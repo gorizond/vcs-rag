@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +91,34 @@ type metaStore interface {
 	Upsert(ctx context.Context, points []store.Point) error
 	ScrollCIFailures(ctx context.Context, repo string, limit uint32) ([]store.ScoredPoint, error)
 	DeleteCIFailure(ctx context.Context, repo, pipelineID, jobID string) error
+	DeleteByIDs(ctx context.Context, ids []string) error // T140 entity reconcile
+}
+
+// Entity-reconcile parameters (T140).
+const (
+	metaMissThreshold = 2  // consecutive absent passes before a point is deleted
+	metaDeletePerRepo = 32 // candidates considered per repository per pass
+)
+
+// entity is one vanished issue/MR key ready for deletion (T140).
+type entity struct {
+	key  string
+	kind string // "issue" | "mr"
+	id   int64
+}
+
+// entityKey parses an entity key; CI keys ("ci:...") and foreign keys are not
+// entities (false).
+func entityKey(key string) (kind string, id int64, ok bool) {
+	kind, rest, found := strings.Cut(key, ":")
+	if !found || (kind != "issue" && kind != "mr") {
+		return "", 0, false
+	}
+	id, err := strconv.ParseInt(rest, 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return kind, id, true
 }
 
 // metaCandidate is a metadata point with its state key and source timestamp.
@@ -177,6 +207,7 @@ func processMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo,
 		return fmt.Errorf("state: %w", err)
 	}
 	seen := mirror.Meta
+	miss := mirror.MetaMiss
 
 	// --- issues + MR/PR: embed only new/changed ---
 	issues, err := deps.VCS.ListIssues(ctx, repo)
@@ -262,11 +293,15 @@ func processMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo,
 	}
 	pruneSeenCI(seen, current)
 
+	// --- entity reconcile (T140): reuse the full issue/MR listings above ---
+	reconcileEntityMeta(ctx, deps, st, repo, seen, miss, cands, deps.stats)
+
 	// the sidecar is shared with the mirror/index lanes: the terminal write
-	// replaces Meta (prune removals included) and stamps the successful
-	// metadata pass (T135) under the mutex.
+	// replaces Meta/MetaMiss (prune removals included) and stamps the
+	// successful metadata pass (T135) under the mutex.
 	if err := updateState(statePath, func(s *MirrorState) {
 		s.Meta = seen
+		s.MetaMiss = miss
 		s.MetaSyncedAt = time.Now().UTC()
 	}); err != nil {
 		return fmt.Errorf("state: %w", err)
@@ -280,6 +315,91 @@ func processMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo,
 	lg.Info("metadata updated", "issues", len(issues), "prs", len(prs),
 		"ci_failures", ciFailed, "skipped", skipped)
 	return nil
+}
+
+// reconcileEntityMeta is the entity-GC phase (T140) of one metadata pass: it
+// reuses the full issue/MR listings already fetched by the pass — no extra API
+// calls. A key absent from the listing twice in a row (MetaMiss) loses its
+// point and the Meta key; a returned key resets its counter. CI keys are owned
+// by the existing prune (pruneCIFailures/pruneSeenCI) and are never touched.
+func reconcileEntityMeta(ctx context.Context, deps RepoDeps, st metaStore, repo provider.Repo,
+	seen map[string]int64, miss map[string]int, cands []metaCandidate, sum *summary) {
+	if sum == nil {
+		sum = newSummary("metadata")
+	}
+	current := make(map[string]bool, len(cands))
+	for _, c := range cands {
+		current[c.key] = true
+	}
+	var toDelete []entity
+	for key := range seen {
+		kind, id, ok := entityKey(key)
+		if !ok {
+			continue
+		}
+		if current[key] {
+			delete(miss, key) // the entity returned — reset the counter
+			continue
+		}
+		miss[key]++
+		if miss[key] >= metaMissThreshold {
+			toDelete = append(toDelete, entity{key: key, kind: kind, id: id})
+		}
+	}
+	sort.Slice(toDelete, func(i, j int) bool { return toDelete[i].key < toDelete[j].key })
+	sum.reconciled.Add(int64(len(toDelete))) // candidates found (before the caps)
+	if len(toDelete) > metaDeletePerRepo {
+		sum.metaSuppressedCap.Add(int64(len(toDelete) - metaDeletePerRepo))
+		toDelete = toDelete[:metaDeletePerRepo]
+	}
+	if len(toDelete) == 0 {
+		return
+	}
+	full := repo.Namespace + "/" + repo.Path
+	// the dry-run kill-switch (default) also holds for the entity GC.
+	if deps.Cfg == nil || deps.Cfg.Worker.GCDryRun {
+		issues, mrs := 0, 0
+		for _, e := range toDelete {
+			if e.kind == "issue" {
+				issues++
+			} else {
+				mrs++
+			}
+		}
+		deps.Logger.Info("reconcile would-delete", "repo", full, "issues", issues, "mrs", mrs)
+		return
+	}
+	// real mode: the pass budget is shared by all repositories; keys are
+	// dropped only after a successful batch delete (a failed one stays).
+	byKind := map[string][]entity{}
+	for _, e := range toDelete {
+		if !sum.reserveMetaDelete() {
+			sum.metaSuppressedCap.Add(1)
+			continue
+		}
+		byKind[e.kind] = append(byKind[e.kind], e)
+	}
+	for kind, batch := range byKind {
+		ids := make([]string, 0, len(batch))
+		for _, e := range batch {
+			if kind == "issue" {
+				ids = append(ids, store.IssueID(deps.VCSType, repo.Path, e.id))
+			} else {
+				ids = append(ids, store.PullRequestID(deps.VCSType, repo.Path, e.id))
+			}
+		}
+		if err := st.DeleteByIDs(ctx, ids); err != nil {
+			sum.failed.Add(1)
+			deps.Logger.Warn("reconcile delete failed", "repo", full, "kind", kind, "count", len(ids), "err", err)
+			continue
+		}
+		for _, e := range batch {
+			delete(seen, e.key)
+			delete(miss, e.key)
+		}
+		sum.goneKeys.Add(int64(len(batch)))
+		sum.deletedEntities.Add(int64(len(batch)))
+	}
 }
 
 // upsertItems embeds the texts (batches inside the provider) and writes points.

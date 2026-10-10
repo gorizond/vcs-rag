@@ -25,6 +25,7 @@ One binary — two modes:
 | `MCP_TRANSPORT` / `MCP_ADDR` | `stdio` (default) or `sse`; address for sse |
 | `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | discovery/index pass tick (a ceiling, see Adaptive tuning) and the embeddings limiter ceiling (default 2) |
 | `WORKER_META_INTERVAL` / `WORKER_MIRROR_INTERVAL` | metadata / mirror pass tick (default — `WORKER_INTERVAL`) |
+| `WORKER_GC_INTERVAL` / `WORKER_GC_DRY_RUN` | repo/entity GC pass (default 15m) and the dry-run kill-switch (default true — nothing is deleted) |
 | `MIRRORS_DIR` | bare mirror directory (default `./mirrors`) |
 | `NATS_URL` | local JetStream for on-demand refresh (`refresh_repo`); empty — the feature is off |
 | `NATS_INSTANCE_ID` | instance id scoping consumers/subjects/KV on a shared NATS (default `default`) |
@@ -87,6 +88,33 @@ looks stale — the LLM does not have to call `refresh_repo`:
   `(group_org=<namespace>, repo=<path>)`; 2–16 candidates become an OR. An empty
   `NATS_URL` disables only the auto-refresh; the filter normalization keeps
   working.
+
+## Garbage collection
+
+**Discovery is the source of truth**: a repository or metadata entity that has
+disappeared from the provider is removed from the index by the GC lane. The
+default `WORKER_GC_DRY_RUN=true` is the permanent kill-switch — the lane only
+logs `gc would-delete` until it is disabled explicitly. Details and the journal
+formats — [`docs/gc.md`](docs/gc.md).
+
+- **Repo GC** (`WORKER_GC_INTERVAL`, default **15m**): a repository absent from
+  two consecutive listings and for at least **10 min** since its first miss is
+  counted, then deleted — Qdrant points (`DeleteRepoPoints`, with a count in
+  the journal), the mirror, the state sidecar and the registry entry. Caps:
+  **10 deletions per pass**, oldest disappearance first; a busy repository
+  (refresh/mirror/index in flight) is skipped.
+- **Anomaly guard**: an empty snapshot, a snapshot dropped by **>30%** (with at
+  least 10 known repositories) or a stale listing (>max(3×`WORKER_INTERVAL`,
+  10m)) freezes the streaks for up to **3** consecutive passes — a bad provider
+  day must not nuke the index. A vanished whole namespace is logged as a WARN.
+- **Entity GC** (the metadata pass): a full issue/MR listing marks vanished
+  `issue:`/`mr:` keys; after **2** consecutive misses the point is deleted by
+  ID — no extra API calls. Caps: **32 per repository** and **128 per pass**;
+  CI keys are owned by the existing CI prune and are untouched.
+- **Orphan mirrors** (a mirror whose namespace is not in the discovery) are
+  WARN-ed, never deleted. The lane is observational in dry-run: the pass
+  summary reports `gc_dry_run`, `gc_anomaly`, `gc_deleted_repos/points` and the
+  suppression counters.
 
 Embeddings — the target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
 (`ollama pull bge-m3`) or in LM Studio (GGUF build, e.g. `lm-kit/bge-m3-gguf`;

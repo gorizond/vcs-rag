@@ -30,3 +30,16 @@ func TestSummaryResumedSkipped(t *testing.T) {
 		}
 	}
 }
+
+// T140: the entity-delete budget is shared by all repositories of one pass.
+func TestSummaryMetaDeleteBudget(t *testing.T) {
+	s := newSummary("metadata")
+	for i := 0; i < metaDeletePerPass; i++ {
+		if !s.reserveMetaDelete() {
+			t.Fatalf("reserve %d failed before the budget", i)
+		}
+	}
+	if s.reserveMetaDelete() {
+		t.Error("the pass budget was exceeded")
+	}
+}

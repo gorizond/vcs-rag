@@ -65,16 +65,18 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	snap := &snapshot{}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 5)
+	errCh := make(chan error, 6)
 	run := func(fn func() error) {
 		defer wg.Done()
 		errCh <- fn()
 	}
-	wg.Add(4)
+	wg.Add(5)
 	go run(func() error { return runDiscovery(ctx, vcs, cfg, logger, snap) })
 	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
 	go run(func() error { return runIndex(ctx, cfg, deps, snap) })
 	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
+	// T140: repo-GC — discovery is the source of truth; dry-run by default.
+	go run(func() error { return runGC(ctx, cfg, deps, snap) })
 
 	// T108/T112: the on-demand refresh over the local JetStream; NATS_URL is
 	// empty by default — the behavior stays as before.

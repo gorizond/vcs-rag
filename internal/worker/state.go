@@ -25,6 +25,11 @@ type MirrorState struct {
 	// Meta is the incremental metadata cache (T080): key → updated_at unix:
 	// "issue:<id>", "mr:<id>", "ci:<pipeline>:<job>".
 	Meta map[string]int64 `json:"meta,omitempty"`
+	// MetaMiss counts consecutive metadata passes where an issue/MR key was
+	// absent from the full listing (T140 entity reconcile): after 2 misses the
+	// point is deleted and the Meta key dropped; a returned key resets the
+	// counter. CI keys are owned by the existing prune and are never counted.
+	MetaMiss map[string]int `json:"meta_miss,omitempty"`
 	// MetaSyncedAt is the end of the last successful metadata pass (T135):
 	// an "auto"-origin refresh skips the metadata phase when it is fresh.
 	MetaSyncedAt time.Time `json:"meta_synced_at"`
@@ -48,6 +53,9 @@ func LoadState(path string) (*MirrorState, error) {
 	}
 	if st.Meta == nil {
 		st.Meta = map[string]int64{}
+	}
+	if st.MetaMiss == nil {
+		st.MetaMiss = map[string]int{}
 	}
 	return st, nil
 }

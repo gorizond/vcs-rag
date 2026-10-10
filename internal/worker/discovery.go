@@ -15,11 +15,13 @@ import (
 type snapshot struct {
 	mu    sync.Mutex
 	repos []provider.Repo
+	stamp time.Time // time of the last successful listing (T140 GC staleness)
 }
 
 func (s *snapshot) set(repos []provider.Repo) {
 	s.mu.Lock()
 	s.repos = repos
+	s.stamp = time.Now()
 	s.mu.Unlock()
 }
 
@@ -27,6 +29,14 @@ func (s *snapshot) get() []provider.Repo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.repos
+}
+
+// at returns the time of the last successful listing (zero — never listed);
+// the GC lane freezes on a stale snapshot (T140).
+func (s *snapshot) at() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stamp
 }
 
 // runDiscovery is the discovery lane: periodic repository listing

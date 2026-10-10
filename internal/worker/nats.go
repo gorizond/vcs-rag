@@ -28,11 +28,12 @@ import (
 var refreshBackoff = []time.Duration{30 * time.Second, 2 * time.Minute}
 
 const (
-	refreshMaxDeliver     = 3
-	refreshTTL            = 24 * time.Hour
-	refreshCoalesceWindow = 30 * time.Second // effective ack wait = refreshBackoff[0]
-	refreshDoneFresh      = 30 * time.Second // a "done" newer than this is coalesced
-	refreshLaneBackoff    = 10 * time.Second // reconnect pause of the lane
+	refreshMaxDeliver        = 3
+	refreshTTL               = 24 * time.Hour
+	refreshCoalesceWindow    = 30 * time.Second // effective ack wait = refreshBackoff[0]
+	refreshDoneFresh         = 30 * time.Second // a "done" newer than this is coalesced
+	refreshLaneBackoff       = 10 * time.Second // reconnect pause of the lane
+	refreshHeartbeatInterval = 30 * time.Second // T142: a long refresh logs liveness
 )
 
 // refreshTask is the published request (T112/T113 wire contract).
@@ -225,12 +226,13 @@ type refreshStats struct {
 // KV, a refresh execution and the status write; the ack happens strictly after
 // the status write (T109 invariant).
 type refreshConsumer struct {
-	source  refreshSource
-	kv      refreshKV
-	resolve func(id string) (provider.Repo, error)
-	run     func(ctx context.Context, repo provider.Repo, origin string) RefreshResult
-	logger  *slog.Logger
-	stats   refreshStats
+	source    refreshSource
+	kv        refreshKV
+	resolve   func(id string) (provider.Repo, error)
+	run       func(ctx context.Context, repo provider.Repo, origin string) RefreshResult
+	logger    *slog.Logger
+	stats     refreshStats
+	heartbeat time.Duration // T142: liveness log interval (0 — the default)
 }
 
 // newRefreshConsumer wires the production dependencies: the discovery snapshot
@@ -330,9 +332,20 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 		return
 	}
 
+	// T142: a visible start line and a liveness heartbeat for long runs — the
+	// user sees whether a refresh is in flight before it silently times out.
+	origin := task.Origin
+	if origin == "" {
+		origin = "manual"
+	}
+	c.logger.Info("refresh start", "repo", task.Repo, "origin", origin, "delivery", msg.NumDelivered())
+
 	// T130: while the refresh runs, the index lane yields.
 	refreshActive.Store(true)
+	done := make(chan struct{})
+	go c.heartbeatLoop(ctx, done, task.Repo, started)
 	res := c.run(ctx, repo, task.Origin)
+	close(done)
 	refreshActive.Store(false)
 	status := refreshStatus{
 		State: "done", RequestID: task.RequestID, StartedAt: started,
@@ -365,6 +378,28 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 		c.stats.failed.Add(1)
 		c.logger.Warn("refresh failed (retry)", "repo", task.Repo,
 			"delivery", msg.NumDelivered(), "errors", res.Errors)
+	}
+}
+
+// heartbeatLoop logs "refresh still running" every heartbeat while the run
+// executes (T142); it stops when done is closed or the context is canceled.
+func (c *refreshConsumer) heartbeatLoop(ctx context.Context, done <-chan struct{}, repo string, started time.Time) {
+	interval := c.heartbeat
+	if interval <= 0 {
+		interval = refreshHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.logger.Info("refresh still running", "repo", repo,
+				"elapsed", time.Since(started).Round(time.Second).String())
+		}
 	}
 }
 

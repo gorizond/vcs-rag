@@ -30,6 +30,25 @@ func withRepoLock(slug string, fn func() error) error {
 	return fn()
 }
 
+// tryRepoLock runs fn under the per-repository lock only when it is free
+// (T140: the GC lane skips a busy repository instead of queueing behind a
+// refresh). Reports whether fn ran; fn's error is returned as-is.
+func tryRepoLock(slug string, fn func() error) (bool, error) {
+	repoLocksMu.Lock()
+	mu, ok := repoLocks[slug]
+	if !ok {
+		mu = &sync.Mutex{}
+		repoLocks[slug] = mu
+	}
+	repoLocksMu.Unlock()
+
+	if !mu.TryLock() {
+		return false, nil
+	}
+	defer mu.Unlock()
+	return true, fn()
+}
+
 // repoSlug normalizes a repository identifier "namespace/path" into the
 // refresh_status KV key form: every "/" replaced with "_" (T109/T112
 // contract; the MCP side repeats this one-liner).

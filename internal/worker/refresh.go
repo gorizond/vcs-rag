@@ -41,6 +41,12 @@ var errRefreshTransient = errors.New("transient")
 // refreshes (T135): a non-user trigger skips metadata when it ran recently.
 const metaAutoFresh = time.Hour
 
+// refreshFetchTimeout bounds the network fetch phase of an on-demand refresh
+// (T142): a hung git transport must not pin the single-consumer lane forever.
+// A timeout is an ordinary phase error — the task is Nak-ed and retried with
+// the consumer backoff, so the retry semantics are unchanged.
+var refreshFetchTimeout = 15 * time.Minute
+
 // RefreshOnce performs an on-demand refresh of one repository (T111): fetch
 // (mirror-lane semantics) → index new commits (per-commit checkpoints, T088) →
 // metadata. An error of a phase does not cancel the next one — it is collected
@@ -65,9 +71,13 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 			before = &MirrorState{}
 		}
 
-		// phase 1: fetch — the refresh owns network access (mirror lane semantics).
-		if _, err := deps.Engine.EnsureMirror(ctx, deps.VCSType, repo); err != nil {
-			res.Errors = append(res.Errors, "mirror: "+err.Error())
+		// phase 1: fetch — the refresh owns network access (mirror lane semantics);
+		// the phase is bounded by refreshFetchTimeout (T142).
+		fetchCtx, cancel := context.WithTimeout(ctx, refreshFetchTimeout)
+		_, errFetch := deps.Engine.EnsureMirror(fetchCtx, deps.VCSType, repo)
+		cancel()
+		if errFetch != nil {
+			res.Errors = append(res.Errors, "mirror: "+errFetch.Error())
 		}
 		// phase 2: index new commits.
 		if err := processRepoOnce(ctx, deps, repo, idx); err != nil {

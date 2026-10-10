@@ -1,8 +1,10 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -469,5 +471,72 @@ func TestRefreshConsumerIsolationAB(t *testing.T) {
 		t.Fatal("b received the message of a")
 	} else if !strings.Contains(err.Error(), "timeout") {
 		t.Fatalf("b fetch = %v, want a timeout", err)
+	}
+}
+
+// syncBuffer is a race-safe log sink: the heartbeat goroutine writes while the
+// test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// T142: a long refresh logs a start line and a periodic liveness heartbeat that
+// stops with the run.
+func TestRefreshHeartbeatLog(t *testing.T) {
+	var buf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	ran := make(chan struct{})
+	release := make(chan struct{})
+	c := newTestConsumer(newFakeKV(), func(context.Context, provider.Repo, string) RefreshResult {
+		close(ran)
+		<-release
+		return RefreshResult{CommitsIndexed: 1}
+	})
+	c.logger = logger
+	c.heartbeat = 10 * time.Millisecond
+
+	msg := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: 1}
+	done := make(chan struct{})
+	go func() {
+		c.handle(context.Background(), msg)
+		close(done)
+	}()
+	<-ran
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "refresh still running") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "refresh start") || !strings.Contains(out, "origin=manual") {
+		t.Errorf("start log missing: %q", out)
+	}
+	if !strings.Contains(out, "refresh still running") {
+		t.Fatalf("heartbeat missing: %q", out)
+	}
+
+	// the heartbeat stops with the run.
+	beats := strings.Count(out, "refresh still running")
+	close(release)
+	<-done
+	time.Sleep(40 * time.Millisecond)
+	if got := strings.Count(buf.String(), "refresh still running"); got != beats {
+		t.Errorf("heartbeat continued after the run: %d → %d", beats, got)
+	}
+	if !strings.Contains(buf.String(), "refresh done") {
+		t.Errorf("completion log missing: %q", buf.String())
 	}
 }

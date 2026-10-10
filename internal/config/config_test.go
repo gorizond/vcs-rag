@@ -16,6 +16,7 @@ var allEnv = []string{
 	"EMBEDDINGS_DIM", "EMBEDDINGS_BATCH",
 	"QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION",
 	"WORKER_INTERVAL", "WORKER_META_INTERVAL", "WORKER_MIRROR_INTERVAL",
+	"WORKER_GC_INTERVAL", "WORKER_GC_DRY_RUN",
 	"WORKER_CONCURRENCY", "MIRRORS_DIR",
 	"HISTORY_MAX_COMMITS", "MAX_FILE_BYTES", "CI_WINDOW",
 	"MCP_TRANSPORT", "MCP_ADDR",
@@ -170,6 +171,37 @@ func TestLoadValid(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "gc: defaults — 15m and dry-run on",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":     "1",
+				"GITLAB_TOKEN":        "t",
+				"EMBEDDINGS_PROVIDER": "ollama",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Worker.GCInterval != 15*time.Minute {
+					t.Errorf("GCInterval = %v, want the 15m default", cfg.Worker.GCInterval)
+				}
+				if !cfg.Worker.GCDryRun {
+					t.Error("GCDryRun = false, want the true kill-switch default")
+				}
+			},
+		},
+		{
+			name: "gc: env override",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":     "1",
+				"GITLAB_TOKEN":        "t",
+				"EMBEDDINGS_PROVIDER": "ollama",
+				"WORKER_GC_INTERVAL":  "5m",
+				"WORKER_GC_DRY_RUN":   "false",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Worker.GCInterval != 5*time.Minute || cfg.Worker.GCDryRun {
+					t.Errorf("gc = %v/%v, want 5m/false", cfg.Worker.GCInterval, cfg.Worker.GCDryRun)
+				}
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -247,6 +279,14 @@ func TestLoadErrors(t *testing.T) {
 				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_META_INTERVAL": "abc",
 			},
 			wantProblem: "WORKER_META_INTERVAL",
+		},
+		{
+			name: "gc: invalid dry-run boolean",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_GC_DRY_RUN": "maybe",
+			},
+			wantProblem: "WORKER_GC_DRY_RUN",
 		},
 		{
 			name: "nats: invalid instance id (mode on)",

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/embed"
 	"github.com/gorizond/vcs-rag/internal/gitengine"
 	"github.com/gorizond/vcs-rag/internal/provider"
@@ -143,13 +144,20 @@ func (c *countingEmbed) Embed(_ context.Context, texts []string) ([][]float32, e
 // countingStore is a metaStore double: records upserts/deletes, serves the
 // configured existing ci points for prune.
 type countingStore struct {
-	upserts  [][]store.Point
-	deletes  [][2]string
-	existing []store.ScoredPoint
+	upserts    [][]store.Point
+	deletes    [][2]string
+	deletedIDs []string
+	existing   []store.ScoredPoint
 }
 
 func (c *countingStore) Upsert(_ context.Context, points []store.Point) error {
 	c.upserts = append(c.upserts, points)
+	return nil
+}
+
+// DeleteByIDs records the entity-reconcile deletions (T140).
+func (c *countingStore) DeleteByIDs(_ context.Context, ids []string) error {
+	c.deletedIDs = append(c.deletedIDs, ids...)
 	return nil
 }
 
@@ -384,5 +392,212 @@ func TestMetadataCheckpointBetweenPhases(t *testing.T) {
 	}
 	if got := stats.skipped.Load(); got != 2 {
 		t.Errorf("summary skipped = %d, want 2 (issues/MR)", got)
+	}
+}
+
+// --- T140: entity reconcile (issue/MR GC in the metadata pass) ---
+
+// reconcileDeps builds a metadata pass with an explicit GC mode (the real
+// deletion mode is normally reachable only with WORKER_GC_DRY_RUN=false).
+func reconcileDeps(t *testing.T, vcs provider.VCSProvider, logger *slog.Logger, dry bool) RepoDeps {
+	t.Helper()
+	deps := newMetaDeps(t, vcs, &countingEmbed{}, logger)
+	deps.Cfg = &config.Config{Worker: config.Worker{GCDryRun: dry}}
+	return deps
+}
+
+// T140: an issue absent twice in a row is deleted by its point ID; a returned
+// one resets the miss counter; the MR is never touched.
+func TestReconcileEntityDeleteAndReset(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Unix(1000, 0)
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	issue := provider.Issue{ID: 1, Title: "I", UpdatedAt: t0}
+	vcs := &fake.Provider{
+		Repos:          []provider.Repo{repo},
+		Issues:         map[string][]provider.Issue{"1": {issue}},
+		ChangeRequests: map[string][]provider.ChangeRequest{"1": {{ID: 2, Title: "PR", UpdatedAt: t0}}},
+	}
+	deps := reconcileDeps(t, vcs, testLogger(), false)
+	st := &countingStore{}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+	pass := func() *MirrorState {
+		t.Helper()
+		if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+			t.Fatalf("metadata pass: %v", err)
+		}
+		saved, err := LoadState(statePath)
+		if err != nil {
+			t.Fatalf("LoadState: %v", err)
+		}
+		return saved
+	}
+
+	pass() // full pass: issue:1 + mr:2
+	// the issue disappears; the MR stays (its counter must reset, not grow).
+	vcs.Issues["1"] = nil
+	saved := pass()
+	if got := saved.MetaMiss["issue:1"]; got != 1 {
+		t.Fatalf("miss after one absent pass = %d, want 1", got)
+	}
+	if len(st.deletedIDs) != 0 {
+		t.Fatalf("deleted before the threshold: %v", st.deletedIDs)
+	}
+	if _, ok := saved.Meta["issue:1"]; !ok {
+		t.Fatal("the Meta key disappeared before the threshold")
+	}
+
+	// the issue returns → the counter resets.
+	vcs.Issues["1"] = []provider.Issue{issue}
+	saved = pass()
+	if _, ok := saved.MetaMiss["issue:1"]; ok {
+		t.Fatalf("returned issue not reset: %v", saved.MetaMiss)
+	}
+
+	// gone again: pass 4 = miss 1, pass 5 = miss 2 → delete by point ID.
+	vcs.Issues["1"] = nil
+	pass()
+	saved = pass()
+	want := store.IssueID("gitlab", "r", 1)
+	if len(st.deletedIDs) != 1 || st.deletedIDs[0] != want {
+		t.Fatalf("deleted IDs = %v, want [%s]", st.deletedIDs, want)
+	}
+	if _, ok := saved.Meta["issue:1"]; ok {
+		t.Error("the Meta key of the deleted issue remained")
+	}
+	if _, ok := saved.MetaMiss["issue:1"]; ok {
+		t.Error("the miss counter of the deleted issue remained")
+	}
+	if _, ok := saved.Meta["mr:2"]; !ok {
+		t.Error("the MR key was touched by the issue reconcile")
+	}
+}
+
+// T140: CI keys belong to the existing prune — the entity reconcile never
+// counts or deletes them.
+func TestReconcileCIUntouched(t *testing.T) {
+	ctx := context.Background()
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	failed := provider.Pipeline{ID: "100", Status: "failed", Ref: "main", SHA: "abc",
+		Jobs: []provider.Job{{ID: "1000", Name: "build", Status: "failed"}}}
+	vcs := &fake.Provider{
+		Repos:     []provider.Repo{repo},
+		Pipelines: map[string][]provider.Pipeline{"1": {failed}},
+		Logs:      map[string]string{"1000": "boom\n"},
+	}
+	deps := reconcileDeps(t, vcs, testLogger(), false)
+	st := &countingStore{}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	for i := 0; i < 3; i++ {
+		if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+			t.Fatalf("pass %d: %v", i, err)
+		}
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := saved.Meta["ci:100:1000"]; !ok {
+		t.Error("the CI key was removed by the entity reconcile")
+	}
+	for key := range saved.MetaMiss {
+		if strings.HasPrefix(key, "ci:") {
+			t.Errorf("a CI key entered meta_miss: %s", key)
+		}
+	}
+	if len(st.deletedIDs) != 0 {
+		t.Errorf("the reconcile deleted CI points: %v", st.deletedIDs)
+	}
+}
+
+// T140: dry-run logs would-delete, keeps the keys and never calls the store.
+func TestReconcileDryRun(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Unix(1000, 0)
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	vcs := &fake.Provider{
+		Repos:  []provider.Repo{repo},
+		Issues: map[string][]provider.Issue{"1": {{ID: 1, Title: "I", UpdatedAt: t0}}},
+	}
+	var buf bytes.Buffer
+	deps := reconcileDeps(t, vcs, slog.New(slog.NewTextHandler(&buf, nil)), true)
+	st := &countingStore{}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	run := func() *MirrorState {
+		t.Helper()
+		if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+			t.Fatalf("metadata pass: %v", err)
+		}
+		saved, err := LoadState(statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saved
+	}
+	run() // index the issue
+	vcs.Issues["1"] = nil
+	run()          // miss 1
+	saved := run() // miss 2 → would-delete
+	if len(st.deletedIDs) != 0 {
+		t.Fatalf("dry-run deleted points: %v", st.deletedIDs)
+	}
+	if saved.MetaMiss["issue:1"] != 2 {
+		t.Errorf("miss = %d, want 2", saved.MetaMiss["issue:1"])
+	}
+	if _, ok := saved.Meta["issue:1"]; !ok {
+		t.Error("dry-run dropped the Meta key")
+	}
+	if !strings.Contains(buf.String(), "reconcile would-delete") ||
+		!strings.Contains(buf.String(), "issues=1") {
+		t.Errorf("dry-run log missing the would-delete: %q", buf.String())
+	}
+}
+
+// T140: the per-repository cap is 32 candidates; the suppression is counted.
+func TestReconcilePerRepoCap(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Unix(1000, 0)
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	issues := make([]provider.Issue, 0, 40)
+	for i := int64(1); i <= 40; i++ {
+		issues = append(issues, provider.Issue{ID: i, Title: "I", UpdatedAt: t0})
+	}
+	vcs := &fake.Provider{
+		Repos:  []provider.Repo{repo},
+		Issues: map[string][]provider.Issue{"1": issues},
+	}
+	deps := reconcileDeps(t, vcs, testLogger(), false)
+	stats := newSummary("metadata")
+	deps.stats = stats
+	st := &countingStore{}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatal(err)
+	}
+	vcs.Issues["1"] = nil
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.deletedIDs) != metaDeletePerRepo {
+		t.Fatalf("deleted = %d, want the per-repo cap %d", len(st.deletedIDs), metaDeletePerRepo)
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Meta) != 8 || len(saved.MetaMiss) != 8 {
+		t.Errorf("remaining keys = %d/%d, want 8/8", len(saved.Meta), len(saved.MetaMiss))
+	}
+	if got := stats.metaSuppressedCap.Load(); got != 8 {
+		t.Errorf("suppressed_cap = %d, want 8", got)
+	}
+	if stats.reconciled.Load() != 40 {
+		t.Errorf("reconciled = %d, want 40", stats.reconciled.Load())
 	}
 }

@@ -83,6 +83,17 @@ state has `MetaSyncedAt` younger than **1 h** (the background metadata lane
 still covers it). The KV status shape and the stream/consumer/subject names are
 unchanged.
 
+## Logs & liveness (v0.0.10)
+
+- every accepted task logs `refresh start` before the run: `repo`, `origin`
+  (`manual` | `auto`) and `delivery` (the redelivery count);
+- while a run executes, a heartbeat logs `refresh still running` every **30 s**
+  (repo + elapsed) and stops with the run — a long refresh is visible instead
+  of silently occupying the single-consumer lane;
+- the network fetch phase is bounded by a **15 min** timeout: a hung git
+  transport becomes an ordinary phase error — the task is `Nak`-ed and retried
+  with the consumer backoff (the KV status carries it in `errors[]`).
+
 ## Delivery semantics
 
 - Consumer `worker-refresh-<id>`: durable **pull**, `MaxAckPending=1`

@@ -61,6 +61,8 @@ type Worker struct {
 	Interval          time.Duration // discovery/index pass tick (WORKER_INTERVAL)
 	MetaInterval      time.Duration // metadata pass tick (WORKER_META_INTERVAL, default Interval)
 	MirrorInterval    time.Duration // mirror pass tick (WORKER_MIRROR_INTERVAL, default Interval)
+	GCInterval        time.Duration // repo-GC pass tick (WORKER_GC_INTERVAL, default 15m)
+	GCDryRun          bool          // WORKER_GC_DRY_RUN (default true — the kill-switch)
 	Concurrency       int           // ponytail: starting default, to be refined based on facts
 	MirrorsDir        string
 	HistoryMaxCommits int   // ponytail: starting default, to be refined based on facts
@@ -196,6 +198,16 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// T140: the repo-GC lane runs rarely; the dry-run default is the permanent
+	// kill-switch (nothing is deleted until it is disabled explicitly).
+	gcInterval, err := envDuration("WORKER_GC_INTERVAL", 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	gcDryRun, err := envBool("WORKER_GC_DRY_RUN", true)
+	if err != nil {
+		return nil, err
+	}
 	historyMax, err := envInt("HISTORY_MAX_COMMITS", 2000)
 	if err != nil {
 		return nil, err
@@ -212,6 +224,8 @@ func Load() (*Config, error) {
 		Interval:          interval,
 		MetaInterval:      metaInterval,
 		MirrorInterval:    mirrorInterval,
+		GCInterval:        gcInterval,
+		GCDryRun:          gcDryRun,
 		Concurrency:       concurrency,
 		MirrorsDir:        envDefault("MIRRORS_DIR", "./mirrors"),
 		HistoryMaxCommits: historyMax,
@@ -265,6 +279,19 @@ func envInt(name string, def int) (int, error) {
 		return 0, &ConfigError{Problem: name + ": positive integer expected"}
 	}
 	return n, nil
+}
+
+// envBool reads a boolean (true/false/1/0); the error names the variable.
+func envBool(name string, def bool) (bool, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, &ConfigError{Problem: name + ": boolean expected (true|false)"}
+	}
+	return b, nil
 }
 
 // envDuration reads time.ParseDuration; the error names the variable, not its value.
