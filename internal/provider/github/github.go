@@ -24,8 +24,14 @@ type Client struct {
 
 // New creates the GitHub client; it makes no network calls.
 // A custom GITHUB_BASE_URL (GHES) is wired via WithEnterpriseURLs.
+// T143: the token is optional (public organizations) — WithAuthToken("")
+// is an error in go-github, and an anonymous client is exactly the tokenless
+// one; the option is added only for a non-empty token.
 func New(cfg *config.Config) (*Client, error) {
-	opts := []gh.ClientOptionsFunc{gh.WithAuthToken(cfg.Provider.GitHubToken)}
+	var opts []gh.ClientOptionsFunc
+	if cfg.Provider.GitHubToken != "" {
+		opts = append(opts, gh.WithAuthToken(cfg.Provider.GitHubToken))
+	}
 	if base := cfg.Provider.GitHubBaseURL; base != "" && base != "https://api.github.com" {
 		opts = append(opts, gh.WithEnterpriseURLs(base, base))
 	}

@@ -58,16 +58,19 @@ type Qdrant struct {
 
 // Worker holds background loop parameters (FR-005/006/018).
 type Worker struct {
-	Interval          time.Duration // discovery/index pass tick (WORKER_INTERVAL)
-	MetaInterval      time.Duration // metadata pass tick (WORKER_META_INTERVAL, default Interval)
-	MirrorInterval    time.Duration // mirror pass tick (WORKER_MIRROR_INTERVAL, default Interval)
-	GCInterval        time.Duration // repo-GC pass tick (WORKER_GC_INTERVAL, default 15m)
-	GCDryRun          bool          // WORKER_GC_DRY_RUN (default true — the kill-switch)
-	Concurrency       int           // ponytail: starting default, to be refined based on facts
-	MirrorsDir        string
-	HistoryMaxCommits int   // ponytail: starting default, to be refined based on facts
-	MaxFileBytes      int64 // ponytail: starting default, to be refined based on facts
-	CIWindow          int   // ponytail: starting default, to be refined based on facts
+	Interval       time.Duration // discovery/index pass tick (WORKER_INTERVAL)
+	MetaInterval   time.Duration // metadata pass tick (WORKER_META_INTERVAL, default Interval)
+	MirrorInterval time.Duration // mirror pass tick (WORKER_MIRROR_INTERVAL, default Interval)
+	GCInterval     time.Duration // repo-GC pass tick (WORKER_GC_INTERVAL, default 15m)
+	GCDryRun       bool          // WORKER_GC_DRY_RUN (default true — the kill-switch)
+	// DiscoveryMinInterval reuses a younger discovery snapshot without an API
+	// call (T143); 0 (default) refreshes on every pass as before.
+	DiscoveryMinInterval time.Duration
+	Concurrency          int // ponytail: starting default, to be refined based on facts
+	MirrorsDir           string
+	HistoryMaxCommits    int   // ponytail: starting default, to be refined based on facts
+	MaxFileBytes         int64 // ponytail: starting default, to be refined based on facts
+	CIWindow             int   // ponytail: starting default, to be refined based on facts
 }
 
 // MCP is the MCP server transport (FR-013).
@@ -121,9 +124,8 @@ func Load() (*Config, error) {
 		if len(githubOrgs) == 0 {
 			return nil, &ConfigError{Problem: "GitHub organization is not set", Missing: []string{"GITHUB_ORG"}}
 		}
-		if githubToken == "" {
-			return nil, &ConfigError{Problem: "GitHub token is not set", Missing: []string{"GITHUB_TOKEN"}}
-		}
+		// T143: the token is optional for public organizations — go-github
+		// sends anonymous requests without it (60 req/h per IP).
 		cfg.Provider.Type = "github"
 		cfg.Provider.GitHubOrgs = githubOrgs
 		cfg.Provider.GitHubToken = githubToken
@@ -208,6 +210,12 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// T143: an optional discovery cache window; 0 (the default) keeps the
+	// previous behavior — a fresh listing on every pass.
+	discoveryMin, err := envDuration("WORKER_DISCOVERY_MIN_INTERVAL", 0)
+	if err != nil {
+		return nil, err
+	}
 	historyMax, err := envInt("HISTORY_MAX_COMMITS", 2000)
 	if err != nil {
 		return nil, err
@@ -221,16 +229,17 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.Worker = Worker{
-		Interval:          interval,
-		MetaInterval:      metaInterval,
-		MirrorInterval:    mirrorInterval,
-		GCInterval:        gcInterval,
-		GCDryRun:          gcDryRun,
-		Concurrency:       concurrency,
-		MirrorsDir:        envDefault("MIRRORS_DIR", "./mirrors"),
-		HistoryMaxCommits: historyMax,
-		MaxFileBytes:      int64(maxFileBytes),
-		CIWindow:          ciWindow,
+		Interval:             interval,
+		MetaInterval:         metaInterval,
+		MirrorInterval:       mirrorInterval,
+		GCInterval:           gcInterval,
+		GCDryRun:             gcDryRun,
+		DiscoveryMinInterval: discoveryMin,
+		Concurrency:          concurrency,
+		MirrorsDir:           envDefault("MIRRORS_DIR", "./mirrors"),
+		HistoryMaxCommits:    historyMax,
+		MaxFileBytes:         int64(maxFileBytes),
+		CIWindow:             ciWindow,
 	}
 
 	// --- NATS (T108/T117): empty URL — the refresh mode is off; the instance

@@ -26,12 +26,19 @@ One binary — two modes:
 | `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | discovery/index pass tick (a ceiling, see Adaptive tuning) and the embeddings limiter ceiling (default 2) |
 | `WORKER_META_INTERVAL` / `WORKER_MIRROR_INTERVAL` | metadata / mirror pass tick (default — `WORKER_INTERVAL`) |
 | `WORKER_GC_INTERVAL` / `WORKER_GC_DRY_RUN` | repo/entity GC pass (default 15m) and the dry-run kill-switch (default true — nothing is deleted) |
+| `WORKER_DISCOVERY_MIN_INTERVAL` | reuse a younger discovery listing without an API call (default `0` — refresh on every pass) |
 | `MIRRORS_DIR` | bare mirror directory (default `./mirrors`) |
 | `NATS_URL` | local JetStream for on-demand refresh (`refresh_repo`); empty — the feature is off |
 | `NATS_INSTANCE_ID` | instance id scoping consumers/subjects/KV on a shared NATS (default `default`) |
 
 Switching GitLab ↔ GitHub is env-only: the core does not change (both providers
 share one interface and pass one contract suite).
+
+GitHub works **without a token** for public organizations (anonymous API limit —
+60 requests/hour per IP); a token without scopes is recommended for the
+metadata lane (issues/MRs), and `WORKER_DISCOVERY_MIN_INTERVAL` can pin the
+repository listing to at most one API call per window (e.g. `10m`). GitLab
+still requires `GITLAB_TOKEN`.
 
 Metadata (issues, MR/PR, CI failures) is indexed incrementally: a point is
 re-embedded only when its source `updated_at` changed; a CI job is indexed once

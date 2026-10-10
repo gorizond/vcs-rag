@@ -40,10 +40,11 @@ func (s *snapshot) at() time.Time {
 }
 
 // runDiscovery is the discovery lane: periodic repository listing
-// (WORKER_INTERVAL). A listing error does not break the loop (FR-014).
+// (WORKER_INTERVAL), optionally cached for WORKER_DISCOVERY_MIN_INTERVAL
+// (T143). A listing error does not break the loop (FR-014).
 func runDiscovery(ctx context.Context, p provider.VCSProvider, cfg *config.Config, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "discovery")
-	listOnce(ctx, p, logger, snap)
+	listOnceCached(ctx, p, cfg.Worker.DiscoveryMinInterval, logger, snap)
 
 	ticker := time.NewTicker(cfg.Worker.Interval)
 	defer ticker.Stop()
@@ -52,9 +53,22 @@ func runDiscovery(ctx context.Context, p provider.VCSProvider, cfg *config.Confi
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			listOnce(ctx, p, logger, snap)
+			listOnceCached(ctx, p, cfg.Worker.DiscoveryMinInterval, logger, snap)
 		}
 	}
+}
+
+// listOnceCached reuses a snapshot younger than minInterval without an API
+// call (T143); a zero interval always refreshes (the previous behavior).
+func listOnceCached(ctx context.Context, p provider.VCSProvider, minInterval time.Duration, logger *slog.Logger, snap *snapshot) {
+	if minInterval > 0 {
+		if at := snap.at(); !at.IsZero() && time.Since(at) < minInterval {
+			logger.Debug("discovery: cached", "age", time.Since(at).Round(time.Second).String(),
+				"min_interval", minInterval.String())
+			return
+		}
+	}
+	listOnce(ctx, p, logger, snap)
 }
 
 // listOnce performs one pass: listing, a log line per repository,

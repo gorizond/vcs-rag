@@ -16,7 +16,7 @@ var allEnv = []string{
 	"EMBEDDINGS_DIM", "EMBEDDINGS_BATCH",
 	"QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION",
 	"WORKER_INTERVAL", "WORKER_META_INTERVAL", "WORKER_MIRROR_INTERVAL",
-	"WORKER_GC_INTERVAL", "WORKER_GC_DRY_RUN",
+	"WORKER_GC_INTERVAL", "WORKER_GC_DRY_RUN", "WORKER_DISCOVERY_MIN_INTERVAL",
 	"WORKER_CONCURRENCY", "MIRRORS_DIR",
 	"HISTORY_MAX_COMMITS", "MAX_FILE_BYTES", "CI_WINDOW",
 	"MCP_TRANSPORT", "MCP_ADDR",
@@ -202,6 +202,43 @@ func TestLoadValid(t *testing.T) {
 				}
 			},
 		},
+		{
+			// T143: a public organization works without a token; discovery is
+			// uncached by default (0).
+			name: "github: public organization without token",
+			env: map[string]string{
+				"GITHUB_ORG":          "acme",
+				"EMBEDDINGS_PROVIDER": "ollama",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Provider.Type != "github" {
+					t.Fatalf("Type = %q, want github", cfg.Provider.Type)
+				}
+				if cfg.Provider.GitHubToken != "" {
+					t.Errorf("GitHubToken = %q, want empty (anonymous)", cfg.Provider.GitHubToken)
+				}
+				if !slices.Equal(cfg.Provider.GitHubOrgs, []string{"acme"}) {
+					t.Errorf("GitHubOrgs = %v", cfg.Provider.GitHubOrgs)
+				}
+				if cfg.Worker.DiscoveryMinInterval != 0 {
+					t.Errorf("DiscoveryMinInterval = %v, want the 0 default", cfg.Worker.DiscoveryMinInterval)
+				}
+			},
+		},
+		{
+			name: "discovery cache window",
+			env: map[string]string{
+				"GITHUB_ORG":                    "acme",
+				"GITHUB_TOKEN":                  "ghp-EXAMPLE-NOT-A-TOKEN",
+				"EMBEDDINGS_PROVIDER":           "ollama",
+				"WORKER_DISCOVERY_MIN_INTERVAL": "10m",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Worker.DiscoveryMinInterval != 10*time.Minute {
+					t.Errorf("DiscoveryMinInterval = %v, want 10m", cfg.Worker.DiscoveryMinInterval)
+				}
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -247,9 +284,11 @@ func TestLoadErrors(t *testing.T) {
 			wantMissing: []string{"GITLAB_GROUP_ID"},
 		},
 		{
-			name:        "github: organization without token",
-			env:         map[string]string{"GITHUB_ORG": "acme", "EMBEDDINGS_PROVIDER": "ollama"},
-			wantMissing: []string{"GITHUB_TOKEN"},
+			// the token is now optional for public orgs (T143) — a token alone
+			// (without an organization) is still an error.
+			name:        "github: token without organization",
+			env:         map[string]string{"GITHUB_TOKEN": "t", "EMBEDDINGS_PROVIDER": "ollama"},
+			wantMissing: []string{"GITHUB_ORG"},
 		},
 		{
 			name:        "embeddings: provider not set",
