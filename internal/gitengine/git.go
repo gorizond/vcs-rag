@@ -18,6 +18,9 @@ import (
 type Engine struct {
 	MirrorsDir string
 	GitBin     string
+	// AuthEnv — env для сетевых операций (clone/fetch): Basic-заголовок для
+	// приватных репо. Локальные операции выполняются без него (T074).
+	AuthEnv []string
 }
 
 // New создаёт движок; GitBin по умолчанию "git".
@@ -35,12 +38,24 @@ func (e *Engine) MirrorPath(vcsType string, repo provider.Repo) string {
 // StatePath — sidecar-файл состояния рядом с зеркалом.
 func StatePath(mirrorPath string) string { return mirrorPath + ".state.json" }
 
-// run выполняет git-команду в каталоге dir и возвращает stdout.
+// run выполняет локальную git-команду в каталоге dir и возвращает stdout.
 // GIT_TERMINAL_PROMPT=0 — никаких интерактивных запросов креденшелов.
 func (e *Engine) run(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return e.runWithEnv(ctx, dir, nil, args...)
+}
+
+// runNet выполняет сетевую git-команду (clone/fetch): к окружению добавляется
+// AuthEnv, если задан (приватные репозитории, T074).
+func (e *Engine) runNet(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return e.runWithEnv(ctx, dir, e.AuthEnv, args...)
+}
+
+// runWithEnv — общий запуск git с базовым и дополнительным окружением.
+func (e *Engine) runWithEnv(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, e.GitBin, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -51,11 +66,12 @@ func (e *Engine) run(ctx context.Context, dir string, args ...string) ([]byte, e
 }
 
 // EnsureMirror клонирует зеркало при отсутствии, иначе обновляет
-// (remote update --prune). Возвращает путь зеркала.
+// (remote update --prune). Обе операции — сетевые: выполняются с AuthEnv
+// (приватные репо), URL клона при этом чистый (без креденшелов).
 func (e *Engine) EnsureMirror(ctx context.Context, vcsType string, repo provider.Repo) (string, error) {
 	path := e.MirrorPath(vcsType, repo)
 	if _, err := os.Stat(filepath.Join(path, "HEAD")); err == nil {
-		if _, err := e.run(ctx, path, "remote", "update", "--prune"); err != nil {
+		if _, err := e.runNet(ctx, path, "remote", "update", "--prune"); err != nil {
 			return "", err
 		}
 		return path, nil
@@ -63,7 +79,7 @@ func (e *Engine) EnsureMirror(ctx context.Context, vcsType string, repo provider
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	if _, err := e.run(ctx, filepath.Dir(path), "clone", "--mirror", repo.CloneURL, path); err != nil {
+	if _, err := e.runNet(ctx, filepath.Dir(path), "clone", "--mirror", repo.CloneURL, path); err != nil {
 		return "", err
 	}
 	return path, nil

@@ -46,10 +46,15 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		return err
 	}
 
+	// T074: приватные репозитории — auth-env для сетевых git-операций;
+	// в URL клона и конфиг зеркала токен не попадает.
+	engine := gitengine.New(cfg.Worker.MirrorsDir)
+	engine.AuthEnv = gitengine.AuthEnv(vcs.Type(), providerToken(cfg, vcs.Type()))
+
 	deps := RepoDeps{
 		VCSType: vcs.Type(),
 		VCS:     vcs,
-		Engine:  gitengine.New(cfg.Worker.MirrorsDir),
+		Engine:  engine,
 		Embed:   emb,
 		Store:   st,
 		Cfg:     cfg,
@@ -78,4 +83,12 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 	logger.Info("worker остановлен")
 	return nil
+}
+
+// providerToken — токен активного провайдера из конфига (для git-auth).
+func providerToken(cfg *config.Config, vcsType string) string {
+	if vcsType == "github" {
+		return cfg.Provider.GitHubToken
+	}
+	return cfg.Provider.GitLabToken
 }

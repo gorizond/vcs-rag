@@ -63,6 +63,11 @@ docker run --rm --network host \
   -v "$PWD/mirrors":/mirrors vcs-rag:dev -mode=worker
 ```
 
+Приватные репозитории: токен передаётся git-процессам через окружение
+(`http.extraHeader`, Basic: GitLab `oauth2:<token>`, GitHub
+`x-access-token:<token>`) — в URL клона и `.git/config` зеркала он не
+сохраняется; локальные git-операции выполняются без токена.
+
 ## MCP: Cursor / Claude
 
 stdio (в конфиг клиента, `mcpServers`):
