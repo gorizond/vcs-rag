@@ -16,16 +16,22 @@ func TestRefreshNames(t *testing.T) {
 		a.KVBucket != "refresh_status_a" || a.ConnName != "vcs-rag-a" {
 		t.Errorf("instance a = %+v", a)
 	}
+	// T150: the worker indexing status bucket is scoped by the same instance id.
+	if a.WorkerKVBucket != "worker_status_a" {
+		t.Errorf("WorkerKVBucket = %q, want worker_status_a", a.WorkerKVBucket)
+	}
 
 	d := RefreshNames("")
 	if d.InstanceID != NATSDefaultInstance || d.Subject != "vcsrag.default.refresh" ||
-		d.Consumer != "worker-refresh-default" || d.KVBucket != "refresh_status_default" {
+		d.Consumer != "worker-refresh-default" || d.KVBucket != "refresh_status_default" ||
+		d.WorkerKVBucket != "worker_status_default" {
 		t.Errorf("default instance = %+v", d)
 	}
 
 	// the instances must not overlap: exact filters, different names.
 	b := RefreshNames("b")
-	if a.Subject == b.Subject || a.Consumer == b.Consumer || a.KVBucket == b.KVBucket {
+	if a.Subject == b.Subject || a.Consumer == b.Consumer || a.KVBucket == b.KVBucket ||
+		a.WorkerKVBucket == b.WorkerKVBucket {
 		t.Errorf("instances a/b overlap: %+v vs %+v", a, b)
 	}
 	for _, n := range []RefreshTopology{a, b, d} {

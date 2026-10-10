@@ -64,6 +64,20 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 	snap := &snapshot{}
 
+	// T150: the indexing status publisher — only with NATS_URL set; a failed
+	// connection disables the status, never the worker.
+	var statusPub *statusPublisher
+	if cfg.NATS.URL != "" {
+		names := config.RefreshNames(cfg.NATS.InstanceID)
+		sp, err := connectWorkerStatus(cfg.NATS.URL, names, logger)
+		if err != nil {
+			logger.Warn("worker status disabled", "err", err)
+		} else {
+			defer sp.Close()
+			statusPub = sp
+		}
+	}
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, 6)
 	run := func(fn func() error) {
@@ -73,7 +87,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	wg.Add(5)
 	go run(func() error { return runDiscovery(ctx, vcs, cfg, logger, snap) })
 	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
-	go run(func() error { return runIndex(ctx, cfg, deps, snap) })
+	go run(func() error { return runIndex(ctx, cfg, deps, snap, statusPub) })
 	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
 	// T140: repo-GC — discovery is the source of truth; dry-run by default.
 	go run(func() error { return runGC(ctx, cfg, deps, snap) })

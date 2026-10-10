@@ -37,6 +37,12 @@ type tools struct {
 	inflight  *flightGroup // in-flight share of refresh_repo (T113)
 	repos     *repoIndex   // nil — the repo filter is passed through as before (T132)
 	auto      *autoClient  // nil when NATS_URL is empty — auto-refresh is off (T134)
+	status    statusReader // nil when NATS_URL is empty — index_status reports unavailable (T151)
+}
+
+// statusReader reads the worker indexing status from the instance KV (T151).
+type statusReader interface {
+	WorkerStatus() ([]byte, bool)
 }
 
 // newTools assembles the tool set; a nil refresher disables refresh_repo.
@@ -127,6 +133,47 @@ type ciHit struct {
 	Snippet    string  `json:"snippet"`
 }
 
+// --- worker indexing status (T151) ---
+
+// workerStatusKVKey is the entry key of the worker_status_<id> KV (T150).
+const workerStatusKVKey = "status"
+
+// indexPassView mirrors the index pass counters of the worker status payload
+// (T150; the write model lives in internal/worker/status.go).
+type indexPassView struct {
+	Repos          int64 `json:"repos"`
+	OK             int64 `json:"ok"`
+	Errors         int64 `json:"errors"`
+	IndexedCommits int64 `json:"indexed_commits"`
+	Resumed        int64 `json:"resumed"`
+	Skipped        int64 `json:"skipped"`
+	Pruned         int64 `json:"pruned"`
+	DurationMS     int64 `json:"duration_ms"`
+}
+
+// workerStatusView is the worker_status_<id> KV payload (key "status").
+type workerStatusView struct {
+	ReposTotal    int            `json:"repos_total"`
+	ReposIndexed  int            `json:"repos_indexed"`
+	ReposPending  int            `json:"repos_pending"`
+	PendingSample []string       `json:"pending_sample"`
+	Points        *uint64        `json:"points,omitempty"` // omitted when the count failed
+	LastPass      *indexPassView `json:"last_pass,omitempty"`
+	UpdatedAt     string         `json:"updated_at"`
+}
+
+// indexStatusInput — index_status takes no arguments.
+type indexStatusInput struct{}
+
+// indexStatusResponse is the index_status answer: always a record. On success
+// the status fields are flattened into the object; an unavailable answer
+// carries the reason instead.
+type indexStatusResponse struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+	*workerStatusView
+}
+
 // registerTools registers the tools from contracts/mcp-tools.md.
 func registerTools(server *mcp.Server, t *tools) {
 	mcp.AddTool(server, &mcp.Tool{
@@ -145,6 +192,11 @@ func registerTools(server *mcp.Server, t *tools) {
 		Name:        "search_ci_failures",
 		Description: "Semantic search over failed CI job logs. The result object is {\"results\": [hits]}.",
 	}, t.searchCIFailures)
+	// T151: registered unconditionally; without NATS it reports available=false.
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "index_status",
+		Description: "Indexing progress: how many repositories are indexed, pending sample, points, last pass stats",
+	}, t.indexStatus)
 	// T113: registered only when NATS_URL is set (the refresh mode is on).
 	if t.refresher != nil {
 		mcp.AddTool(server, &mcp.Tool{
@@ -277,6 +329,24 @@ func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in
 		})
 	}
 	return nil, resultsResponse[ciHit]{Results: hits}, nil
+}
+
+// indexStatus — the indexing progress of this instance (T151): reads the
+// worker_status_<id> KV; the tool is always registered and reports
+// available=false when NATS is off or the worker has not published yet.
+func (t *tools) indexStatus(_ context.Context, _ *mcp.CallToolRequest, _ indexStatusInput) (*mcp.CallToolResult, any, error) {
+	if t.status == nil {
+		return nil, indexStatusResponse{Available: false, Reason: "NATS is not configured"}, nil
+	}
+	data, ok := t.status.WorkerStatus()
+	if !ok {
+		return nil, indexStatusResponse{Available: false, Reason: "no worker status published yet"}, nil
+	}
+	var st workerStatusView
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, indexStatusResponse{Available: false, Reason: "worker status is unreadable"}, nil
+	}
+	return nil, indexStatusResponse{Available: true, workerStatusView: &st}, nil
 }
 
 // splitRepoName splits a full "namespace/path" name into the payload pair:

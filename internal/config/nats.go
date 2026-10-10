@@ -28,7 +28,10 @@ type RefreshTopology struct {
 	Subject    string   // instance request subject: vcsrag.<id>.refresh
 	Consumer   string   // instance pull consumer: worker-refresh-<id>
 	KVBucket   string   // instance status KV: refresh_status_<id>
-	ConnName   string   // connection name: vcs-rag-<id>
+	// WorkerKVBucket is the indexing status KV (T150): the worker periodically
+	// publishes its indexing snapshot there, the MCP index_status tool reads it.
+	WorkerKVBucket string // worker_status_<id>
+	ConnName       string // connection name: vcs-rag-<id>
 }
 
 // RefreshNames builds the names of an instance; an empty id means the default
@@ -38,13 +41,14 @@ func RefreshNames(id string) RefreshTopology {
 		id = NATSDefaultInstance
 	}
 	return RefreshTopology{
-		InstanceID: id,
-		Stream:     NATSStream,
-		Subjects:   []string{NATSSubjects},
-		Subject:    "vcsrag." + id + ".refresh",
-		Consumer:   "worker-refresh-" + id,
-		KVBucket:   "refresh_status_" + id,
-		ConnName:   "vcs-rag-" + id,
+		InstanceID:     id,
+		Stream:         NATSStream,
+		Subjects:       []string{NATSSubjects},
+		Subject:        "vcsrag." + id + ".refresh",
+		Consumer:       "worker-refresh-" + id,
+		KVBucket:       "refresh_status_" + id,
+		WorkerKVBucket: "worker_status_" + id,
+		ConnName:       "vcs-rag-" + id,
 	}
 }
 

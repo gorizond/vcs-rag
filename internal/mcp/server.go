@@ -64,6 +64,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 		tl.refresher = ref
 		tl.inflight = newFlightGroup()
 		tl.auto = newAutoClient(ref, logger) // T134: auto-freshness before repo searches
+		tl.status = ref                      // T151: index_status reads the worker-status KV
 	}
 	registerTools(server, tl)
 

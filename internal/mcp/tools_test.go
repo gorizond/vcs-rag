@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -349,5 +350,90 @@ func TestNormalizeRepoFilterNoIndex(t *testing.T) {
 	}
 	if ms.gotFilter.Repo != "nats" || ms.gotFilter.RepoRefs != nil || ms.gotFilter.GroupOrg != "" {
 		t.Errorf("passthrough filter = %+v", ms.gotFilter)
+	}
+}
+
+// --- T151: index_status ---
+
+// fakeStatusReader serves the worker-status KV bytes.
+type fakeStatusReader struct {
+	data []byte
+	ok   bool
+}
+
+func (f *fakeStatusReader) WorkerStatus() ([]byte, bool) { return f.data, f.ok }
+
+// T151: index_status returns the worker status as a record (structuredContent
+// object + the same content text), never an array.
+func TestIndexStatusTool(t *testing.T) {
+	points := uint64(11)
+	view := workerStatusView{
+		ReposTotal: 3, ReposIndexed: 2, ReposPending: 1,
+		PendingSample: []string{"g/c"}, Points: &points,
+		LastPass:  &indexPassView{Repos: 3, OK: 2, Errors: 1, IndexedCommits: 7, DurationMS: 42},
+		UpdatedAt: "2026-01-01T00:00:00Z",
+	}
+	data, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{},
+		status: &fakeStatusReader{data: data, ok: true}}
+
+	_, out, err := tl.indexStatus(context.Background(), nil, indexStatusInput{})
+	if err != nil {
+		t.Fatalf("indexStatus: %v", err)
+	}
+	resp, ok := out.(indexStatusResponse)
+	if !ok || !resp.Available || resp.ReposIndexed != 2 || resp.PendingSample[0] != "g/c" ||
+		resp.LastPass == nil || resp.LastPass.IndexedCommits != 7 {
+		t.Fatalf("response = %+v (ok=%v)", out, ok)
+	}
+	js := marshalJSON(out)
+	if strings.HasPrefix(strings.TrimSpace(js), "[") {
+		t.Errorf("structured output is an array: %s", js)
+	}
+	for _, want := range []string{`"available":true`, `"repos_total":3`, `"repos_indexed":2`,
+		`"pending_sample":["g/c"]`, `"points":11`, `"indexed_commits":7`, `"updated_at":"2026-01-01T00:00:00Z"`} {
+		if !strings.Contains(js, want) {
+			t.Errorf("JSON does not contain %s: %s", want, js)
+		}
+	}
+}
+
+// T151: unavailable answers are records with available=false and a reason;
+// the nil embedded status keeps them flat (no zeroed status fields).
+func TestIndexStatusUnavailable(t *testing.T) {
+	cases := []struct {
+		name   string
+		status statusReader
+		reason string
+	}{
+		{"no NATS", nil, "NATS is not configured"},
+		{"no data", &fakeStatusReader{}, "no worker status published yet"},
+		{"unreadable", &fakeStatusReader{data: []byte("{"), ok: true}, "worker status is unreadable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}, status: tc.status}
+			_, out, err := tl.indexStatus(context.Background(), nil, indexStatusInput{})
+			if err != nil {
+				t.Fatalf("indexStatus: %v", err)
+			}
+			resp, ok := out.(indexStatusResponse)
+			if !ok || resp.Available || !strings.Contains(resp.Reason, tc.reason) {
+				t.Fatalf("out = %+v", out)
+			}
+			js := marshalJSON(out)
+			if strings.HasPrefix(strings.TrimSpace(js), "[") {
+				t.Errorf("structured output is an array: %s", js)
+			}
+			if !strings.Contains(js, `"available":false`) || !strings.Contains(js, `"reason":`) {
+				t.Errorf("JSON = %s", js)
+			}
+			if strings.Contains(js, `"repos_total"`) {
+				t.Errorf("unavailable response leaked status fields: %s", js)
+			}
+		})
 	}
 }

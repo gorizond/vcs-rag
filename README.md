@@ -201,7 +201,9 @@ validation (dummy is fine). Network mode: `MCP_TRANSPORT=sse MCP_ADDR=:8080` →
 endpoint `http://localhost:8080/mcp`.
 
 Tools: `search_code`, `search_pull_requests`, `search_issues`,
-`search_ci_failures`; backend errors are returned in a structured form
+`search_ci_failures`, `index_status` (the worker indexing progress read from
+the instance status KV; `available=false` until the worker publishes) and, with
+`NATS_URL` set, `refresh_repo`; backend errors are returned in a structured form
 (`{"error": {...}}`), the server does not crash.
 
 ## Release

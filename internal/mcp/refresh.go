@@ -277,6 +277,26 @@ func (r *natsRefresher) Refresh(ctx context.Context, repo string, timeout time.D
 	return r.poll(ctx, kv, key, timeout, task.RequestID)
 }
 
+// WorkerStatus reads the instance worker-status KV (T151): the worker status
+// snapshot published by the index lane; a missing bucket (the worker never
+// published) or an unreadable entry is "no status". The reader never creates
+// the bucket — that is the worker's job.
+func (r *natsRefresher) WorkerStatus() ([]byte, bool) {
+	js, err := r.nc.JetStream()
+	if err != nil {
+		return nil, false
+	}
+	kv, err := js.KeyValue(r.names.WorkerKVBucket)
+	if err != nil {
+		return nil, false
+	}
+	entry, err := kv.Get(workerStatusKVKey)
+	if err != nil {
+		return nil, false
+	}
+	return entry.Value(), true
+}
+
 // poll reads the KV status every 500 ms until done/failed or the timeout.
 // A terminal status is accepted only when it belongs to the requested task
 // (want == "" — a run started earlier and polled without correlation).
