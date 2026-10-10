@@ -1,5 +1,5 @@
-// Package provider описывает VCS-агностичный интерфейс к GitLab/GitHub
-// и нормализованные типы метаданных.
+// Package provider defines a VCS-agnostic interface to GitLab/GitHub
+// and normalized metadata types.
 package provider
 
 import (
@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// ErrNotImplemented возвращают заглушки методов; реализация — US4.
+// ErrNotImplemented is returned by method stubs; implemented in US4.
 var ErrNotImplemented = errors.New("not implemented")
 
-// TailLines возвращает последние n строк текста (n<=0 — без обрезки).
+// TailLines returns the last n lines of the text (n<=0 — no truncation).
 func TailLines(s string, n int) string {
 	if n <= 0 || s == "" {
 		return s
@@ -25,7 +25,7 @@ func TailLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// VCSProvider — источник репозиториев и метаданных (FR-003/004).
+// VCSProvider is a source of repositories and metadata (FR-003/004).
 type VCSProvider interface {
 	Type() string // "gitlab" | "github"
 	ListRepositories(ctx context.Context) ([]Repo, error)
@@ -35,7 +35,7 @@ type VCSProvider interface {
 	PipelineLogTail(ctx context.Context, repo Repo, pipeline Pipeline, job Job, lines int) (string, error)
 }
 
-// Repo — нормализованный репозиторий.
+// Repo is a normalized repository.
 type Repo struct {
 	ID            string
 	Namespace     string
@@ -44,7 +44,7 @@ type Repo struct {
 	DefaultBranch string
 }
 
-// Issue — issue/задача (GitLab issue = GitHub issue).
+// Issue is an issue/task (GitLab issue = GitHub issue).
 type Issue struct {
 	ID        int64
 	Title     string
@@ -66,7 +66,7 @@ type ChangeRequest struct {
 	UpdatedAt    time.Time
 }
 
-// Pipeline — пайплайн CI с задачами.
+// Pipeline is a CI pipeline with jobs.
 type Pipeline struct {
 	ID        string
 	Status    string
@@ -76,7 +76,7 @@ type Pipeline struct {
 	Jobs      []Job
 }
 
-// Job — задача пайплайна.
+// Job is a pipeline job.
 type Job struct {
 	ID         string
 	Name       string
@@ -85,7 +85,7 @@ type Job struct {
 	Duration   time.Duration
 }
 
-// RateLimit — состояние лимитов API.
+// RateLimit is the API rate limit state.
 type RateLimit struct {
 	Remaining  int
 	Reset      time.Time

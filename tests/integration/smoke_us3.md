@@ -1,11 +1,11 @@
-# Smoke US3 — MCP-поиск (T049)
+# Smoke US3 — MCP search (T049)
 
-Дата прогона: 2026-10-10. Изолированный контур Qdrant **:16334** / Ollama **:11435**
-(порты 6334/11434 заняты чужими сервисами; подъём — в `smoke_us2.md`).
+Run date: 2026-10-10. Isolated environment Qdrant **:16334** / Ollama **:11435**
+(ports 6334/11434 are occupied by foreign services; setup — in `smoke_us2.md`).
 
-## 1. Конфиг MCP-клиента (stdio)
+## 1. MCP client config (stdio)
 
-Собрать образ локально: `docker build -t vcs-rag:dev .`
+Build the image locally: `docker build -t vcs-rag:dev .`
 
 Cursor / Claude (`mcpServers`):
 
@@ -26,7 +26,7 @@ Cursor / Claude (`mcpServers`):
 }
 ```
 
-Сетевой режим (streamable HTTP):
+Network mode (streamable HTTP):
 
 ```bash
 docker run -d --name vcs-rag-mcp -p 8080:8080 --network host \
@@ -38,40 +38,40 @@ docker run -d --name vcs-rag-mcp -p 8080:8080 --network host \
 # endpoint: http://localhost:8080/mcp
 ```
 
-## 2. Примеры запросов ко всем инструментам
+## 2. Example requests for all tools
 
-- `search_code`: `{"query": "где main?", "repo": "fixture", "top_k": 5}` →
-  массив `{repo, group_org, branch, file_path, commit_sha, score, snippet}`;
-- `search_pull_requests`: `{"query": "фикс парсера", "state": "opened"}` →
+- `search_code`: `{"query": "where is main?", "repo": "fixture", "top_k": 5}` →
+  an array of `{repo, group_org, branch, file_path, commit_sha, score, snippet}`;
+- `search_pull_requests`: `{"query": "parser fix", "state": "opened"}` →
   `{vcs_type, repo, pr_id, source_branch, target_branch, state, score, snippet}`;
-- `search_issues`: `{"query": "падение при индексации", "repo": "fixture"}` →
+- `search_issues`: `{"query": "crash during indexing", "repo": "fixture"}` →
   `{vcs_type, repo, issue_id, state, score, snippet}`;
-- `search_ci_failures`: `{"query": "timeout в тестах", "branch": "main"}` →
+- `search_ci_failures`: `{"query": "timeout in tests", "branch": "main"}` →
   `{vcs_type, repo, branch, commit_sha, pipeline_id, job_name, score, snippet}`.
 
-`top_k`: по умолчанию 5, максимум 20; `snippet` ≤ 400 символов.
-Ошибки: `{"error": {"code": "...", "message": "..."}}` — сервер не падает.
+`top_k`: default 5, maximum 20; `snippet` ≤ 400 characters.
+Errors: `{"error": {"code": "...", "message": "..."}}` — the server does not crash.
 
-## 3. Наблюдено (e2e `TestE2E_US3`, PASS 17.09 s)
+## 3. Observed (e2e `TestE2E_US3`, PASS 17.09 s)
 
 ```bash
 QDRANT_URL=http://localhost:16334 EMBEDDINGS_BASE_URL=http://localhost:11435 \
 go test -tags e2e ./tests/integration -run TestE2E_US3 -v -count=1
 ```
 
-- проиндексировано точек = **3** (коллекция `vcs_rag_e2e3`);
-- `tools/list` → все 4 инструмента;
-- `tools/call search_code {"query":"main"}` → 3 чанка: `feature.txt`
-  (score 0.649), `main.go` ветки `main` (0.586), `main.go` ветки `feature`
-  (0.586) — присутствуют `fixture`, `main.go`, полный payload;
-- негатив: `QDRANT_URL=http://127.0.0.1:19999` → структурированный ответ
-  `{"code":"qdrant_unavailable","message":"qdrant: поиск: ... connection refused"}`,
-  процесс продолжает отвечать (следующий `tools/list` — OK);
-- CLI: пустой stdin при недоступном Qdrant → штатное завершение (exit 0, без паники).
-- REST-контроль: `count({exact:true})` = 3.
+- indexed points = **3** (collection `vcs_rag_e2e3`);
+- `tools/list` → all 4 tools;
+- `tools/call search_code {"query":"main"}` → 3 chunks: `feature.txt`
+  (score 0.649), `main.go` of branch `main` (0.586), `main.go` of branch `feature`
+  (0.586) — `fixture`, `main.go`, and the full payload are present;
+- negative: `QDRANT_URL=http://127.0.0.1:19999` → structured response
+  `{"code":"qdrant_unavailable","message":"qdrant: search: ... connection refused"}`,
+  the process keeps responding (the next `tools/list` — OK);
+- CLI: empty stdin with an unavailable Qdrant → clean shutdown (exit 0, no panic).
+- REST control: `count({exact:true})` = 3.
 
-## 4. Что осталось на машине
+## 4. What was left on the machine
 
-- Коллекция `vcs_rag_e2e3` (3 точки) в изолированном Qdrant — оставлена для ручных запросов.
-- Контейнеры `vcs-rag-qdrant` / `vcs-rag-ollama` остановлены и удалены после прогона;
-  volume `vcs-rag-ollama` (bge-m3) оставлен.
+- Collection `vcs_rag_e2e3` (3 points) in the isolated Qdrant — kept for manual queries.
+- Containers `vcs-rag-qdrant` / `vcs-rag-ollama` stopped and removed after the run;
+  the `vcs-rag-ollama` volume (bge-m3) was kept.

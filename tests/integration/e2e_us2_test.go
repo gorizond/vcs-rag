@@ -21,7 +21,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/worker"
 )
 
-// envOr возвращает env или дефолт.
+// envOr returns the env value or the default.
 func envOr(name, def string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
@@ -29,10 +29,10 @@ func envOr(name, def string) string {
 	return def
 }
 
-// TestE2E_US2 — сквозной прогон на реальных Qdrant + Ollama.
+// TestE2E_US2 — end-to-end run against real Qdrant + Ollama.
 //
-// Порты по умолчанию 6334/11434 на машине заняты чужими сервисами, поэтому
-// изолированный контур поднимается на 16334/11435 (см. smoke_us2.md):
+// Default ports 6334/11434 are occupied by other services on the host, so
+// the isolated setup runs on 16334/11435 (see smoke_us2.md):
 //
 //	QDRANT_URL=http://localhost:16334 EMBEDDINGS_BASE_URL=http://localhost:11435 \
 //	go test -tags e2e ./tests/integration -run TestE2E_US2 -v -count=1
@@ -41,7 +41,7 @@ func TestE2E_US2(t *testing.T) {
 	defer cancel()
 
 	cfg := &config.Config{}
-	cfg.Provider.Type = "gitlab" // ProcessRepoOnce сеть провайдера не трогает
+	cfg.Provider.Type = "gitlab" // ProcessRepoOnce does not touch provider network
 	cfg.Embeddings = config.Embeddings{
 		Provider: envOr("EMBEDDINGS_PROVIDER", "ollama"),
 		BaseURL:  envOr("EMBEDDINGS_BASE_URL", "http://localhost:11434"),
@@ -71,7 +71,7 @@ func TestE2E_US2(t *testing.T) {
 	}
 	defer st.Close()
 
-	// чистая коллекция
+	// clean collection
 	_ = st.DropCollection(ctx)
 	if err := st.EnsureCollection(ctx, uint64(cfg.Embeddings.Dim)); err != nil {
 		t.Fatalf("EnsureCollection: %v", err)
@@ -94,7 +94,7 @@ func TestE2E_US2(t *testing.T) {
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
-	// 1) первый проход
+	// 1) first pass
 	if err := worker.ProcessRepoOnce(ctx, deps, repo); err != nil {
 		t.Fatalf("ProcessRepoOnce: %v", err)
 	}
@@ -103,11 +103,11 @@ func TestE2E_US2(t *testing.T) {
 		t.Fatalf("Count: %v", err)
 	}
 	if count1 == 0 {
-		t.Fatal("count после первого прохода = 0")
+		t.Fatal("count after first pass = 0")
 	}
-	t.Logf("read-back: count после первого прохода = %d", count1)
+	t.Logf("read-back: count after first pass = %d", count1)
 
-	// payload code-точки полон (SC-006)
+	// code point payload is complete (SC-006)
 	payloads, err := st.ScrollPayloads(ctx, 10)
 	if err != nil {
 		t.Fatalf("ScrollPayloads: %v", err)
@@ -121,28 +121,28 @@ func TestE2E_US2(t *testing.T) {
 		foundCode = true
 		for _, key := range required {
 			if _, ok := p[key]; !ok {
-				t.Errorf("payload code-точки без поля %q: %v", key, p)
+				t.Errorf("code point payload missing field %q: %v", key, p)
 			}
 		}
 	}
 	if !foundCode {
-		t.Fatalf("code-точек нет среди payload: %v", payloads)
+		t.Fatalf("no code points among payloads: %v", payloads)
 	}
 
-	// 2) повторный проход — идемпотентность (SC-002, FR-011)
+	// 2) repeated pass — idempotency (SC-002, FR-011)
 	if err := worker.ProcessRepoOnce(ctx, deps, repo); err != nil {
-		t.Fatalf("ProcessRepoOnce (повтор): %v", err)
+		t.Fatalf("ProcessRepoOnce (repeat): %v", err)
 	}
 	count2, err := st.Count(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count2 != count1 {
-		t.Errorf("идемпотентность нарушена: count %d → %d", count1, count2)
+		t.Errorf("idempotency violated: count %d → %d", count1, count2)
 	}
-	t.Logf("read-back: count после повторного прохода = %d (не вырос)", count2)
+	t.Logf("read-back: count after repeated pass = %d (did not grow)", count2)
 
-	// 3) prune: удаление файла feature.txt в ветке feature + коммит
+	// 3) prune: delete feature.txt in the feature branch + commit
 	runGit(t, src, "checkout", "feature")
 	runGit(t, src, "rm", "feature.txt")
 	runGit(t, src, "commit", "-m", "c5: delete feature.txt")
@@ -154,9 +154,9 @@ func TestE2E_US2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("read-back: count после удаления файла = %d", count3)
+	t.Logf("read-back: count after file deletion = %d", count3)
 	if count3 >= count2 {
-		t.Errorf("prune не сработал: count %d → %d", count2, count3)
+		t.Errorf("prune did not work: count %d → %d", count2, count3)
 	}
 	payloads, err = st.ScrollPayloads(ctx, 100)
 	if err != nil {
@@ -164,18 +164,18 @@ func TestE2E_US2(t *testing.T) {
 	}
 	for _, p := range payloads {
 		if p["file_path"] == "feature.txt" {
-			t.Errorf("точки удалённого файла остались: %v", p)
+			t.Errorf("points of the deleted file remain: %v", p)
 		}
 	}
 
-	// 4) негативный контроль SC-004: рабочих файлов кода на диске нет —
-	// только git-интерналы зеркала + sidecar-состояние.
+	// 4) negative control SC-004: no working code files on disk —
+	// only the mirror's git internals + sidecar state.
 	mirrorPath := filepath.Join(cfg.Worker.MirrorsDir, "gitlab", "e2e_grp", "fixture.git")
 	if _, err := os.Stat(gitengine.StatePath(mirrorPath)); err != nil {
-		t.Errorf("state-файл не найден: %v", err)
+		t.Errorf("state file not found: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(mirrorPath, "main.go")); err == nil {
-		t.Error("негативный контроль: main.go найден в корне зеркала (рабочие файлы не должны создаваться)")
+		t.Error("negative control: main.go found in the mirror root (working files must not be created)")
 	}
 	err = filepath.WalkDir(cfg.Worker.MirrorsDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -185,7 +185,7 @@ func TestE2E_US2(t *testing.T) {
 			return nil
 		}
 		if !strings.Contains(path, ".git"+string(filepath.Separator)) {
-			t.Errorf("файл вне git-интерналов зеркала: %s", path)
+			t.Errorf("file outside the mirror's git internals: %s", path)
 		}
 		return nil
 	})

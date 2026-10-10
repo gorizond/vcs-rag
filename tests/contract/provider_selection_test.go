@@ -7,8 +7,8 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider/factory"
 )
 
-// TestFactorySelectsProvider: фабрика выбирает провайдера по конфигу;
-// конструктор не делает сетевых вызовов (base URL заведомо недоступен).
+// TestFactorySelectsProvider: the factory selects a provider from config;
+// the constructor makes no network calls (base URL is deliberately unreachable).
 func TestFactorySelectsProvider(t *testing.T) {
 	gitlabCfg := &config.Config{}
 	gitlabCfg.Provider.Type = "gitlab"
@@ -37,9 +37,9 @@ func TestFactorySelectsProvider(t *testing.T) {
 	}
 }
 
-// TestFactoryUnknownProvider: пустой/неизвестный тип — ошибка (exit 2 — на уровне main).
+// TestFactoryUnknownProvider: empty/unknown type — error (exit 2 at the main level).
 func TestFactoryUnknownProvider(t *testing.T) {
 	if _, err := factory.New(&config.Config{}); err == nil {
-		t.Error("factory.New(пустой провайдер) = nil error, ожидалась ошибка")
+		t.Error("factory.New(empty provider) = nil error, expected an error")
 	}
 }

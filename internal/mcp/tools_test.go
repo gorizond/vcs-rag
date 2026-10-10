@@ -9,7 +9,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// mockSearcher — мок store.Searcher: фиксирует фильтр/topK.
+// mockSearcher — a mock store.Searcher: records the filter/topK.
 type mockSearcher struct {
 	gotFilter store.Filter
 	gotTopK   int
@@ -28,7 +28,7 @@ func (m *mockSearcher) Search(_ context.Context, _ []float32, f store.Filter, to
 	return m.points, nil
 }
 
-// mockEmbedder — мок embedder: вектор на каждый текст.
+// mockEmbedder — a mock embedder: a vector per text.
 type mockEmbedder struct {
 	err   error
 	calls int
@@ -61,14 +61,14 @@ func TestSearchCodeFilterAndResponse(t *testing.T) {
 		t.Fatalf("searchCode: %v", err)
 	}
 	if ms.gotFilter.Type != "code" || ms.gotFilter.Repo != "fixture" {
-		t.Errorf("фильтр = %+v, ожидался type=code repo=fixture", ms.gotFilter)
+		t.Errorf("filter = %+v, expected type=code repo=fixture", ms.gotFilter)
 	}
 	if ms.gotTopK != defaultTopK {
-		t.Errorf("top_k = %d, ожидался default %d", ms.gotTopK, defaultTopK)
+		t.Errorf("top_k = %d, expected default %d", ms.gotTopK, defaultTopK)
 	}
 	hits, ok := out.([]codeHit)
 	if !ok {
-		t.Fatalf("out = %T, ожидался []codeHit", out)
+		t.Fatalf("out = %T, expected []codeHit", out)
 	}
 	if len(hits) != 1 || hits[0].FilePath != "main.go" || hits[0].Score != 0.87 {
 		t.Errorf("hits = %+v", hits)
@@ -76,7 +76,7 @@ func TestSearchCodeFilterAndResponse(t *testing.T) {
 	js := marshalJSON(out)
 	for _, want := range []string{`"repo":"fixture"`, `"file_path":"main.go"`, `"commit_sha":"abc"`, `"score":0.87`, `"snippet":"func main() {}"`} {
 		if !strings.Contains(js, want) {
-			t.Errorf("JSON не содержит %s: %s", want, js)
+			t.Errorf("JSON does not contain %s: %s", want, js)
 		}
 	}
 }
@@ -90,10 +90,10 @@ func TestTopKClamping(t *testing.T) {
 			t.Fatalf("searchCode(top_k=%d): %v", tc.in, err)
 		}
 		if ms.gotTopK != tc.want {
-			t.Errorf("top_k %d → %d, ожидалось %d", tc.in, ms.gotTopK, tc.want)
+			t.Errorf("top_k %d → %d, expected %d", tc.in, ms.gotTopK, tc.want)
 		}
 		if ms.gotFilter.Type != "code" {
-			t.Errorf("фильтр type = %q, ожидался code", ms.gotFilter.Type)
+			t.Errorf("filter type = %q, expected code", ms.gotFilter.Type)
 		}
 	}
 }
@@ -108,13 +108,13 @@ func TestSnippetLimit(t *testing.T) {
 	}
 	hit := out.([]codeHit)[0]
 	if n := len([]rune(hit.Snippet)); n > maxSnippet {
-		t.Errorf("snippet %d символов > %d", n, maxSnippet)
+		t.Errorf("snippet %d characters > %d", n, maxSnippet)
 	}
 	if !strings.HasSuffix(hit.Snippet, "…") {
-		t.Error("snippet не обрезан многоточием")
+		t.Error("snippet is not truncated with an ellipsis")
 	}
-	if snip := snippet("короткий текст"); snip != "короткий текст" {
-		t.Errorf("короткий текст изменён: %q", snip)
+	if snip := snippet("short text"); snip != "short text" {
+		t.Errorf("short text changed: %q", snip)
 	}
 }
 
@@ -125,27 +125,27 @@ func TestToolErrors(t *testing.T) {
 		searchErr error
 		wantCode  string
 	}{
-		{name: "qdrant недоступен", searchErr: errors.New("connection refused"), wantCode: codeSearchFailed},
-		{name: "эмбеддинги недоступны", embedErr: errors.New("ollama: dial tcp: refused"), wantCode: codeEmbedFailed},
-		{name: "таймаут", searchErr: context.DeadlineExceeded, wantCode: codeTimeout},
-		{name: "отмена", searchErr: context.Canceled, wantCode: codeCanceled},
+		{name: "qdrant unavailable", searchErr: errors.New("connection refused"), wantCode: codeSearchFailed},
+		{name: "embeddings unavailable", embedErr: errors.New("ollama: dial tcp: refused"), wantCode: codeEmbedFailed},
+		{name: "timeout", searchErr: context.DeadlineExceeded, wantCode: codeTimeout},
+		{name: "canceled", searchErr: context.Canceled, wantCode: codeCanceled},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			tl := &tools{embedder: &mockEmbedder{err: tc.embedErr}, searcher: &mockSearcher{err: tc.searchErr}}
 			_, out, err := tl.searchCode(context.Background(), nil, searchCodeInput{Query: "x"})
 			if err != nil {
-				t.Fatalf("handler вернул protocol-ошибку %v, ожидался структурированный ответ", err)
+				t.Fatalf("handler returned protocol error %v, expected a structured response", err)
 			}
 			te, ok := out.(toolError)
 			if !ok {
-				t.Fatalf("out = %T, ожидался toolError", out)
+				t.Fatalf("out = %T, expected toolError", out)
 			}
 			if te.Code != tc.wantCode {
 				t.Errorf("code = %q, want %q", te.Code, tc.wantCode)
 			}
 			if te.Message == "" {
-				t.Error("message пуст")
+				t.Error("message is empty")
 			}
 			if !strings.Contains(marshalJSON(out), `"code":"`+tc.wantCode+`"`) {
 				t.Errorf("JSON = %s", marshalJSON(out))
@@ -168,7 +168,7 @@ func TestSearchPRsIssuesCIFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	if prSearcher.gotFilter.Type != "pull_request" || prSearcher.gotFilter.State != "opened" {
-		t.Errorf("фильтр PR = %+v", prSearcher.gotFilter)
+		t.Errorf("PR filter = %+v", prSearcher.gotFilter)
 	}
 	pr := out.([]prHit)[0]
 	if pr.PRID != 42 || pr.SourceBranch != "feat" || pr.State != "opened" {
@@ -190,7 +190,7 @@ func TestSearchPRsIssuesCIFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	if issueSearcher.gotFilter.Type != "issue" {
-		t.Errorf("фильтр issues = %+v", issueSearcher.gotFilter)
+		t.Errorf("issues filter = %+v", issueSearcher.gotFilter)
 	}
 	if issue := out.([]issueHit)[0]; issue.IssueID != 7 || issue.State != "closed" {
 		t.Errorf("issueHit = %+v", issue)
@@ -209,7 +209,7 @@ func TestSearchPRsIssuesCIFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ciSearcher.gotFilter.Type != "ci_failure" || ciSearcher.gotFilter.Branch != "main" {
-		t.Errorf("фильтр CI = %+v", ciSearcher.gotFilter)
+		t.Errorf("CI filter = %+v", ciSearcher.gotFilter)
 	}
 	if ci := out.([]ciHit)[0]; ci.PipelineID != "100" || ci.JobName != "build" {
 		t.Errorf("ciHit = %+v", ci)
@@ -223,6 +223,6 @@ func TestEmptyResultIsEmptyArray(t *testing.T) {
 		t.Fatal(err)
 	}
 	if js := marshalJSON(out); js != "[]" {
-		t.Errorf("пустой результат = %s, ожидался []", js)
+		t.Errorf("empty result = %s, expected []", js)
 	}
 }

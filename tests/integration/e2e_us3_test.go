@@ -24,15 +24,15 @@ import (
 	"github.com/gorizond/vcs-rag/internal/worker"
 )
 
-// discardLogger — тихий логгер для e2e.
+// discardLogger — a quiet logger for e2e.
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-// TestE2E_US3 — сквозной прогон MCP-поиска: индексация фикстуры (как US2) →
-// подпроцесс `-mode=mcp` (stdio) → JSON-RPC initialize/tools/list/tools/call
-// search_code → структурированная ошибка при недоступном Qdrant.
+// TestE2E_US3 — end-to-end MCP search run: fixture indexing (as in US2) →
+// `-mode=mcp` subprocess (stdio) → JSON-RPC initialize/tools/list/tools/call
+// search_code → structured error when Qdrant is unavailable.
 //
-// Контур — изолированный (16334/11435; порты 6334/11434 заняты чужими
-// сервисами), команды — в smoke_us2.md / smoke_us3.md:
+// The setup is isolated (16334/11435; ports 6334/11434 are occupied by other
+// services), commands are in smoke_us2.md / smoke_us3.md:
 //
 //	QDRANT_URL=http://localhost:16334 EMBEDDINGS_BASE_URL=http://localhost:11435 \
 //	go test -tags e2e ./tests/integration -run TestE2E_US3 -v -count=1
@@ -61,7 +61,7 @@ func TestE2E_US3(t *testing.T) {
 		MaxFileBytes:      1 << 20,
 	}
 
-	// 1) индексация фикстуры (по образцу e2e_us2)
+	// 1) fixture indexing (following e2e_us2)
 	emb, err := embed.New(cfg)
 	if err != nil {
 		t.Fatalf("embed.New: %v", err)
@@ -98,12 +98,12 @@ func TestE2E_US3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("read-back: проиндексировано точек = %d", count)
+	t.Logf("read-back: indexed points = %d", count)
 	if count == 0 {
 		t.Fatal("count = 0")
 	}
 
-	// 2) сборка бинарника
+	// 2) build the binary
 	bin := filepath.Join(t.TempDir(), "vcs-rag")
 	build := exec.CommandContext(ctx, "go", "build", "-o", bin, "github.com/gorizond/vcs-rag/cmd/vcs-rag")
 	if out, err := build.CombinedOutput(); err != nil {
@@ -118,32 +118,32 @@ func TestE2E_US3(t *testing.T) {
 	}
 	initParams := `{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}`
 
-	// 3) рабочий контур: stdio + реальные Qdrant/Ollama
+	// 3) working setup: stdio + real Qdrant/Ollama
 	proc := startMCP(t, bin, append(append([]string{}, baseEnv...), "QDRANT_URL="+cfg.Qdrant.URL))
 	defer proc.stop(t)
 
 	if resp := proc.call(t, 1, "initialize", initParams); !strings.Contains(resp, `"vcs-rag"`) {
-		t.Errorf("initialize без serverInfo: %s", resp)
+		t.Errorf("initialize without serverInfo: %s", resp)
 	}
 	proc.notify(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 
 	toolsResp := proc.call(t, 2, "tools/list", `{}`)
 	for _, name := range []string{"search_code", "search_pull_requests", "search_issues", "search_ci_failures"} {
 		if !strings.Contains(toolsResp, name) {
-			t.Errorf("tools/list без %s: %s", name, truncateForLog(toolsResp, 300))
+			t.Errorf("tools/list missing %s: %s", name, truncateForLog(toolsResp, 300))
 		}
 	}
 
 	searchResp := proc.call(t, 3, "tools/call", `{"name":"search_code","arguments":{"query":"main"}}`)
 	t.Logf("read-back: search_code = %s", truncateForLog(searchResp, 700))
 	if !strings.Contains(searchResp, "fixture") {
-		t.Errorf("ответ search_code без fixture: %s", truncateForLog(searchResp, 500))
+		t.Errorf("search_code response missing fixture: %s", truncateForLog(searchResp, 500))
 	}
 	if !strings.Contains(searchResp, "main.go") {
-		t.Errorf("ответ search_code без main.go: %s", truncateForLog(searchResp, 500))
+		t.Errorf("search_code response missing main.go: %s", truncateForLog(searchResp, 500))
 	}
 
-	// 4) негатив: Qdrant недоступен — структурированная ошибка, процесс жив
+	// 4) negative: Qdrant unavailable — structured error, process stays alive
 	badEnv := append(append([]string{}, baseEnv...), "QDRANT_URL=http://127.0.0.1:19999")
 	bad := startMCP(t, bin, badEnv)
 	defer bad.stop(t)
@@ -151,17 +151,17 @@ func TestE2E_US3(t *testing.T) {
 	bad.call(t, 1, "initialize", initParams)
 	bad.notify(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	errResp := bad.call(t, 2, "tools/call", `{"name":"search_code","arguments":{"query":"main"}}`)
-	t.Logf("read-back: search_code при недоступном Qdrant = %s", truncateForLog(errResp, 300))
+	t.Logf("read-back: search_code with Qdrant unavailable = %s", truncateForLog(errResp, 300))
 	if !strings.Contains(errResp, "qdrant_unavailable") {
-		t.Errorf("нет структурированной ошибки: %s", truncateForLog(errResp, 400))
+		t.Errorf("no structured error: %s", truncateForLog(errResp, 400))
 	}
 	alive := bad.call(t, 3, "tools/list", `{}`)
 	if !strings.Contains(alive, "search_code") {
-		t.Errorf("процесс не отвечает после ошибки: %s", truncateForLog(alive, 300))
+		t.Errorf("process is not responding after the error: %s", truncateForLog(alive, 300))
 	}
 }
 
-// truncateForLog обрезает строку для лога.
+// truncateForLog truncates a string for logging.
 func truncateForLog(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -169,7 +169,7 @@ func truncateForLog(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// mcpProcess — stdio-подпроцесс MCP-сервера.
+// mcpProcess — stdio subprocess of the MCP server.
 type mcpProcess struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -177,7 +177,7 @@ type mcpProcess struct {
 	stderr *os.File
 }
 
-// startMCP запускает бинарь в режиме mcp и читает stdout построчно.
+// startMCP starts the binary in mcp mode and reads stdout line by line.
 func startMCP(t *testing.T, bin string, extraEnv []string) *mcpProcess {
 	t.Helper()
 	cmd := exec.Command(bin, "-mode=mcp")
@@ -210,24 +210,24 @@ func startMCP(t *testing.T, bin string, extraEnv []string) *mcpProcess {
 	return &mcpProcess{cmd: cmd, stdin: stdin, lines: lines, stderr: stderrFile}
 }
 
-// notify отправляет JSON-RPC-уведомление (без id).
+// notify sends a JSON-RPC notification (no id).
 func (p *mcpProcess) notify(line string) {
 	_, _ = fmt.Fprintln(p.stdin, line)
 }
 
-// call отправляет запрос и ждёт ответ с тем же id.
+// call sends a request and waits for a response with the same id.
 func (p *mcpProcess) call(t *testing.T, id int, method, params string) string {
 	t.Helper()
 	req := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":%q,"params":%s}`, id, method, params)
 	if _, err := fmt.Fprintln(p.stdin, req); err != nil {
-		t.Fatalf("запись в stdin: %v", err)
+		t.Fatalf("write to stdin: %v", err)
 	}
-	timeout := time.After(3 * time.Minute) // запас на холодный старт эмбеддингов
+	timeout := time.After(3 * time.Minute) // headroom for cold start of embeddings
 	for {
 		select {
 		case line, ok := <-p.lines:
 			if !ok {
-				t.Fatalf("сервер закрыл stdout; stderr:\n%s", p.stderrText())
+				t.Fatalf("server closed stdout; stderr:\n%s", p.stderrText())
 			}
 			var resp struct {
 				ID *int `json:"id"`
@@ -239,18 +239,18 @@ func (p *mcpProcess) call(t *testing.T, id int, method, params string) string {
 				return line
 			}
 		case <-timeout:
-			t.Fatalf("таймаут ответа id=%d; stderr:\n%s", id, p.stderrText())
+			t.Fatalf("response timeout id=%d; stderr:\n%s", id, p.stderrText())
 		}
 	}
 }
 
-// stderrText читает накопленный stderr подпроцесса.
+// stderrText reads the accumulated stderr of the subprocess.
 func (p *mcpProcess) stderrText() string {
 	data, _ := os.ReadFile(p.stderr.Name())
 	return string(data)
 }
 
-// stop закрывает stdin (EOF → штатное завершение) с запасным kill.
+// stop closes stdin (EOF → graceful shutdown) with a fallback kill.
 func (p *mcpProcess) stop(t *testing.T) {
 	t.Helper()
 	_ = p.stdin.Close()

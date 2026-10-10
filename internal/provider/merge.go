@@ -1,7 +1,7 @@
 package provider
 
-// MergeRepos дедуплицирует репозитории по ID, сохраняя порядок первого
-// появления. Входные списки — сотни элементов, O(n) по памяти приемлемо.
+// MergeRepos deduplicates repositories by ID, keeping first-appearance order.
+// Input lists are hundreds of entries; O(n) memory is acceptable.
 func MergeRepos(repos []Repo) []Repo {
 	seen := make(map[string]bool, len(repos))
 	out := make([]Repo, 0, len(repos))

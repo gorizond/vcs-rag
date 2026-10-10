@@ -1,4 +1,4 @@
-// GitLab-метаданные: issues, MR, пайплайны и хвосты логов (US4/FR-012).
+// GitLab metadata: issues, MRs, pipelines and log tails (US4/FR-012).
 package gitlab
 
 import (
@@ -13,7 +13,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// repoFullPath — полный путь проекта GitLab ("namespace/path").
+// repoFullPath returns the full GitLab project path ("namespace/path").
 func repoFullPath(repo provider.Repo) string {
 	if repo.Namespace == "" {
 		return repo.Path
@@ -21,7 +21,7 @@ func repoFullPath(repo provider.Repo) string {
 	return repo.Namespace + "/" + repo.Path
 }
 
-// timeOrZero разыменовывает *time.Time.
+// timeOrZero dereferences *time.Time.
 func timeOrZero(t *time.Time) time.Time {
 	if t == nil {
 		return time.Time{}
@@ -29,7 +29,7 @@ func timeOrZero(t *time.Time) time.Time {
 	return *t
 }
 
-// ListIssues возвращает issues проекта (все страницы).
+// ListIssues returns the project issues (all pages).
 func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider.Issue, error) {
 	pid := repoFullPath(repo)
 	opt := &gitlab.ListProjectIssuesOptions{ListOptions: gitlab.ListOptions{PerPage: 100}}
@@ -57,7 +57,7 @@ func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider
 	return out, nil
 }
 
-// ListChangeRequests возвращает MR проекта (все страницы).
+// ListChangeRequests returns the project MRs (all pages).
 func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]provider.ChangeRequest, error) {
 	pid := repoFullPath(repo)
 	opt := &gitlab.ListProjectMergeRequestsOptions{ListOptions: gitlab.ListOptions{PerPage: 100}}
@@ -87,8 +87,8 @@ func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]
 	return out, nil
 }
 
-// ListPipelines возвращает окно CI_WINDOW последних пайплайнов; jobs
-// подтягиваются только для упавших пайплайнов (metadata-линия смотрит только их).
+// ListPipelines returns the CI_WINDOW of recent pipelines; jobs are fetched
+// only for failed pipelines (the metadata lane looks at those only).
 func (c *Client) ListPipelines(ctx context.Context, repo provider.Repo) ([]provider.Pipeline, error) {
 	pid := repoFullPath(repo)
 	opt := &gitlab.ListProjectPipelinesOptions{ListOptions: gitlab.ListOptions{PerPage: int64(c.ciWindow)}}
@@ -126,8 +126,8 @@ func (c *Client) ListPipelines(ctx context.Context, repo provider.Repo) ([]provi
 	return out, nil
 }
 
-// PipelineLogTail возвращает последние lines строк trace job'а
-// (полный лог в памяти не удерживается).
+// PipelineLogTail returns the last lines lines of the job trace
+// (the full log is not kept in memory).
 func (c *Client) PipelineLogTail(ctx context.Context, repo provider.Repo, pipeline provider.Pipeline, job provider.Job, lines int) (string, error) {
 	jobID, err := strconv.ParseInt(job.ID, 10, 64)
 	if err != nil {
@@ -139,7 +139,7 @@ func (c *Client) PipelineLogTail(ctx context.Context, repo provider.Repo, pipeli
 	}
 	logText, err := io.ReadAll(reader)
 	if err != nil {
-		return "", fmt.Errorf("gitlab: чтение trace job %s: %w", job.ID, err)
+		return "", fmt.Errorf("gitlab: read trace job %s: %w", job.ID, err)
 	}
 	return provider.TailLines(string(logText), lines), nil
 }

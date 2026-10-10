@@ -1,45 +1,45 @@
 # vcs-rag
 
-Self-hosted, VCS-agnostic RAG-сервис по исходному коду и метаданным репозиториев.
-Альтернатива GitLab Orbit: зеркалирует репозитории (GitLab/GitHub), чанкует код,
-строит embeddings и отдаёт поиск через MCP-сервер.
+Self-hosted, VCS-agnostic RAG service over source code and repository metadata.
+An alternative to GitLab Orbit: mirrors repositories (GitLab/GitHub), chunks
+code, builds embeddings, and serves search via an MCP server.
 
-Один бинарник — два режима:
+One binary — two modes:
 
-| Режим | Назначение |
-|-------|------------|
-| `-mode=worker` | зеркалирование репозиториев, чанкинг, эмбеддинги, запись в Qdrant |
-| `-mode=mcp` | MCP-сервер поиска по коду/PR/issues/CI-фейлам |
+| Mode | Purpose |
+|------|---------|
+| `-mode=worker` | repository mirroring, chunking, embeddings, writes to Qdrant |
+| `-mode=mcp` | MCP server for search over code/PRs/issues/CI failures |
 
-## Ключевые переменные окружения
+## Key environment variables
 
-| Переменная | Описание |
-|------------|----------|
-| `GITLAB_GROUP_ID` / `GITLAB_TOKEN` | группа GitLab (список через запятую) и токен доступа |
-| `GITHUB_ORG` / `GITHUB_TOKEN` | организация GitHub (список) и токен доступа |
-| `GITLAB_BASE_URL` / `GITHUB_BASE_URL` | self-hosted/GHES endpoint (опционально) |
-| `EMBEDDINGS_PROVIDER` | `ollama` или `lm-studio` |
-| `EMBEDDINGS_BASE_URL` / `EMBEDDINGS_MODEL` | endpoint и модель эмбеддингов |
-| `EMBEDDINGS_DIM` | размерность векторов (default 1024) |
-| `QDRANT_URL` / `QDRANT_COLLECTION` | gRPC-адрес Qdrant и имя коллекции |
-| `MCP_TRANSPORT` / `MCP_ADDR` | `stdio` (default) или `sse`; адрес для sse |
-| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | тик проходов и параллелизм |
-| `MIRRORS_DIR` | каталог bare-зеркал (по умолчанию `./mirrors`) |
+| Variable | Description |
+|----------|-------------|
+| `GITLAB_GROUP_ID` / `GITLAB_TOKEN` | GitLab group (comma-separated list) and access token |
+| `GITHUB_ORG` / `GITHUB_TOKEN` | GitHub organization (list) and access token |
+| `GITLAB_BASE_URL` / `GITHUB_BASE_URL` | self-hosted/GHES endpoint (optional) |
+| `EMBEDDINGS_PROVIDER` | `ollama` or `lm-studio` |
+| `EMBEDDINGS_BASE_URL` / `EMBEDDINGS_MODEL` | embeddings endpoint and model |
+| `EMBEDDINGS_DIM` | vector dimension (default 1024) |
+| `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant gRPC address and collection name |
+| `MCP_TRANSPORT` / `MCP_ADDR` | `stdio` (default) or `sse`; address for sse |
+| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | pass tick and concurrency |
+| `MIRRORS_DIR` | bare mirror directory (default `./mirrors`) |
 
-Смена GitLab ↔ GitHub — только env: ядро не меняется (оба провайдера за одним
-интерфейсом, проходят один контрактный набор).
+Switching GitLab ↔ GitHub is env-only: the core does not change (both providers
+share one interface and pass one contract suite).
 
-Эмбеддинги — целевая модель **`bge-m3`** (dim 1024, COSINE): в Ollama
-(`ollama pull bge-m3`) или в LM Studio (GGUF-билд, напр. `lm-kit/bge-m3-gguf`;
-локальный сервер включается в UI). Провайдеры взаимозаменяемы — переключение
-только env; имя коллекции Qdrant — `QDRANT_COLLECTION` (default `vcs_rag`).
-Другая модель/размерность — только по процедуре reindex
-([`docs/reindex.md`](docs/reindex.md)). Для LM Studio:
+Embeddings — the target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
+(`ollama pull bge-m3`) or in LM Studio (GGUF build, e.g. `lm-kit/bge-m3-gguf`;
+the local server is enabled in the UI). The providers are interchangeable —
+switching is env-only; the Qdrant collection name is `QDRANT_COLLECTION`
+(default `vcs_rag`). A different model/dimension only via the reindex procedure
+([`docs/reindex.md`](docs/reindex.md)). For LM Studio:
 `EMBEDDINGS_PROVIDER=lm-studio`,
 `EMBEDDINGS_BASE_URL=http://localhost:1234`,
-`EMBEDDINGS_MODEL=<identifier из LM Studio>`, `EMBEDDINGS_DIM=1024`.
+`EMBEDDINGS_MODEL=<identifier from LM Studio>`, `EMBEDDINGS_DIM=1024`.
 
-## Запуск
+## Running
 
 ```bash
 docker build -t vcs-rag:dev .
@@ -47,30 +47,30 @@ docker run --rm vcs-rag:dev            # → vcs-rag dev
 docker run --rm vcs-rag:dev -version   # → vcs-rag <version>
 ```
 
-Воркер (нужны доступные Qdrant и Ollama/LM Studio; токены — только env):
+Worker (requires reachable Qdrant and Ollama/LM Studio; tokens via env only):
 
 ```bash
-# GitLab: группа или список групп (подгруппы включены, дедуп по ID)
+# GitLab: group or list of groups (subgroups included, dedup by ID)
 docker run --rm --network host \
-  -e GITLAB_GROUP_ID=<group-или-список> -e GITLAB_TOKEN=<read_api-токен> \
+  -e GITLAB_GROUP_ID=<group-or-list> -e GITLAB_TOKEN=<read_api-token> \
   -e EMBEDDINGS_PROVIDER=ollama -e QDRANT_URL=http://localhost:6334 \
   -v "$PWD/mirrors":/mirrors vcs-rag:dev -mode=worker
 
-# GitHub: организация или список
+# GitHub: organization or list
 docker run --rm --network host \
-  -e GITHUB_ORG=<org-или-список> -e GITHUB_TOKEN=<repo-read-токен> \
+  -e GITHUB_ORG=<org-or-list> -e GITHUB_TOKEN=<repo-read-token> \
   -e EMBEDDINGS_PROVIDER=ollama -e QDRANT_URL=http://localhost:6334 \
   -v "$PWD/mirrors":/mirrors vcs-rag:dev -mode=worker
 ```
 
-Приватные репозитории: токен передаётся git-процессам через окружение
-(`http.extraHeader`, Basic: GitLab `oauth2:<token>`, GitHub
-`x-access-token:<token>`) — в URL клона и `.git/config` зеркала он не
-сохраняется; локальные git-операции выполняются без токена.
+Private repositories: the token is passed to git processes through the
+environment (`http.extraHeader`, Basic: GitLab `oauth2:<token>`, GitHub
+`x-access-token:<token>`) — it is not stored in the clone URL or the mirror's
+`.git/config`; local git operations run without the token.
 
 ## MCP: Cursor / Claude
 
-stdio (в конфиг клиента, `mcpServers`):
+stdio (into the client config, `mcpServers`):
 
 ```json
 {"mcpServers": {"vcs-rag": {"command": "docker", "args": [
@@ -80,31 +80,31 @@ stdio (в конфиг клиента, `mcpServers`):
   "vcs-rag:dev", "-mode=mcp"]}}}
 ```
 
-Для поиска VCS-доступ не нужен: провайдерные env требуются только валидацией
-конфига (можно dummy). Сетевой режим: `MCP_TRANSPORT=sse MCP_ADDR=:8080` →
+Search needs no VCS access: provider envs are required only for config
+validation (dummy is fine). Network mode: `MCP_TRANSPORT=sse MCP_ADDR=:8080` →
 endpoint `http://localhost:8080/mcp`.
 
-Инструменты: `search_code`, `search_pull_requests`, `search_issues`,
-`search_ci_failures`; ошибки бэкендов возвращаются структурированно
-(`{"error": {...}}`), сервер не падает.
+Tools: `search_code`, `search_pull_requests`, `search_issues`,
+`search_ci_failures`; backend errors are returned in a structured form
+(`{"error": {...}}`), the server does not crash.
 
-## Релиз
+## Release
 
-Образы — `ghcr.io/gorizond/vcs-rag:<tag>` (semver-теги без префикса `v`, напр.
-`0.0.1`/`0.0`/`0`, и `latest`; rc-теги — только версия + Pre-release, `latest`
-не двигают); версия вшивается на сборке (`--build-arg VERSION=...` из имени
-git-тега, release-workflow):
+Images — `ghcr.io/gorizond/vcs-rag:<tag>` (semver tags without the `v` prefix,
+e.g. `0.0.1`/`0.0`/`0`, and `latest`; rc tags — version only + Pre-release, they
+do not move `latest`); the version is baked in at build time (`--build-arg
+VERSION=...` from the git tag name, release workflow):
 
 ```bash
 docker pull ghcr.io/gorizond/vcs-rag:0.0.1
 docker run --rm ghcr.io/gorizond/vcs-rag:0.0.1 -version   # → vcs-rag v0.0.1
 ```
 
-## Обслуживание
+## Maintenance
 
-- Смена модели/размерности эмбеддингов — процедура reindex: [`docs/reindex.md`](docs/reindex.md).
-- Валидация SC-001…SC-009 и перф-база — `tests/integration/final-validation.md`,
+- Changing the embeddings model/dimension — reindex procedure: [`docs/reindex.md`](docs/reindex.md).
+- Validation SC-001…SC-009 and the performance baseline — `tests/integration/final-validation.md`,
   `tests/integration/perf-baseline.md`.
 
-Полные контракты (CLI, MCP-инструменты, схема Qdrant) — в spec-kit проекта
-(репозиторий 0_WORK), см. `contracts/cli.md` в спецификации.
+Full contracts (CLI, MCP tools, Qdrant schema) live in the project spec-kit
+(0_WORK repository), see `contracts/cli.md` in the specification.

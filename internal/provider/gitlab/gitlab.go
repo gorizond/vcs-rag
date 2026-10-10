@@ -1,4 +1,4 @@
-// Package gitlab — реализация provider.VCSProvider для GitLab (FR-003).
+// Package gitlab implements provider.VCSProvider for GitLab (FR-003).
 package gitlab
 
 import (
@@ -12,31 +12,31 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// Client — GitLab-провайдер: листинг проектов групп (включая подгруппы).
+// Client is the GitLab provider: lists group projects (including subgroups).
 type Client struct {
 	api      *gitlab.Client
 	groups   []string
 	ciWindow int
 }
 
-// New создаёт клиент GitLab; сетевых вызовов не выполняет.
+// New creates the GitLab client; it makes no network calls.
 func New(cfg *config.Config) (*Client, error) {
 	api, err := gitlab.NewClient(cfg.Provider.GitLabToken, gitlab.WithBaseURL(cfg.Provider.GitLabBaseURL))
 	if err != nil {
-		return nil, fmt.Errorf("gitlab-клиент: %w", err)
+		return nil, fmt.Errorf("gitlab client: %w", err)
 	}
 	ciWindow := cfg.Worker.CIWindow
 	if ciWindow < 1 {
-		ciWindow = 50 // ponytail: фолбэк, если конфиг собран в обход Load
+		ciWindow = 50 // ponytail: fallback in case the config is built bypassing Load
 	}
 	return &Client{api: api, groups: cfg.Provider.GitLabGroups, ciWindow: ciWindow}, nil
 }
 
-// Type возвращает "gitlab".
+// Type returns "gitlab".
 func (c *Client) Type() string { return "gitlab" }
 
-// ListRepositories возвращает проекты всех групп конфига (IncludeSubGroups,
-// пагинация до конца), дедуплицированные по ID.
+// ListRepositories returns projects of all configured groups (IncludeSubGroups,
+// full pagination), deduplicated by ID.
 func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) {
 	var all []provider.Repo
 	for _, gid := range c.groups {
@@ -47,7 +47,7 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 		for {
 			projects, resp, err := c.api.Groups.ListGroupProjects(gid, opt, gitlab.WithContext(ctx))
 			if err != nil {
-				return nil, fmt.Errorf("группа %s: %w", gid, err)
+				return nil, fmt.Errorf("group %s: %w", gid, err)
 			}
 			for _, p := range projects {
 				ns := ""

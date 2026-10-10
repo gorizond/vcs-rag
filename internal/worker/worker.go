@@ -1,4 +1,4 @@
-// Package worker — фоновые линии: discovery, mirror, index (FR-005/006/018).
+// Package worker provides background lanes: discovery, mirror, index (FR-005/006/018).
 package worker
 
 import (
@@ -13,12 +13,12 @@ import (
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// Run собирает и запускает воркер: провайдер → эмбеддинги → store;
-// размерность коллекции и индексы проверяются ДО первой записи (FR-009,
-// fail-fast), затем параллельно работают линии discovery/mirror/index.
-// Блокируется до отмены контекста.
+// Run assembles and starts the worker: provider → embeddings → store;
+// the collection dimension and indexes are checked BEFORE the first write
+// (FR-009, fail-fast), then the discovery/mirror/index lanes run in parallel.
+// Blocks until context cancellation.
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	// FR-014: второй воркер на том же MirrorsDir не запускается.
+	// FR-014: a second worker on the same MirrorsDir will not start.
 	release, err := AcquireLock(cfg.Worker.MirrorsDir)
 	if err != nil {
 		return err
@@ -46,8 +46,8 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		return err
 	}
 
-	// T074: приватные репозитории — auth-env для сетевых git-операций;
-	// в URL клона и конфиг зеркала токен не попадает.
+	// T074: private repositories — auth env for network git operations;
+	// the token never reaches the clone URL or the mirror config.
 	engine := gitengine.New(cfg.Worker.MirrorsDir)
 	engine.AuthEnv = gitengine.AuthEnv(vcs.Type(), providerToken(cfg, vcs.Type()))
 
@@ -74,18 +74,18 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	go run(func() error { return runIndex(ctx, cfg, deps, snap) })
 	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
 
-	wg.Wait() // горутины завершаются по ctx.Done()
+	wg.Wait() // goroutines exit on ctx.Done()
 	close(errCh)
 	for err := range errCh {
 		if err != nil {
 			return err
 		}
 	}
-	logger.Info("worker остановлен")
+	logger.Info("worker stopped")
 	return nil
 }
 
-// providerToken — токен активного провайдера из конфига (для git-auth).
+// providerToken returns the active provider token from the config (for git auth).
 func providerToken(cfg *config.Config, vcsType string) string {
 	if vcsType == "github" {
 		return cfg.Provider.GitHubToken

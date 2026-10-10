@@ -13,9 +13,9 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// runMirror — линия постоянного обновления зеркал (T040): по тикеру
-// WORKER_INTERVAL зеркалирует репозитории из реестра discovery, параллелизм —
-// WORKER_CONCURRENCY; ошибки не прерывают цикл (FR-014).
+// runMirror is the continuous mirror refresh lane (T040): on the
+// WORKER_INTERVAL tick it mirrors repositories from the discovery registry,
+// concurrency — WORKER_CONCURRENCY; errors do not break the loop (FR-014).
 func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "mirror")
 	mirrorAll(ctx, cfg, vcsType, eng, logger, snap)
@@ -32,8 +32,8 @@ func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 	}
 }
 
-// mirrorAll обновляет зеркала всех известных репозиториев через пул;
-// отказы изолируются (FR-014), после прохода пишется сводка (FR-020).
+// mirrorAll refreshes mirrors of all known repositories through the pool;
+// failures are isolated (FR-014), a summary is written after the pass (FR-020).
 func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) {
 	repos := snap.get()
 	if len(repos) == 0 {
@@ -59,18 +59,18 @@ func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 	sum.log(logger)
 }
 
-// mirrorRepo зеркалирует один репозиторий и фиксирует LastFetchAt.
+// mirrorRepo mirrors a single repository and records LastFetchAt.
 func mirrorRepo(ctx context.Context, vcsType string, eng *gitengine.Engine, logger *slog.Logger, repo provider.Repo) error {
 	name := repo.Namespace + "/" + repo.Path
 	mirror, err := eng.EnsureMirror(ctx, vcsType, repo)
 	if err != nil {
-		return fmt.Errorf("зеркало: %w", err)
+		return fmt.Errorf("mirror: %w", err)
 	}
 	if err := updateState(gitengine.StatePath(mirror), func(st *MirrorState) {
 		st.LastFetchAt = time.Now().UTC()
 	}); err != nil {
 		return fmt.Errorf("state: %w", err)
 	}
-	logger.Info("зеркало обновлено", "repo", name)
+	logger.Info("mirror updated", "repo", name)
 	return nil
 }

@@ -7,9 +7,9 @@ import (
 	"syscall"
 )
 
-// AcquireLock берёт эксклюзивный неблокирующий flock на <dir>/.worker.lock —
-// защита от нескольких воркеров на одном MirrorsDir (FR-014). Возвращает
-// release; при занятом локе — ошибка «воркер уже запущен».
+// AcquireLock takes an exclusive non-blocking flock on <dir>/.worker.lock —
+// protection against multiple workers on the same MirrorsDir (FR-014). It
+// returns release; when the lock is busy — the "worker already running" error.
 func AcquireLock(dir string) (release func(), err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -21,7 +21,7 @@ func AcquireLock(dir string) (release func(), err error) {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("воркер уже запущен (lock: %s)", path)
+		return nil, fmt.Errorf("worker already running (lock: %s)", path)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

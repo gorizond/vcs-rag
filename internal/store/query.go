@@ -7,8 +7,8 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
-// Filter — фильтр поиска по payload; пустые поля не участвуют
-// (must-условия по payload-индексам, без полного скана).
+// Filter — payload search filter; empty fields do not participate
+// (must conditions on payload indexes, no full scan).
 type Filter struct {
 	VCSType  string
 	GroupOrg string
@@ -18,14 +18,14 @@ type Filter struct {
 	State    string
 }
 
-// ScoredPoint — результат векторного поиска.
+// ScoredPoint — a vector search result.
 type ScoredPoint struct {
 	ID      string
 	Score   float32
 	Payload map[string]any
 }
 
-// Search выполняет векторный поиск с фильтром; topK задаёт лимит выдачи.
+// Search performs a filtered vector search; topK sets the result limit.
 func (s *Store) Search(ctx context.Context, vector []float32, f Filter, topK int) ([]ScoredPoint, error) {
 	req := &qdrant.QueryPoints{
 		CollectionName: s.collection,
@@ -51,7 +51,7 @@ func (s *Store) Search(ctx context.Context, vector []float32, f Filter, topK int
 
 	pts, err := s.client.Query(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("qdrant: поиск: %w", err)
+		return nil, fmt.Errorf("qdrant: search: %w", err)
 	}
 	out := make([]ScoredPoint, 0, len(pts))
 	for _, p := range pts {
@@ -64,7 +64,7 @@ func (s *Store) Search(ctx context.Context, vector []float32, f Filter, topK int
 	return out, nil
 }
 
-// Count возвращает точное число точек коллекции (read-back для e2e).
+// Count returns the exact number of collection points (read-back for e2e).
 func (s *Store) Count(ctx context.Context) (uint64, error) {
 	n, err := s.client.Count(ctx, &qdrant.CountPoints{
 		CollectionName: s.collection,
@@ -76,7 +76,7 @@ func (s *Store) Count(ctx context.Context) (uint64, error) {
 	return n, nil
 }
 
-// CountByFilter — число точек под фильтром (проверки prune).
+// CountByFilter — the number of points under a filter (prune checks).
 func (s *Store) CountByFilter(ctx context.Context, f *qdrant.Filter) (uint64, error) {
 	n, err := s.client.Count(ctx, &qdrant.CountPoints{
 		CollectionName: s.collection,
@@ -89,7 +89,7 @@ func (s *Store) CountByFilter(ctx context.Context, f *qdrant.Filter) (uint64, er
 	return n, nil
 }
 
-// ScrollPayloads возвращает payload'ы первых limit точек (read-back для e2e).
+// ScrollPayloads returns the payloads of the first limit points (read-back for e2e).
 func (s *Store) ScrollPayloads(ctx context.Context, limit uint32) ([]map[string]any, error) {
 	pts, err := s.scrollByFilter(ctx, nil, limit)
 	if err != nil {
@@ -102,8 +102,8 @@ func (s *Store) ScrollPayloads(ctx context.Context, limit uint32) ([]map[string]
 	return out, nil
 }
 
-// ScrollCIFailures возвращает существующие ci-точки репозитория (prune).
-// ponytail: одна страница до limit; хвосты за limit обработаются следующим циклом.
+// ScrollCIFailures returns the existing ci points of a repository (prune).
+// ponytail: one page up to limit; tails beyond limit are handled by the next cycle.
 func (s *Store) ScrollCIFailures(ctx context.Context, repo string, limit uint32) ([]ScoredPoint, error) {
 	return s.scrollByFilter(ctx, &qdrant.Filter{Must: []*qdrant.Condition{
 		qdrant.NewMatch("type", "ci_failure"),
@@ -111,7 +111,7 @@ func (s *Store) ScrollCIFailures(ctx context.Context, repo string, limit uint32)
 	}}, limit)
 }
 
-// scrollByFilter — одна страница scroll по фильтру (nil — без фильтра).
+// scrollByFilter — one scroll page by filter (nil — no filter).
 func (s *Store) scrollByFilter(ctx context.Context, f *qdrant.Filter, limit uint32) ([]ScoredPoint, error) {
 	pts, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
 		CollectionName: s.collection,
@@ -132,7 +132,7 @@ func (s *Store) scrollByFilter(ctx context.Context, f *qdrant.Filter, limit uint
 	return out, nil
 }
 
-// DropCollection удаляет коллекцию (e2e-очистка).
+// DropCollection deletes the collection (e2e cleanup).
 func (s *Store) DropCollection(ctx context.Context) error {
 	return s.client.DeleteCollection(ctx, s.collection)
 }

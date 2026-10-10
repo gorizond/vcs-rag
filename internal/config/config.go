@@ -1,6 +1,6 @@
-// Package config загружает конфигурацию сервиса из переменных окружения и
-// валидирует её до первого сетевого вызова. В сообщениях об ошибках — только
-// ИМЕНА переменных; значения секретов не выводятся.
+// Package config loads the service configuration from environment variables and
+// validates it before the first network call. Error messages contain only
+// variable NAMES; secret values are never printed.
 package config
 
 import (
@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Config — конфигурация сервиса целиком.
+// Config is the complete service configuration.
 type Config struct {
 	Provider   Provider
 	Embeddings Embeddings
@@ -19,70 +19,70 @@ type Config struct {
 	MCP        MCP
 }
 
-// Provider описывает выбранный VCS-провайдер (FR-003): ровно один из двух.
+// Provider describes the selected VCS provider (FR-003): exactly one of the two.
 type Provider struct {
 	Type string // "gitlab" | "github"
 
-	GitLabGroups  []string // GITLAB_GROUP_ID, через запятую
-	GitLabToken   string   // GITLAB_TOKEN (секрет)
+	GitLabGroups  []string // GITLAB_GROUP_ID, comma-separated
+	GitLabToken   string   // GITLAB_TOKEN (secret)
 	GitLabBaseURL string   // GITLAB_BASE_URL
 
-	GitHubOrgs    []string // GITHUB_ORG, через запятую
-	GitHubToken   string   // GITHUB_TOKEN (секрет)
+	GitHubOrgs    []string // GITHUB_ORG, comma-separated
+	GitHubToken   string   // GITHUB_TOKEN (secret)
 	GitHubBaseURL string   // GITHUB_BASE_URL
 }
 
-// Embeddings — провайдер эмбеддингов (FR-009).
+// Embeddings is the embeddings provider (FR-009).
 type Embeddings struct {
 	Provider string // "ollama" | "lm-studio"
 	BaseURL  string
 	Model    string
 	Dim      int
-	Batch    int // ponytail: стартовый дефолт, уточняется по фактам
+	Batch    int // ponytail: starting default, to be refined based on facts
 }
 
-// Qdrant — векторное хранилище (FR-010).
+// Qdrant is the vector store (FR-010).
 type Qdrant struct {
 	URL        string
-	APIKey     string // секрет, опционален
+	APIKey     string // secret, optional
 	Collection string
 }
 
-// Worker — параметры фонового цикла (FR-005/006/018).
+// Worker holds background loop parameters (FR-005/006/018).
 type Worker struct {
 	Interval          time.Duration
-	Concurrency       int // ponytail: стартовый дефолт, уточняется по фактам
+	Concurrency       int // ponytail: starting default, to be refined based on facts
 	MirrorsDir        string
-	HistoryMaxCommits int   // ponytail: стартовый дефолт, уточняется по фактам
-	MaxFileBytes      int64 // ponytail: стартовый дефолт, уточняется по фактам
-	CIWindow          int   // ponytail: стартовый дефолт, уточняется по фактам
+	HistoryMaxCommits int   // ponytail: starting default, to be refined based on facts
+	MaxFileBytes      int64 // ponytail: starting default, to be refined based on facts
+	CIWindow          int   // ponytail: starting default, to be refined based on facts
 }
 
-// MCP — транспорт MCP-сервера (FR-013).
+// MCP is the MCP server transport (FR-013).
 type MCP struct {
 	Transport string // "stdio" | "sse"
-	Addr      string // адрес для sse
+	Addr      string // address for sse
 }
 
-// ConfigError — ошибка конфигурации с перечнем имён переменных, которые
-// нужно задать (или конфликт, который нужно устранить).
+// ConfigError is a configuration error listing the variable names that must be
+// set (or the conflict that must be resolved).
 type ConfigError struct {
-	Problem string   // краткое описание проблемы
-	Missing []string // имена переменных окружения
+	Problem string   // short problem description
+	Missing []string // environment variable names
 }
 
 func (e *ConfigError) Error() string {
 	if len(e.Missing) == 0 {
-		return "конфигурация: " + e.Problem
+		return "configuration: " + e.Problem
 	}
-	return "конфигурация: " + e.Problem + ": " + strings.Join(e.Missing, ", ")
+	return "configuration: " + e.Problem + ": " + strings.Join(e.Missing, ", ")
 }
 
-// Load читает переменные окружения и возвращает валидированную конфигурацию.
+// Load reads environment variables and returns a validated configuration.
 func Load() (*Config, error) {
 	cfg := &Config{}
 
-	// --- VCS-провайдер ---
+	// --- VCS provider ---
 	gitlabGroups := splitList(os.Getenv("GITLAB_GROUP_ID"))
 	gitlabToken := os.Getenv("GITLAB_TOKEN")
 	githubOrgs := splitList(os.Getenv("GITHUB_ORG"))
@@ -93,13 +93,13 @@ func Load() (*Config, error) {
 
 	switch {
 	case hasGitLab && hasGitHub:
-		return nil, &ConfigError{Problem: "заданы оба провайдера (GitLab и GitHub), оставьте ровно один"}
+		return nil, &ConfigError{Problem: "both providers are set (GitLab and GitHub), keep exactly one"}
 	case hasGitLab:
 		if len(gitlabGroups) == 0 {
-			return nil, &ConfigError{Problem: "для GitLab не задана группа", Missing: []string{"GITLAB_GROUP_ID"}}
+			return nil, &ConfigError{Problem: "GitLab group is not set", Missing: []string{"GITLAB_GROUP_ID"}}
 		}
 		if gitlabToken == "" {
-			return nil, &ConfigError{Problem: "для GitLab не задан токен", Missing: []string{"GITLAB_TOKEN"}}
+			return nil, &ConfigError{Problem: "GitLab token is not set", Missing: []string{"GITLAB_TOKEN"}}
 		}
 		cfg.Provider.Type = "gitlab"
 		cfg.Provider.GitLabGroups = gitlabGroups
@@ -107,10 +107,10 @@ func Load() (*Config, error) {
 		cfg.Provider.GitLabBaseURL = envDefault("GITLAB_BASE_URL", "https://gitlab.com")
 	case hasGitHub:
 		if len(githubOrgs) == 0 {
-			return nil, &ConfigError{Problem: "для GitHub не задана организация", Missing: []string{"GITHUB_ORG"}}
+			return nil, &ConfigError{Problem: "GitHub organization is not set", Missing: []string{"GITHUB_ORG"}}
 		}
 		if githubToken == "" {
-			return nil, &ConfigError{Problem: "для GitHub не задан токен", Missing: []string{"GITHUB_TOKEN"}}
+			return nil, &ConfigError{Problem: "GitHub token is not set", Missing: []string{"GITHUB_TOKEN"}}
 		}
 		cfg.Provider.Type = "github"
 		cfg.Provider.GitHubOrgs = githubOrgs
@@ -118,22 +118,22 @@ func Load() (*Config, error) {
 		cfg.Provider.GitHubBaseURL = envDefault("GITHUB_BASE_URL", "https://api.github.com")
 	default:
 		return nil, &ConfigError{
-			Problem: "не задан VCS-провайдер, задайте GitLab или GitHub",
+			Problem: "VCS provider is not set, configure GitLab or GitHub",
 			Missing: []string{"GITLAB_GROUP_ID", "GITLAB_TOKEN", "GITHUB_ORG", "GITHUB_TOKEN"},
 		}
 	}
 
-	// --- Эмбеддинги ---
+	// --- Embeddings ---
 	embProvider := os.Getenv("EMBEDDINGS_PROVIDER")
 	switch embProvider {
 	case "ollama", "lm-studio":
 	case "":
 		return nil, &ConfigError{
-			Problem: "не задан провайдер эмбеддингов (ollama|lm-studio)",
+			Problem: "embeddings provider is not set (ollama|lm-studio)",
 			Missing: []string{"EMBEDDINGS_PROVIDER"},
 		}
 	default:
-		return nil, &ConfigError{Problem: "EMBEDDINGS_PROVIDER: недопустимое значение (ollama|lm-studio)"}
+		return nil, &ConfigError{Problem: "EMBEDDINGS_PROVIDER: invalid value (ollama|lm-studio)"}
 	}
 	embBaseURL := os.Getenv("EMBEDDINGS_BASE_URL")
 	if embBaseURL == "" {
@@ -199,7 +199,7 @@ func Load() (*Config, error) {
 	// --- MCP ---
 	transport := envDefault("MCP_TRANSPORT", "stdio")
 	if transport != "stdio" && transport != "sse" {
-		return nil, &ConfigError{Problem: "MCP_TRANSPORT: недопустимое значение (stdio|sse)"}
+		return nil, &ConfigError{Problem: "MCP_TRANSPORT: invalid value (stdio|sse)"}
 	}
 	cfg.MCP = MCP{
 		Transport: transport,
@@ -209,7 +209,7 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// envDefault возвращает значение переменной окружения или дефолт.
+// envDefault returns the environment variable value or the default.
 func envDefault(name, def string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
@@ -217,7 +217,7 @@ func envDefault(name, def string) string {
 	return def
 }
 
-// envInt читает положительное целое; ошибка называет переменную, не значение.
+// envInt reads a positive integer; the error names the variable, not its value.
 func envInt(name string, def int) (int, error) {
 	v := os.Getenv(name)
 	if v == "" {
@@ -225,12 +225,12 @@ func envInt(name string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
-		return 0, &ConfigError{Problem: name + ": ожидается положительное целое"}
+		return 0, &ConfigError{Problem: name + ": positive integer expected"}
 	}
 	return n, nil
 }
 
-// envDuration читает time.ParseDuration; ошибка называет переменную, не значение.
+// envDuration reads time.ParseDuration; the error names the variable, not its value.
 func envDuration(name string, def time.Duration) (time.Duration, error) {
 	v := os.Getenv(name)
 	if v == "" {
@@ -238,12 +238,12 @@ func envDuration(name string, def time.Duration) (time.Duration, error) {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
-		return 0, &ConfigError{Problem: name + ": ожидается положительная длительность (например, 60s)"}
+		return 0, &ConfigError{Problem: name + ": positive duration expected (e.g. 60s)"}
 	}
 	return d, nil
 }
 
-// splitList разбивает список через запятую, обрезая пробелы и пропуская пустые.
+// splitList splits a comma-separated list, trimming spaces and skipping empty items.
 func splitList(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {

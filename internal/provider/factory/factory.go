@@ -1,8 +1,8 @@
-// Package factory — сборка provider.VCSProvider по конфигурации (T020).
+// Package factory assembles a provider.VCSProvider from configuration (T020).
 //
-// Вынесен отдельным пакетом: положить New в package provider невозможно —
-// provider импортировал бы provider/gitlab|github, а те используют типы
-// контракта (цикл импортов). Конструкторы сетевых вызовов не делают.
+// It lives in a separate package: putting New into package provider is
+// impossible — provider would import provider/gitlab|github, and those use
+// the contract types (an import cycle). Constructors make no network calls.
 package factory
 
 import (
@@ -14,7 +14,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider/gitlab"
 )
 
-// New создаёт VCSProvider по конфигурации. Сетевых вызовов не выполняет.
+// New creates a VCSProvider from configuration. It makes no network calls.
 func New(cfg *config.Config) (provider.VCSProvider, error) {
 	switch cfg.Provider.Type {
 	case "gitlab":
@@ -22,6 +22,6 @@ func New(cfg *config.Config) (provider.VCSProvider, error) {
 	case "github":
 		return github.New(cfg)
 	default:
-		return nil, fmt.Errorf("неизвестный VCS-провайдер %q", cfg.Provider.Type)
+		return nil, fmt.Errorf("unknown VCS provider %q", cfg.Provider.Type)
 	}
 }

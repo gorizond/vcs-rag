@@ -1,5 +1,5 @@
-// Package embed — клиенты эмбеддингов (Ollama, LM Studio) с общим интерфейсом
-// и валидацией размерности (FR-009).
+// Package embed — embedding clients (Ollama, LM Studio) with a common interface
+// and dimension validation (FR-009).
 package embed
 
 import (
@@ -9,13 +9,13 @@ import (
 	"strings"
 )
 
-// Provider — провайдер эмбеддингов.
+// Provider — an embedding provider.
 type Provider interface {
 	Dim() int
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
 }
 
-// base — общая часть клиентов: адрес, модель, батч, размерность, HTTP.
+// base — common part of the clients: address, model, batch, dimension, HTTP.
 type base struct {
 	baseURL string
 	model   string
@@ -24,10 +24,10 @@ type base struct {
 	http    *http.Client
 }
 
-// Dim возвращает размерность векторов.
+// Dim returns the vector dimension.
 func (b *base) Dim() int { return b.dim }
 
-// batches нарезает тексты на батчи размера batch.
+// batches splits texts into batches of size batch.
 func (b *base) batches(texts []string) [][]string {
 	var out [][]string
 	for start := 0; start < len(texts); start += b.batch {
@@ -36,22 +36,22 @@ func (b *base) batches(texts []string) [][]string {
 	return out
 }
 
-// validate проверяет число векторов и размерность каждого (FR-009).
+// validate checks the number of vectors and the dimension of each (FR-009).
 func (b *base) validate(vecs [][]float32, want int) error {
 	if len(vecs) != want {
-		return fmt.Errorf("эмбеддинги: получено %d векторов, ожидалось %d", len(vecs), want)
+		return fmt.Errorf("embeddings: got %d vectors, expected %d", len(vecs), want)
 	}
 	for i, v := range vecs {
 		if len(v) != b.dim {
 			return fmt.Errorf(
-				"эмбеддинги: вектор %d имеет размерность %d, ожидалась %d — проверьте EMBEDDINGS_MODEL/DIM; смена размерности требует переиндексации (quickstart §7)",
+				"embeddings: vector %d has dimension %d, expected %d — check EMBEDDINGS_MODEL/DIM; changing the dimension requires reindex (quickstart §7)",
 				i, len(v), b.dim)
 		}
 	}
 	return nil
 }
 
-// truncate обрезает тело ответа для сообщений об ошибках.
+// truncate cuts the response body for error messages.
 func truncate(data []byte) string {
 	const maxLen = 300
 	s := strings.TrimSpace(string(data))

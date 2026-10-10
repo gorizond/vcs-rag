@@ -16,21 +16,21 @@ import (
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// RepoDeps — зависимости обработки одного репозитория (T041/T044).
+// RepoDeps are the dependencies of processing a single repository (T041/T044).
 type RepoDeps struct {
 	VCSType string
-	VCS     provider.VCSProvider // нужен линии метаданных (US4)
+	VCS     provider.VCSProvider // needed by the metadata lane (US4)
 	Engine  *gitengine.Engine
 	Embed   embed.Provider
 	Store   *store.Store
 	Cfg     *config.Config
 	Logger  *slog.Logger
-	stats   *summary // необязательные счётчики прохода (T060)
+	stats   *summary // optional pass counters (T060)
 }
 
-// runIndex — линия инкрементальной индексации кода (T041): по тикеру
-// WORKER_INTERVAL обрабатывает репозитории реестра через пул
-// WORKER_CONCURRENCY; ошибки не прерывают цикл (FR-014).
+// runIndex is the incremental code indexing lane (T041): on the
+// WORKER_INTERVAL tick it processes registry repositories through the pool
+// (WORKER_CONCURRENCY); errors do not break the loop (FR-014).
 func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) error {
 	deps.Logger = log.WithPhase(deps.Logger, "index")
 	indexAll(ctx, cfg, deps, snap)
@@ -47,8 +47,8 @@ func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	}
 }
 
-// indexAll индексирует все известные репозитории через пул; отказы
-// изолируются (FR-014), после прохода пишется сводка (FR-020).
+// indexAll indexes all known repositories through the pool; failures are
+// isolated (FR-014), a summary is written after the pass (FR-020).
 func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) {
 	repos := snap.get()
 	if len(repos) == 0 {
@@ -75,17 +75,17 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	sum.log(deps.Logger)
 }
 
-// ProcessRepoOnce — полный проход по репозиторию: зеркало → снимок веток →
-// новые коммиты (diff → blob → чанки → эмбеддинги → upsert) → prune
-// rewritten-коммитов и исчезнувших веток. Состояние сохраняется только
-// после успеха (FR-014): при ошибке повтор на следующем проходе безопасен —
-// delete/upsert идемпотентны (FR-011).
+// ProcessRepoOnce is a full pass over a repository: mirror → branch snapshot →
+// new commits (diff → blob → chunks → embeddings → upsert) → prune of
+// rewritten commits and vanished branches. State is saved only after success
+// (FR-014): on error a retry in the next pass is safe — delete/upsert are
+// idempotent (FR-011).
 func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) error {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 
 	mirror, err := deps.Engine.EnsureMirror(ctx, deps.VCSType, repo)
 	if err != nil {
-		return fmt.Errorf("зеркало: %w", err)
+		return fmt.Errorf("mirror: %w", err)
 	}
 	statePath := gitengine.StatePath(mirror)
 	st, err := LoadState(statePath)
@@ -94,7 +94,7 @@ func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) err
 	}
 	refs, err := deps.Engine.Snapshot(ctx, mirror)
 	if err != nil {
-		return fmt.Errorf("снимок веток: %w", err)
+		return fmt.Errorf("branch snapshot: %w", err)
 	}
 	reader, err := deps.Engine.NewBlobReader(ctx, mirror)
 	if err != nil {
@@ -104,11 +104,11 @@ func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) err
 
 	for branch, tip := range refs {
 		if err := processBranch(ctx, deps, repo, mirror, branch, tip, st, reader, lg); err != nil {
-			return fmt.Errorf("ветка %s: %w", branch, err)
+			return fmt.Errorf("branch %s: %w", branch, err)
 		}
 	}
 
-	// Исчезнувшие ветки → удаление всех их точек (data-model §2).
+	// Vanished branches → delete all their points (data-model §2).
 	for branch := range st.Branches {
 		if _, ok := refs[branch]; ok {
 			continue
@@ -117,13 +117,13 @@ func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) err
 			return err
 		}
 		delete(st.Branches, branch)
-		lg.Info("ветка удалена из индекса", "branch", branch)
+		lg.Info("branch removed from the index", "branch", branch)
 	}
 
 	return SaveState(statePath, st)
 }
 
-// processBranch индексирует новые коммиты ветки и prune'ит недостижимые.
+// processBranch indexes new branch commits and prunes unreachable ones.
 func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirror, branch, tip string, st *MirrorState, reader *gitengine.BlobReader, lg *slog.Logger) error {
 	prev := st.Branches[branch]
 	allRev, err := deps.Engine.RevList(ctx, mirror, tip, 0)
@@ -143,7 +143,7 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 	}
 	newCount := len(toIndex)
 
-	// prune: проиндексированные коммиты, недостижимые из нового tip
+	// prune: indexed commits unreachable from the new tip
 	// (force-push/rewrite, FR-016).
 	inTip := make(map[string]bool, len(allRev))
 	for _, sha := range allRev {
@@ -165,7 +165,7 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 		deps.stats.addPruned(len(pruned))
 	}
 	if newCount > 0 || len(pruned) > 0 {
-		lg.Info("ветка проиндексирована", "branch", branch, "new_commits", newCount, "pruned", len(pruned))
+		lg.Info("branch indexed", "branch", branch, "new_commits", newCount, "pruned", len(pruned))
 	}
 
 	st.Branches[branch] = BranchState{
@@ -176,9 +176,9 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 	return nil
 }
 
-// newCommits отбирает коммиты окна (newest→oldest), не попавшие в indexed;
-// порядок результата — oldest→newest (порядок индексации). Повторный проход
-// с полным indexed не даёт коммитов — resume/идемпотентность (FR-006/011).
+// newCommits selects window commits (newest→oldest) missing from indexed;
+// the result order is oldest→newest (indexing order). A repeated pass with
+// a full indexed set yields no commits — resume/idempotency (FR-006/011).
 func newCommits(window, indexed []string) []string {
 	if len(window) == 0 {
 		return nil
@@ -196,8 +196,8 @@ func newCommits(window, indexed []string) []string {
 	return out
 }
 
-// processCommit индексирует изменённые файлы коммита: старые точки файла
-// удаляются, подходящие blob'ы чанкуются и пишутся заново.
+// processCommit indexes the changed files of a commit: old file points are
+// deleted, eligible blobs are chunked and written anew.
 func processCommit(ctx context.Context, deps RepoDeps, repo provider.Repo, mirror, branch, sha string, reader *gitengine.BlobReader, lg *slog.Logger) error {
 	changes, err := deps.Engine.DiffCommit(ctx, mirror, sha)
 	if err != nil {
@@ -221,7 +221,7 @@ func processCommit(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 		}
 		file, ok := byPath[ch.Path]
 		if !ok {
-			continue // крупный файл или не blob — не индексируется
+			continue // a large file or not a blob — not indexed
 		}
 		content, found, err := reader.ReadBlob(file.SHA)
 		if err != nil {
@@ -240,7 +240,7 @@ func processCommit(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 		}
 		vecs, err := deps.Embed.Embed(ctx, texts)
 		if err != nil {
-			return fmt.Errorf("эмбеддинги %s: %w", ch.Path, err)
+			return fmt.Errorf("embeddings %s: %w", ch.Path, err)
 		}
 		points := make([]store.Point, len(chunks))
 		for i, c := range chunks {
@@ -254,6 +254,6 @@ func processCommit(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 			return err
 		}
 	}
-	lg.Debug("коммит проиндексирован", "branch", branch, "commit", sha, "changes", len(changes))
+	lg.Debug("commit indexed", "branch", branch, "commit", sha, "changes", len(changes))
 	return nil
 }

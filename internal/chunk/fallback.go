@@ -5,11 +5,11 @@ import (
 	"strings"
 )
 
-// blockStartRe — старт блока в языках с procedure-подобными декларациями.
+// blockStartRe marks a block start in languages with procedure-like declarations.
 var blockStartRe = regexp.MustCompile(`^(func |def |class |function |type )`)
 
-// splitBlocks — лёгкая эвристика блочных границ: блок начинается со строки,
-// матчащей blockStartRe. Возвращает nil, если границ ≤1 (тогда — окно строк).
+// splitBlocks is a lightweight block boundary heuristic: a block starts at a line
+// matching blockStartRe. Returns nil if there are ≤1 boundaries (then a line window).
 func splitBlocks(content []byte) []string {
 	lines := strings.Split(string(content), "\n")
 	var starts []int
@@ -37,13 +37,13 @@ func splitBlocks(content []byte) []string {
 	return out
 }
 
-// splitWindow — окно строк с перекрытием: единственный чанк, если строк мало.
+// splitWindow is a line window with overlap: a single chunk if there are few lines.
 func splitWindow(content []byte) []string {
 	return splitWindowText(string(content))
 }
 
-// splitWindowText режет текст на окна по windowLines строк с перекрытием
-// windowOverlap; последнее окно заканчивается на последней строке.
+// splitWindowText splits text into windows of windowLines lines with
+// windowOverlap overlap; the last window ends at the last line.
 func splitWindowText(text string) []string {
 	lines := strings.Split(text, "\n")
 	step := windowLines - windowOverlap

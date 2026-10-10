@@ -12,7 +12,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// TestAuthEnv — корректность Basic-пары по типу провайдера (T074).
+// TestAuthEnv checks the Basic pair and header per provider type (T074).
 func TestAuthEnv(t *testing.T) {
 	gitlab := AuthEnv("gitlab", "glpat-secret")
 	assertEnvKV(t, gitlab, "GIT_CONFIG_COUNT", "1")
@@ -25,7 +25,7 @@ func TestAuthEnv(t *testing.T) {
 		"Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:tok123")))
 
 	if AuthEnv("gitlab", "") != nil {
-		t.Error("пустой токен: env должен быть nil")
+		t.Error("empty token: env must be nil")
 	}
 }
 
@@ -39,15 +39,15 @@ func assertEnvKV(t *testing.T, env []string, key, want string) {
 			return
 		}
 	}
-	t.Errorf("%s не найден в env %v", key, env)
+	t.Errorf("%s not found in env %v", key, env)
 }
 
-// gitWrapper ставит скрипт-обёртку git, логирующую полученный env и argv.
+// gitWrapper installs a git wrapper script that logs the received env and argv.
 func gitWrapper(t *testing.T, logPath string) string {
 	t.Helper()
 	realGit, err := exec.LookPath("git")
 	if err != nil {
-		t.Skipf("git не найден: %v", err)
+		t.Skipf("git not found: %v", err)
 	}
 	script := "#!/bin/sh\n" +
 		"printf 'ENV:%s ARGS:%s\\n' \"$GIT_CONFIG_VALUE_0\" \"$*\" >> '" + logPath + "'\n" +
@@ -59,7 +59,7 @@ func gitWrapper(t *testing.T, logPath string) string {
 	return path
 }
 
-// initLocalRepo — локальный репозиторий-источник с одним коммитом.
+// initLocalRepo creates a local source repository with a single commit.
 func initLocalRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -82,8 +82,9 @@ func initLocalRepo(t *testing.T) string {
 	return dir
 }
 
-// TestCloneAndFetchGetAuthEnv — auth-env получают только сетевые операции
-// (clone/fetch), URL клона чистый, в зеркале токена нет (T074).
+// TestCloneAndFetchGetAuthEnv verifies that only network operations
+// (clone/fetch) receive the auth env, the clone URL is clean, and no token
+// ends up in the mirror (T074).
 func TestCloneAndFetchGetAuthEnv(t *testing.T) {
 	ctx := context.Background()
 	src := initLocalRepo(t)
@@ -106,7 +107,7 @@ func TestCloneAndFetchGetAuthEnv(t *testing.T) {
 
 	data, err := os.ReadFile(logPath)
 	if err != nil {
-		t.Fatalf("лог обёртки: %v", err)
+		t.Fatalf("wrapper log: %v", err)
 	}
 	log := string(data)
 	wantCred := base64.StdEncoding.EncodeToString([]byte("oauth2:fake-token-123"))
@@ -117,41 +118,41 @@ func TestCloneAndFetchGetAuthEnv(t *testing.T) {
 	} {
 		line := findLine(log, tc.args)
 		if line == "" {
-			t.Fatalf("%s: в логе нет строки %q\n%s", tc.name, tc.args, log)
+			t.Fatalf("%s: no log line %q\n%s", tc.name, tc.args, log)
 		}
 		if !strings.Contains(line, "ENV:Authorization: Basic "+wantCred) {
-			t.Errorf("%s: нет auth-env: %s", tc.name, line)
+			t.Errorf("%s: missing auth env: %s", tc.name, line)
 		}
 		if strings.Contains(line, "fake-token-123") {
-			t.Errorf("%s: токен попал в argv: %s", tc.name, line)
+			t.Errorf("%s: token leaked into argv: %s", tc.name, line)
 		}
 	}
 
-	// локальная операция — без auth-env
+	// local operation — no auth env
 	local := findLine(log, "ARGS:rev-list")
 	if local == "" {
-		t.Fatalf("в логе нет rev-list\n%s", log)
+		t.Fatalf("no rev-list in the log\n%s", log)
 	}
 	if !strings.HasPrefix(local, "ENV: ARGS:") {
-		t.Errorf("локальная операция получила auth-env: %s", local)
+		t.Errorf("local operation received auth env: %s", local)
 	}
 
-	// негативный контроль: ни токена, ни base64-пары нет в зеркале
+	// negative control: neither the token nor the base64 pair is in the mirror
 	for _, needle := range []string{"fake-token-123", wantCred} {
 		out, err := exec.Command("grep", "-r", "-l", "--", needle, mirror).CombinedOutput()
 		if err == nil && len(out) > 0 {
-			t.Errorf("негативный контроль: %q найден в зеркале: %s", needle, out)
+			t.Errorf("negative control: %q found in the mirror: %s", needle, out)
 		}
 	}
-	// URL клона в конфиге зеркала — чистый
+	// clone URL in the mirror config is clean
 	urlOut, err := exec.Command(eng.GitBin, "-C", mirror, "config", "--get", "remote.origin.url").Output()
 	if err != nil || strings.TrimSpace(string(urlOut)) != repo.CloneURL {
-		t.Errorf("remote.origin.url = %q (err=%v), ожидался чистый URL %q",
+		t.Errorf("remote.origin.url = %q (err=%v), want clean URL %q",
 			strings.TrimSpace(string(urlOut)), err, repo.CloneURL)
 	}
 }
 
-// findLine возвращает первую строку лога, содержащую substr.
+// findLine returns the first log line containing substr.
 func findLine(log, substr string) string {
 	for _, line := range strings.Split(log, "\n") {
 		if strings.Contains(line, substr) {

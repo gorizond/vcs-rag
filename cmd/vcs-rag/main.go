@@ -1,4 +1,4 @@
-// Command vcs-rag — единый бинарник сервиса: worker и MCP-сервер (FR-001).
+// Command vcs-rag is the single service binary: worker and MCP server (FR-001).
 package main
 
 import (
@@ -19,10 +19,10 @@ func main() {
 	os.Exit(run())
 }
 
-// run возвращает код возврата: 0 — штатно, 1 — ошибка запуска, 2 — ошибка конфигурации.
+// run returns the exit code: 0 — success, 1 — startup error, 2 — configuration error.
 func run() int {
-	mode := flag.String("mode", "", "режим работы: worker | mcp")
-	showVersion := flag.Bool("version", false, "напечатать версию и выйти")
+	mode := flag.String("mode", "", "operating mode: worker | mcp")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
 	if *showVersion {
@@ -40,7 +40,7 @@ func run() int {
 		return 2
 	}
 
-	// Логи — в stderr: stdout принадлежит MCP-транспорту (stdio).
+	// Logs go to stderr: stdout belongs to the MCP transport (stdio).
 	logger := log.New(os.Stderr, false)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -54,7 +54,7 @@ func run() int {
 		runErr = mcp.Run(ctx, cfg, logger, version)
 	}
 	if runErr != nil {
-		logger.Error("завершение с ошибкой", "err", runErr)
+		logger.Error("exiting with error", "err", runErr)
 		return 1
 	}
 	return 0

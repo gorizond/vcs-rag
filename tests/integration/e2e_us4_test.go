@@ -18,10 +18,10 @@ import (
 	"github.com/gorizond/vcs-rag/internal/worker"
 )
 
-// TestE2E_US4 — метаданные (issues/MR/CI) на реальных Qdrant+Ollama:
-// fake-провайдер → ProcessMetadataOnce → read-back, идемпотентность, prune.
+// TestE2E_US4 — metadata (issues/MR/CI) on real Qdrant+Ollama:
+// fake provider → ProcessMetadataOnce → read-back, idempotency, prune.
 //
-// Контур — изолированный (16334/11435; команды в smoke_us2.md):
+// The setup is isolated (16334/11435; commands in smoke_us2.md):
 //
 //	QDRANT_URL=http://localhost:16334 EMBEDDINGS_BASE_URL=http://localhost:11435 \
 //	go test -tags e2e ./tests/integration -run TestE2E_US4 -v -count=1
@@ -73,48 +73,48 @@ func TestE2E_US4(t *testing.T) {
 		Logger:  discardLogger(),
 	}
 
-	// 1) первый проход: issue + PR + failed CI
+	// 1) first pass: issue + PR + failed CI
 	if err := worker.ProcessMetadataOnce(ctx, deps, repo); err != nil {
 		t.Fatalf("ProcessMetadataOnce: %v", err)
 	}
 	payloads := scrollPayloads(t, st, ctx)
 	counts := classifyPayloads(payloads)
-	t.Logf("read-back: issue=%d pull_request=%d ci_failure=%d (всего %d)",
+	t.Logf("read-back: issue=%d pull_request=%d ci_failure=%d (total %d)",
 		counts["issue"], counts["pull_request"], counts["ci_failure"], len(payloads))
 	if counts["issue"] != 1 || counts["pull_request"] != 1 || counts["ci_failure"] != 1 {
-		t.Fatalf("counts = %v, ожидалось по 1 каждого типа", counts)
+		t.Fatalf("counts = %v, expected 1 of each type", counts)
 	}
 
 	checkMetaPayloads(t, payloads)
 
-	// 2) идемпотентность: повторный проход не добавляет точек
+	// 2) idempotency: repeated pass adds no points
 	if err := worker.ProcessMetadataOnce(ctx, deps, repo); err != nil {
-		t.Fatalf("ProcessMetadataOnce (повтор): %v", err)
+		t.Fatalf("ProcessMetadataOnce (repeat): %v", err)
 	}
 	again := scrollPayloads(t, st, ctx)
 	if len(again) != len(payloads) {
-		t.Errorf("идемпотентность: точек %d → %d", len(payloads), len(again))
+		t.Errorf("idempotency: points %d → %d", len(payloads), len(again))
 	}
-	t.Logf("read-back: повторный проход — точек %d (не выросло)", len(again))
+	t.Logf("read-back: repeated pass — points %d (did not grow)", len(again))
 
-	// 3) prune: пайплайн перезапущен в success → ci-точка удалена
+	// 3) prune: pipeline rerun as success → ci point removed
 	vcs.Pipelines["1"] = []provider.Pipeline{{ID: "100", Status: "success", Ref: "main", SHA: "abc"}}
 	if err := worker.ProcessMetadataOnce(ctx, deps, repo); err != nil {
 		t.Fatalf("ProcessMetadataOnce (prune): %v", err)
 	}
 	final := scrollPayloads(t, st, ctx)
 	finalCounts := classifyPayloads(final)
-	t.Logf("read-back: после success — issue=%d pull_request=%d ci_failure=%d",
+	t.Logf("read-back: after success — issue=%d pull_request=%d ci_failure=%d",
 		finalCounts["issue"], finalCounts["pull_request"], finalCounts["ci_failure"])
 	if finalCounts["ci_failure"] != 0 {
-		t.Errorf("prune не сработал: ci_failure = %d", finalCounts["ci_failure"])
+		t.Errorf("prune did not work: ci_failure = %d", finalCounts["ci_failure"])
 	}
 	if finalCounts["issue"] != 1 || finalCounts["pull_request"] != 1 {
-		t.Errorf("prune задел issues/PR: %v", finalCounts)
+		t.Errorf("prune affected issues/PR: %v", finalCounts)
 	}
 }
 
-// newFakeRepo — fake-провайдер: 1 issue, 1 PR, 1 failed pipeline с 100-строчным логом.
+// newFakeRepo — fake provider: 1 issue, 1 PR, 1 failed pipeline with a 100-line log.
 func newFakeRepo() *fake.Provider {
 	var log strings.Builder
 	for i := 1; i <= 100; i++ {
@@ -136,7 +136,7 @@ func newFakeRepo() *fake.Provider {
 	}
 }
 
-// scrollPayloads читает все точки коллекции.
+// scrollPayloads reads all points of the collection.
 func scrollPayloads(t *testing.T, st *store.Store, ctx context.Context) []map[string]any {
 	t.Helper()
 	payloads, err := st.ScrollPayloads(ctx, 100)
@@ -146,7 +146,7 @@ func scrollPayloads(t *testing.T, st *store.Store, ctx context.Context) []map[st
 	return payloads
 }
 
-// classifyPayloads считает точки по полю type.
+// classifyPayloads counts points by the type field.
 func classifyPayloads(payloads []map[string]any) map[string]int {
 	counts := make(map[string]int)
 	for _, p := range payloads {
@@ -157,7 +157,7 @@ func classifyPayloads(payloads []map[string]any) map[string]int {
 	return counts
 }
 
-// checkMetaPayloads проверяет полноту payload'ов и хвост лога CI.
+// checkMetaPayloads verifies payload completeness and the CI log tail.
 func checkMetaPayloads(t *testing.T, payloads []map[string]any) {
 	t.Helper()
 	required := map[string][]string{
@@ -169,7 +169,7 @@ func checkMetaPayloads(t *testing.T, payloads []map[string]any) {
 		typ, _ := p["type"].(string)
 		for _, key := range required[typ] {
 			if _, ok := p[key]; !ok {
-				t.Errorf("payload type=%s без поля %q: %v", typ, key, p)
+				t.Errorf("payload type=%s missing field %q: %v", typ, key, p)
 			}
 		}
 		if typ != "ci_failure" {
@@ -178,16 +178,16 @@ func checkMetaPayloads(t *testing.T, payloads []map[string]any) {
 		text, _ := p["text"].(string)
 		lines := strings.Split(text, "\n")
 		if len(lines) > 1+50 {
-			t.Errorf("ci text: строк %d, ожидалось ≤ 51 (заголовок + 50)", len(lines))
+			t.Errorf("ci text: %d lines, expected ≤ 51 (header + 50)", len(lines))
 		}
 		if !strings.HasSuffix(text, "line 100") {
-			t.Errorf("ci text не содержит хвост лога: %q", text)
+			t.Errorf("ci text does not contain the log tail: %q", text)
 		}
 		if strings.Contains(text, "line 50") {
-			t.Errorf("в хвост попала строка вне последних 50: %q", text)
+			t.Errorf("tail contains a line outside the last 50: %q", text)
 		}
 		if !strings.Contains(lines[0], "build") {
-			t.Errorf("заголовок ci text = %q", lines[0])
+			t.Errorf("ci text header = %q", lines[0])
 		}
 	}
 }

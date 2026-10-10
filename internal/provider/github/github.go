@@ -1,4 +1,4 @@
-// Package github — реализация provider.VCSProvider для GitHub (FR-003).
+// Package github implements provider.VCSProvider for GitHub (FR-003).
 package github
 
 import (
@@ -14,7 +14,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// Client — GitHub-провайдер: листинг репозиториев организаций.
+// Client is the GitHub provider: lists organization repositories.
 type Client struct {
 	api      *gh.Client
 	orgs     []string
@@ -22,8 +22,8 @@ type Client struct {
 	logsHTTP *http.Client
 }
 
-// New создаёт клиент GitHub; сетевых вызовов не выполняет.
-// Кастомный GITHUB_BASE_URL (GHES) подключается через WithEnterpriseURLs.
+// New creates the GitHub client; it makes no network calls.
+// A custom GITHUB_BASE_URL (GHES) is wired via WithEnterpriseURLs.
 func New(cfg *config.Config) (*Client, error) {
 	opts := []gh.ClientOptionsFunc{gh.WithAuthToken(cfg.Provider.GitHubToken)}
 	if base := cfg.Provider.GitHubBaseURL; base != "" && base != "https://api.github.com" {
@@ -31,26 +31,26 @@ func New(cfg *config.Config) (*Client, error) {
 	}
 	api, err := gh.NewClient(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("github-клиент: %w", err)
+		return nil, fmt.Errorf("github client: %w", err)
 	}
 	ciWindow := cfg.Worker.CIWindow
 	if ciWindow < 1 {
-		ciWindow = 50 // ponytail: фолбэк, если конфиг собран в обход Load
+		ciWindow = 50 // ponytail: fallback in case the config is built bypassing Load
 	}
 	return &Client{
 		api:      api,
 		orgs:     cfg.Provider.GitHubOrgs,
 		ciWindow: ciWindow,
-		// Загрузка логов Actions — по подписанному redirect URL, без Authorization.
+		// Actions log download goes via the signed redirect URL, without Authorization.
 		logsHTTP: &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
 
-// Type возвращает "github".
+// Type returns "github".
 func (c *Client) Type() string { return "github" }
 
-// ListRepositories возвращает репозитории всех организаций конфига
-// (пагинация до конца), дедуплицированные по ID.
+// ListRepositories returns repositories of all configured organizations
+// (full pagination), deduplicated by ID.
 func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) {
 	var all []provider.Repo
 	for _, org := range c.orgs {
@@ -58,7 +58,7 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 		for {
 			repos, resp, err := c.api.Repositories.ListByOrg(ctx, org, opt)
 			if err != nil {
-				return nil, fmt.Errorf("организация %s: %w", org, err)
+				return nil, fmt.Errorf("organization %s: %w", org, err)
 			}
 			for _, r := range repos {
 				all = append(all, provider.Repo{

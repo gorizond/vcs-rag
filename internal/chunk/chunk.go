@@ -1,5 +1,5 @@
-// Package chunk — чанкинг исходников: границы блоков Go (go/parser) и
-// фолбэк-окно строк с перекрытием (FR-008).
+// Package chunk — source chunking: Go block boundaries (go/parser) and a
+// fallback line window with overlap (FR-008).
 package chunk
 
 import (
@@ -11,23 +11,23 @@ import (
 	"strings"
 )
 
-// Chunk — фрагмент файла; Index — порядковый номер (≥0) в файле.
+// Chunk is a file fragment; Index is its ordinal number (≥0) within the file.
 type Chunk struct {
 	Index int
 	Text  string
 }
 
 const (
-	// ponytail: стартовые значения, уточняются по фактам.
-	oversizeLines = 120 // блок длиннее — режется окном
-	windowLines   = 100 // размер окна фолбэка, строк
-	windowOverlap = 10  // перекрытие окон, строк
+	// ponytail: starting values, to be refined based on facts.
+	oversizeLines = 120 // longer blocks are split into windows
+	windowLines   = 100 // fallback window size, lines
+	windowOverlap = 10  // window overlap, lines
 )
 
-// Split разбивает файл на чанки. Go-файлы — по границам top-level
-// func/type/method (go/parser); ошибка парсинга или отсутствие деклараций —
-// эвристика блочных границ; иначе — окно строк с перекрытием.
-// Пустой (или whitespace-only) файл — без чанков.
+// Split splits a file into chunks. Go files — at top-level func/type/method
+// boundaries (go/parser); a parse error or missing declarations — block
+// boundary heuristics; otherwise — a line window with overlap.
+// An empty (or whitespace-only) file yields no chunks.
 func Split(path string, content []byte) []Chunk {
 	if len(bytes.TrimSpace(content)) == 0 {
 		return nil
@@ -60,8 +60,8 @@ func Split(path string, content []byte) []Chunk {
 	return chunks
 }
 
-// splitGo режет файл по top-level декларациям (включая методы — они FuncDecl
-// с получателем). import-блок пропускается как не несущий кода.
+// splitGo splits a file at top-level declarations (including methods — they are
+// FuncDecl with a receiver). The import block is skipped as it carries no code.
 func splitGo(path string, content []byte) []string {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, content, parser.ParseComments)
@@ -93,7 +93,7 @@ func splitGo(path string, content []byte) []string {
 	return texts
 }
 
-// countLines считает строки, игнорируя завершающий перевод строки.
+// countLines counts lines, ignoring the trailing newline.
 func countLines(s string) int {
 	s = strings.TrimRight(s, "\n")
 	if s == "" {

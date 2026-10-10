@@ -7,17 +7,17 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
-// maxUpsertBatch — размер батча записи (запас к лимиту gRPC; уточняется по фактам).
+// maxUpsertBatch — write batch size (headroom against the gRPC limit; refined by facts).
 const maxUpsertBatch = 128
 
-// Point — точка для записи.
+// Point — a point to write.
 type Point struct {
 	ID      string
 	Vector  []float32
 	Payload map[string]any
 }
 
-// Upsert пишет точки батчами ≤ maxUpsertBatch; последний батч — с Wait=true.
+// Upsert writes points in batches ≤ maxUpsertBatch; the last batch uses Wait=true.
 func (s *Store) Upsert(ctx context.Context, points []Point) error {
 	for start := 0; start < len(points); start += maxUpsertBatch {
 		end := min(start+maxUpsertBatch, len(points))

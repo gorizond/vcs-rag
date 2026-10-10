@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// allEnv — все переменные, которые читает Load; перед каждым кейсом сбрасываются.
+// allEnv lists all variables read by Load; reset before each test case.
 var allEnv = []string{
 	"GITLAB_GROUP_ID", "GITLAB_TOKEN", "GITLAB_BASE_URL",
 	"GITHUB_ORG", "GITHUB_TOKEN", "GITHUB_BASE_URL",
@@ -20,7 +20,7 @@ var allEnv = []string{
 	"MCP_TRANSPORT", "MCP_ADDR",
 }
 
-// prepareEnv сбрасывает среду и применяет кейс.
+// prepareEnv resets the environment and applies the test case.
 func prepareEnv(t *testing.T, env map[string]string) {
 	t.Helper()
 	for _, name := range allEnv {
@@ -38,7 +38,7 @@ func TestLoadValid(t *testing.T) {
 		check func(t *testing.T, cfg *Config)
 	}{
 		{
-			name: "gitlab: группы, дефолты",
+			name: "gitlab: groups, defaults",
 			env: map[string]string{
 				"GITLAB_GROUP_ID":     " 111, 222 ,,",
 				"GITLAB_TOKEN":        "glpat-token",
@@ -55,29 +55,29 @@ func TestLoadValid(t *testing.T) {
 					t.Errorf("GitLabBaseURL = %q", cfg.Provider.GitLabBaseURL)
 				}
 				if cfg.Provider.GitHubToken != "" || len(cfg.Provider.GitHubOrgs) != 0 {
-					t.Error("GitHub-поля должны быть пустыми")
+					t.Error("GitHub fields must be empty")
 				}
 				if cfg.Embeddings.BaseURL != "http://localhost:11434" {
 					t.Errorf("Embeddings.BaseURL = %q", cfg.Embeddings.BaseURL)
 				}
 				if cfg.Embeddings.Model != "bge-m3" || cfg.Embeddings.Dim != 1024 || cfg.Embeddings.Batch != 32 {
-					t.Errorf("эмбеддинги по умолчанию: %+v", cfg.Embeddings)
+					t.Errorf("default embeddings: %+v", cfg.Embeddings)
 				}
 				if cfg.Qdrant.URL != "http://localhost:6334" || cfg.Qdrant.Collection != "vcs_rag" {
-					t.Errorf("qdrant по умолчанию: %+v", cfg.Qdrant)
+					t.Errorf("default qdrant: %+v", cfg.Qdrant)
 				}
 				if cfg.Worker.Interval != 60*time.Second || cfg.Worker.Concurrency != 4 ||
 					cfg.Worker.MirrorsDir != "./mirrors" || cfg.Worker.HistoryMaxCommits != 2000 ||
 					cfg.Worker.MaxFileBytes != 1048576 || cfg.Worker.CIWindow != 50 {
-					t.Errorf("worker по умолчанию: %+v", cfg.Worker)
+					t.Errorf("default worker: %+v", cfg.Worker)
 				}
 				if cfg.MCP.Transport != "stdio" || cfg.MCP.Addr != ":8080" {
-					t.Errorf("mcp по умолчанию: %+v", cfg.MCP)
+					t.Errorf("default mcp: %+v", cfg.MCP)
 				}
 			},
 		},
 		{
-			name: "github: организация, кастомные значения",
+			name: "github: organization, custom values",
 			env: map[string]string{
 				"GITHUB_ORG":          "acme, inc",
 				"GITHUB_TOKEN":        "ghp-token",
@@ -96,7 +96,7 @@ func TestLoadValid(t *testing.T) {
 					t.Errorf("GitHubBaseURL = %q", cfg.Provider.GitHubBaseURL)
 				}
 				if cfg.Embeddings.Provider != "lm-studio" || cfg.Embeddings.BaseURL != "http://localhost:1234" {
-					t.Errorf("эмбеддинги lm-studio: %+v", cfg.Embeddings)
+					t.Errorf("lm-studio embeddings: %+v", cfg.Embeddings)
 				}
 				if cfg.Worker.Interval != 90*time.Second {
 					t.Errorf("Interval = %v, want 90s", cfg.Worker.Interval)
@@ -124,41 +124,41 @@ func TestLoadErrors(t *testing.T) {
 		wantMissing []string
 	}{
 		{
-			name:        "нет провайдера",
+			name:        "no provider",
 			env:         map[string]string{"EMBEDDINGS_PROVIDER": "ollama"},
 			wantMissing: []string{"GITLAB_GROUP_ID", "GITLAB_TOKEN", "GITHUB_ORG", "GITHUB_TOKEN"},
 		},
 		{
-			name: "оба провайдера",
+			name: "both providers",
 			env: map[string]string{
 				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
 				"GITHUB_ORG": "acme", "GITHUB_TOKEN": "t",
 				"EMBEDDINGS_PROVIDER": "ollama",
 			},
-			wantProblem: "оба провайдера",
+			wantProblem: "both providers",
 		},
 		{
-			name:        "gitlab: группа без токена",
+			name:        "gitlab: group without token",
 			env:         map[string]string{"GITLAB_GROUP_ID": "1", "EMBEDDINGS_PROVIDER": "ollama"},
 			wantMissing: []string{"GITLAB_TOKEN"},
 		},
 		{
-			name:        "gitlab: токен без группы",
+			name:        "gitlab: token without group",
 			env:         map[string]string{"GITLAB_TOKEN": "t", "EMBEDDINGS_PROVIDER": "ollama"},
 			wantMissing: []string{"GITLAB_GROUP_ID"},
 		},
 		{
-			name:        "github: организация без токена",
+			name:        "github: organization without token",
 			env:         map[string]string{"GITHUB_ORG": "acme", "EMBEDDINGS_PROVIDER": "ollama"},
 			wantMissing: []string{"GITHUB_TOKEN"},
 		},
 		{
-			name:        "эмбеддинги: провайдер не задан",
+			name:        "embeddings: provider not set",
 			env:         map[string]string{"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t"},
 			wantMissing: []string{"EMBEDDINGS_PROVIDER"},
 		},
 		{
-			name: "эмбеддинги: недопустимый провайдер",
+			name: "embeddings: invalid provider",
 			env: map[string]string{
 				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
 				"EMBEDDINGS_PROVIDER": "openai",
@@ -166,7 +166,7 @@ func TestLoadErrors(t *testing.T) {
 			wantProblem: "EMBEDDINGS_PROVIDER",
 		},
 		{
-			name: "worker: некорректная длительность",
+			name: "worker: invalid duration",
 			env: map[string]string{
 				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
 				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_INTERVAL": "abc",
@@ -174,7 +174,7 @@ func TestLoadErrors(t *testing.T) {
 			wantProblem: "WORKER_INTERVAL",
 		},
 		{
-			name: "mcp: недопустимый транспорт",
+			name: "mcp: invalid transport",
 			env: map[string]string{
 				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
 				"EMBEDDINGS_PROVIDER": "ollama", "MCP_TRANSPORT": "ws",
@@ -187,14 +187,14 @@ func TestLoadErrors(t *testing.T) {
 			prepareEnv(t, tc.env)
 			cfg, err := Load()
 			if err == nil {
-				t.Fatalf("Load() = %+v, ожидалась ошибка", cfg)
+				t.Fatalf("Load() = %+v, expected an error", cfg)
 			}
 			var cfgErr *ConfigError
 			if !errors.As(err, &cfgErr) {
-				t.Fatalf("err = %T (%v), ожидался *ConfigError", err, err)
+				t.Fatalf("err = %T (%v), want *ConfigError", err, err)
 			}
 			if tc.wantProblem != "" && !strings.Contains(cfgErr.Problem, tc.wantProblem) {
-				t.Errorf("Problem = %q, не содержит %q", cfgErr.Problem, tc.wantProblem)
+				t.Errorf("Problem = %q does not contain %q", cfgErr.Problem, tc.wantProblem)
 			}
 			if tc.wantMissing != nil && !slices.Equal(cfgErr.Missing, tc.wantMissing) {
 				t.Errorf("Missing = %v, want %v", cfgErr.Missing, tc.wantMissing)
@@ -203,7 +203,7 @@ func TestLoadErrors(t *testing.T) {
 	}
 }
 
-// TestSecretNotLeaked: значения токенов не попадают в текст ошибки.
+// TestSecretNotLeaked: token values do not appear in the error text.
 func TestSecretNotLeaked(t *testing.T) {
 	const gitlabSecret = "glpat-SUPERSECRET-123"
 	const githubSecret = "ghp-ANOTHER-SECRET-456"
@@ -216,10 +216,10 @@ func TestSecretNotLeaked(t *testing.T) {
 	})
 	_, err := Load()
 	if err == nil {
-		t.Fatal("ожидалась ошибка (оба провайдера)")
+		t.Fatal("error expected (both providers)")
 	}
 	if strings.Contains(err.Error(), gitlabSecret) || strings.Contains(err.Error(), githubSecret) {
-		t.Errorf("утечка секрета в тексте ошибки: %v", err)
+		t.Errorf("secret leaked into the error message: %v", err)
 	}
 }
 
@@ -228,6 +228,6 @@ func TestSplitList(t *testing.T) {
 		t.Errorf("splitList = %v, want %v", got, want)
 	}
 	if got := splitList("  ,  "); len(got) != 0 {
-		t.Errorf("splitList пустого списка = %v, want пусто", got)
+		t.Errorf("splitList of an empty list = %v, want empty", got)
 	}
 }

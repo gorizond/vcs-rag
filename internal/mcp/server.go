@@ -1,7 +1,7 @@
-// Package mcp — MCP-сервер поиска (FR-013): stdio (default) и streamable HTTP,
-// инструменты поверх store/embed. Сервер стартует и отвечает даже при
-// недоступном Qdrant — ошибки бэкендов возвращаются структурированными
-// ответами инструментов, процесс не падает.
+// Package mcp — MCP search server (FR-013): stdio (default) and streamable HTTP,
+// tools on top of store/embed. The server starts and responds even when
+// Qdrant is unavailable — backend errors are returned as structured
+// tool responses, the process does not crash.
 package mcp
 
 import (
@@ -17,8 +17,8 @@ import (
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// Run запускает MCP-сервер: stdio по умолчанию, streamable HTTP при
-// MCP_TRANSPORT=sse (адрес MCP_ADDR). Блокируется до отмены контекста.
+// Run starts the MCP server: stdio by default, streamable HTTP when
+// MCP_TRANSPORT=sse (address MCP_ADDR). Blocks until the context is canceled.
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version string) error {
 	emb, err := embed.New(cfg)
 	if err != nil {
@@ -39,11 +39,11 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	if cfg.MCP.Transport == "sse" {
 		return runHTTP(ctx, cfg, logger, server)
 	}
-	logger.Info("MCP: транспорт stdio")
+	logger.Info("MCP: transport stdio")
 	return server.Run(ctx, &mcp.StdioTransport{})
 }
 
-// runHTTP обслуживает streamable HTTP на MCP_ADDR.
+// runHTTP serves streamable HTTP on MCP_ADDR.
 func runHTTP(ctx context.Context, cfg *config.Config, logger *slog.Logger, server *mcp.Server) error {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 	srv := &http.Server{Addr: cfg.MCP.Addr, Handler: handler}
@@ -51,7 +51,7 @@ func runHTTP(ctx context.Context, cfg *config.Config, logger *slog.Logger, serve
 		<-ctx.Done()
 		_ = srv.Shutdown(context.Background())
 	}()
-	logger.Info("MCP: транспорт streamable HTTP", "addr", cfg.MCP.Addr)
+	logger.Info("MCP: transport streamable HTTP", "addr", cfg.MCP.Addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

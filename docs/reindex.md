@@ -1,57 +1,57 @@
-# Процедура reindex: смена модели/размерности эмбеддингов
+# Reindex procedure: changing the embeddings model/dimension
 
-Смена `EMBEDDINGS_MODEL`/`EMBEDDINGS_DIM` на модель другой размерности требует
-пересоздания коллекции и полной переиндексации. До процедуры воркер стартует с
-детерминированным отказом (FR-009): «коллекция "vcs_rag" имеет размерность N,
-ожидается M — требуется переиндексация…» — записи при этом **не создаются**
-(0 смешанных векторов).
+Changing `EMBEDDINGS_MODEL`/`EMBEDDINGS_DIM` to a model with a different dimension
+requires recreating the collection and a full reindex. Before the procedure the
+worker starts with a deterministic failure (FR-009): `qdrant: collection "vcs_rag"
+has dimension N, expected M — reindex required…` — no records are created in this
+case (**0 mixed vectors**).
 
-## Шаги
+## Steps
 
-1. **Остановить воркер** (Ctrl-C/SIGTERM) — линия index завершает текущий проход,
-   state сохраняется только после успеха (FR-014).
+1. **Stop the worker** (Ctrl-C/SIGTERM) — the index pipeline finishes the current
+   pass, state is saved only after success (FR-014).
 
-2. **Пересоздать коллекцию** (REST-команда проверена на Qdrant v1.19.2):
+2. **Recreate the collection** (REST command verified on Qdrant v1.19.2):
 
    ```bash
    curl -s -X DELETE http://localhost:6333/collections/vcs_rag
    # → {"result":true,"status":"ok",...}
-   # коллекция будет создана заново при старте воркера (EnsureCollection, FR-009)
+   # the collection is recreated on worker startup (EnsureCollection, FR-009)
    ```
 
-3. **Удалить sidecar-состояния** (`*.state.json` рядом с зеркалами) — иначе проход
-   посчитает историю уже проиндексированной и не перезапишет точки:
+3. **Delete sidecar states** (`*.state.json` next to the mirrors) — otherwise the
+   pass will consider the history already indexed and will not overwrite the points:
 
    ```bash
    find <MIRRORS_DIR> -name '*.state.json' -delete
    ```
 
-4. **Запустить воркер** с новой конфигурацией:
+4. **Start the worker** with the new configuration:
 
    ```bash
    docker run --rm --network host \
      -e GITLAB_GROUP_ID=... -e GITLAB_TOKEN=... \
-     -e EMBEDDINGS_PROVIDER=ollama -e EMBEDDINGS_MODEL=<новая-модель> \
-     -e EMBEDDINGS_DIM=<новая-размерность> -e QDRANT_URL=http://localhost:6334 \
+     -e EMBEDDINGS_PROVIDER=ollama -e EMBEDDINGS_MODEL=<new-model> \
+     -e EMBEDDINGS_DIM=<new-dimension> -e QDRANT_URL=http://localhost:6334 \
      vcs-rag:dev -mode=worker
    ```
 
-   На старте: создание коллекции под новую размерность + payload-индексы; линии
-   discovery/mirror/index/metadata наполнят её заново (зеркала на диске не
-   трогаются — код читается из локальных git-объектов).
+   On startup: the collection for the new dimension + payload indexes are
+   created; the discovery/mirror/index/metadata pipelines will refill it (the
+   mirrors on disk are not touched — code is read from local git objects).
 
-5. **Проверки**:
+5. **Checks**:
 
    ```bash
    curl -s http://localhost:6333/collections/vcs_rag | grep -A3 vectors   # size == EMBEDDINGS_DIM
    curl -s -X POST http://localhost:6333/collections/vcs_rag/points/count \
-     -H 'Content-Type: application/json' -d '{"exact":true}'               # count растёт
+     -H 'Content-Type: application/json' -d '{"exact":true}'               # count grows
    ```
 
-## Примечания
+## Notes
 
-- Размерность проверяется и на каждом upsert (embed-валидация, FR-009) — запись
-  «чужих» векторов невозможна.
-- Процедура проверена e2e-тестом `TestE2E_Reindex`: отказ при 768 против 1024 —
-  count не изменился; после drop + очистки sidecar — count>0 и 100% векторов
-  новой конфигурации (см. `tests/integration/final-validation.md`, SC-009).
+- The dimension is also checked on every upsert (embed validation, FR-009) —
+  writing "foreign" vectors is impossible.
+- The procedure is verified by the e2e test `TestE2E_Reindex`: a failure at 768
+  against 1024 — count did not change; after drop + sidecar cleanup — count>0 and
+  100% of vectors of the new configuration (see `tests/integration/final-validation.md`, SC-009).

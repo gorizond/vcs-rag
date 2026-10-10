@@ -8,8 +8,8 @@ import (
 
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
-// Эталонные UUID5 посчитаны независимо (python uuid.uuid5, namespace =
-// sha1("vcs-rag")[:16]) — кросс-проверка формулы data-model §3–§6.
+// Reference UUID5 values are computed independently (python uuid.uuid5,
+// namespace = sha1("vcs-rag")[:16]) — a cross-check of the data-model §3–§6 formulas.
 
 func TestCodeChunkID(t *testing.T) {
 	const want = "7e107394-9035-5dab-aa21-e1540db10278"
@@ -18,10 +18,10 @@ func TestCodeChunkID(t *testing.T) {
 		t.Errorf("CodeChunkID = %q, want %q", got, want)
 	}
 	if !uuidRe.MatchString(got) {
-		t.Errorf("ID не соответствует формату UUIDv5: %q", got)
+		t.Errorf("ID does not match the UUIDv5 format: %q", got)
 	}
 	if CodeChunkID("gitlab", "my-org/team-a/svc", "myrepo", "main", "abc123", "src/main.go", 1) == got {
-		t.Error("chunk_index не влияет на ID")
+		t.Error("chunk_index does not affect the ID")
 	}
 }
 
@@ -58,7 +58,7 @@ func TestCodePayload(t *testing.T) {
 	}
 	for _, key := range []string{"vcs_type", "group_org", "repo", "type", "branch", "commit_sha", "file_path", "text", "chunk_index"} {
 		if _, ok := got[key]; !ok {
-			t.Errorf("в payload нет обязательного поля %q", key)
+			t.Errorf("payload has no required field %q", key)
 		}
 	}
 }

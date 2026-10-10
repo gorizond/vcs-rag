@@ -9,33 +9,33 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// maxRateLimitPause — верхняя граница паузы при лимите VCS (FR-015).
+// maxRateLimitPause is the upper bound of the pause on a VCS rate limit (FR-015).
 const maxRateLimitPause = 5 * time.Minute
 
-// processSafely выполняет per-repo обработку с изоляцией отказов (FR-014):
-// паника не рушит линию, ошибка логируется со структурой (repo, phase) и НЕ
-// меняет state — повтор в следующем проходе; rate-limit ошибки выдерживают
-// паузу min(retryAfter, maxRateLimitPause) до повтора (FR-015).
-// Возвращает ошибку обработки (nil — успех или штатная отмена контекста).
+// processSafely runs per-repo processing with failure isolation (FR-014):
+// a panic does not break the lane, an error is logged with structure (repo,
+// phase) and does NOT change state — retried on the next pass; rate limit
+// errors wait min(retryAfter, maxRateLimitPause) before retry (FR-015).
+// It returns the processing error (nil — success or normal context cancellation).
 func processSafely(ctx context.Context, lg *slog.Logger, repo provider.Repo, phase string, fn func() error) (err error) {
 	name := repo.Namespace + "/" + repo.Path
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
-			lg.Error("паника в обработке репозитория", "repo", name, "phase", phase, "panic", fmt.Sprint(r))
+			lg.Error("panic while processing repository", "repo", name, "phase", phase, "panic", fmt.Sprint(r))
 		}
 	}()
 
 	err = fn()
 	if err == nil || ctx.Err() != nil {
-		return nil // штатное завершение — не шумим
+		return nil // normal shutdown — stay quiet
 	}
 	if retryAfter, ok := provider.IsRateLimit(err); ok {
 		pause := retryAfter
 		if pause <= 0 || pause > maxRateLimitPause {
 			pause = maxRateLimitPause
 		}
-		lg.Warn("лимит VCS: пауза перед повтором", "repo", name, "phase", phase,
+		lg.Warn("VCS rate limit: pause before retry", "repo", name, "phase", phase,
 			"retry_after", retryAfter.String(), "pause", pause.String())
 		select {
 		case <-ctx.Done():
@@ -43,6 +43,6 @@ func processSafely(ctx context.Context, lg *slog.Logger, repo provider.Repo, pha
 		}
 		return err
 	}
-	lg.Error("обработка репозитория не удалась", "repo", name, "phase", phase, "err", err)
+	lg.Error("repository processing failed", "repo", name, "phase", phase, "err", err)
 	return err
 }

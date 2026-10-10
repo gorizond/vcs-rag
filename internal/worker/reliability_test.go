@@ -13,7 +13,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// (а) сбой одного репозитория не прерывает остальные: N−1 обработаны.
+// (a) a single repository failure does not stop the others: N−1 processed.
 func TestProcessSafelyIsolation(t *testing.T) {
 	repos := []provider.Repo{
 		{ID: "1", Namespace: "g", Path: "a"},
@@ -33,32 +33,32 @@ func TestProcessSafelyIsolation(t *testing.T) {
 		if err != nil {
 			failures++
 			if repo.ID != "2" {
-				t.Errorf("неожиданный сбой repo %s: %v", repo.ID, err)
+				t.Errorf("unexpected failure of repo %s: %v", repo.ID, err)
 			}
 		}
 	}
 	if len(processed) != len(repos)-1 {
-		t.Errorf("обработано %d, ожидалось N−1 = %d", len(processed), len(repos)-1)
+		t.Errorf("processed %d, want N−1 = %d", len(processed), len(repos)-1)
 	}
 	if failures != 1 {
-		t.Errorf("сбоев %d, ожидался 1", failures)
+		t.Errorf("failures %d, want 1", failures)
 	}
 }
 
-// паника изолируется и возвращается ошибкой — линия продолжает работу.
+// a panic is isolated and returned as an error — the lane keeps running.
 func TestProcessSafelyPanic(t *testing.T) {
 	err := processSafely(context.Background(), testLogger(), provider.Repo{ID: "1"}, "index", func() error {
 		panic("kaboom")
 	})
 	if err == nil {
-		t.Fatal("паника должна вернуться ошибкой")
+		t.Fatal("panic must be returned as an error")
 	}
 	if !strings.Contains(err.Error(), "kaboom") {
 		t.Errorf("err = %v", err)
 	}
 }
 
-// (б) IsRateLimit: GitHub-типы, generic 429/Retry-After, обёртка errors.As.
+// (b) IsRateLimit: GitHub types, generic 429/Retry-After, errors.As unwrapping.
 func TestIsRateLimit(t *testing.T) {
 	retry := 30 * time.Second
 	resetIn := 10 * time.Second
@@ -86,30 +86,30 @@ func TestIsRateLimit(t *testing.T) {
 		t.Errorf("retryAfter = %v (ok=%v), want %v", d, ok, retry)
 	}
 	if d, ok := provider.IsRateLimit(&gh.RateLimitError{Rate: gh.Rate{Reset: gh.Timestamp{Time: time.Now().Add(resetIn)}}}); !ok || d <= 0 {
-		t.Errorf("rate reset retryAfter = %v (ok=%v), ожидалось > 0", d, ok)
+		t.Errorf("rate reset retryAfter = %v (ok=%v), want > 0", d, ok)
 	}
 	wrapped := fmt.Errorf("list repos: %w", &gh.AbuseRateLimitError{RetryAfter: &retry})
 	if _, ok := provider.IsRateLimit(wrapped); !ok {
-		t.Error("errors.As не развернул обёрнутую ошибку")
+		t.Error("errors.As did not unwrap the wrapped error")
 	}
 }
 
-// (в) resume: повторный проход не даёт коммитов к индексации
-// (полный счётчик точек проверен e2e US2–US4 на реальном Qdrant).
+// (c) resume: a repeated pass yields no commits to index
+// (the full point counter is covered by e2e US2–US4 on a real Qdrant).
 func TestNewCommitsResume(t *testing.T) {
 	window := []string{"c", "b", "a"} // newest→oldest
 	if got := newCommits(window, nil); len(got) != 3 || got[0] != "a" || got[2] != "c" {
-		t.Errorf("первый проход = %v, ожидалось [a b c] (oldest→newest)", got)
+		t.Errorf("first pass = %v, want [a b c] (oldest→newest)", got)
 	}
 	if got := newCommits(window, []string{"a", "b", "c"}); len(got) != 0 {
-		t.Errorf("повторный проход = %v, ожидалось пусто (resume)", got)
+		t.Errorf("repeated pass = %v, want empty (resume)", got)
 	}
 	if got := newCommits(window, []string{"a", "b"}); len(got) != 1 || got[0] != "c" {
-		t.Errorf("инкремент = %v, ожидалось [c]", got)
+		t.Errorf("increment = %v, want [c]", got)
 	}
 }
 
-// T059: flock-лок — второй AcquireLock занят, после release снова свободен.
+// T059: flock lock — the second AcquireLock is busy, free again after release.
 func TestAcquireLock(t *testing.T) {
 	dir := t.TempDir()
 	release, err := AcquireLock(dir)
@@ -118,16 +118,16 @@ func TestAcquireLock(t *testing.T) {
 	}
 	_, err = AcquireLock(dir)
 	if err == nil {
-		t.Fatal("второй AcquireLock должен вернуть ошибку занятости")
+		t.Fatal("the second AcquireLock must return the busy error")
 	}
-	if !strings.Contains(err.Error(), "воркер уже запущен") {
+	if !strings.Contains(err.Error(), "worker already running") {
 		t.Errorf("err = %v", err)
 	}
 	release()
 
 	release2, err := AcquireLock(dir)
 	if err != nil {
-		t.Fatalf("AcquireLock после release: %v", err)
+		t.Fatalf("AcquireLock after release: %v", err)
 	}
 	release2()
 }

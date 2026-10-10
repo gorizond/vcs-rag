@@ -7,13 +7,13 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
-// indexFields — keyword-индексы payload. Первые пять — контракт
-// (data-model §3/QueryFilter); commit_sha и file_path — расширение для
-// prune/удаления файлов (отмечено в отчёте фазы).
+// indexFields — keyword payload indexes. The first five are the contract
+// (data-model §3/QueryFilter); commit_sha and file_path are the extension
+// for prune/file deletion (noted in the phase report).
 var indexFields = []string{"vcs_type", "group_org", "repo", "type", "branch", "commit_sha", "file_path"}
 
-// EnsureIndexes создаёт keyword-индексы (идемпотентно — повторный вызов
-// для существующего индекса безвреден).
+// EnsureIndexes creates keyword indexes (idempotent — a repeated call
+// for an existing index is harmless).
 func (s *Store) EnsureIndexes(ctx context.Context) error {
 	for _, field := range indexFields {
 		if _, err := s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
@@ -22,7 +22,7 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			FieldType:      qdrant.FieldType_FieldTypeKeyword.Enum(),
 			Wait:           qdrant.PtrOf(true),
 		}); err != nil {
-			return fmt.Errorf("qdrant: индекс %q: %w", field, err)
+			return fmt.Errorf("qdrant: index %q: %w", field, err)
 		}
 	}
 	return nil

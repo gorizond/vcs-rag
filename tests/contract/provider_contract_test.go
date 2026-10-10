@@ -1,5 +1,5 @@
-// Package contract — переиспользуемый контрактный набор для provider.VCSProvider.
-// Сейчас гоняется на фейке; позже подключаются реальные GitLab/GitHub-провайдеры.
+// Package contract — reusable contract suite for provider.VCSProvider.
+// Currently runs against the fake; real GitLab/GitHub providers are wired in later.
 package contract
 
 import (
@@ -14,13 +14,13 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider/fake"
 )
 
-// RunProviderContract проверяет общие инварианты реализации VCSProvider.
+// RunProviderContract checks the common invariants of a VCSProvider implementation.
 func RunProviderContract(t *testing.T, p provider.VCSProvider) {
 	t.Helper()
 	ctx := context.Background()
 
 	if p.Type() == "" {
-		t.Error("Type() пуст")
+		t.Error("Type() is empty")
 	}
 
 	repos, err := p.ListRepositories(ctx)
@@ -28,25 +28,25 @@ func RunProviderContract(t *testing.T, p provider.VCSProvider) {
 		t.Fatalf("ListRepositories: %v", err)
 	}
 	if len(repos) == 0 {
-		t.Fatal("ListRepositories: пустая выдача")
+		t.Fatal("ListRepositories: empty result")
 	}
 	seen := make(map[string]bool)
 	for _, r := range repos {
 		if r.ID == "" || r.Namespace == "" || r.Path == "" || r.CloneURL == "" {
-			t.Errorf("repo %+v: пустые обязательные поля ID/Namespace/Path/CloneURL", r)
+			t.Errorf("repo %+v: empty required fields ID/Namespace/Path/CloneURL", r)
 		}
 		if seen[r.ID] {
-			t.Errorf("repo ID %q не уникален", r.ID)
+			t.Errorf("repo ID %q is not unique", r.ID)
 		}
 		seen[r.ID] = true
 	}
 
 	repos2, err := p.ListRepositories(ctx)
 	if err != nil {
-		t.Fatalf("ListRepositories (повтор): %v", err)
+		t.Fatalf("ListRepositories (repeat): %v", err)
 	}
 	if !reflect.DeepEqual(repos, repos2) {
-		t.Error("ListRepositories не детерминирован")
+		t.Error("ListRepositories is not deterministic")
 	}
 
 	repo := repos[0]
@@ -57,10 +57,10 @@ func RunProviderContract(t *testing.T, p provider.VCSProvider) {
 	}
 	issues2, err := p.ListIssues(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListIssues (повтор): %v", err)
+		t.Fatalf("ListIssues (repeat): %v", err)
 	}
 	if !reflect.DeepEqual(issues1, issues2) {
-		t.Error("ListIssues не детерминирован")
+		t.Error("ListIssues is not deterministic")
 	}
 
 	pipelines, err := p.ListPipelines(ctx, repo)
@@ -68,23 +68,23 @@ func RunProviderContract(t *testing.T, p provider.VCSProvider) {
 		t.Fatalf("ListPipelines: %v", err)
 	}
 
-	// Отмена контекста → ошибка (context.Canceled).
+	// Context cancellation → error (context.Canceled).
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
 	if _, err := p.ListRepositories(cancelled); !errors.Is(err, context.Canceled) {
-		t.Errorf("ListRepositories: отмена контекста дала err=%v", err)
+		t.Errorf("ListRepositories: context cancellation gave err=%v", err)
 	}
 	if _, err := p.ListIssues(cancelled, repo); !errors.Is(err, context.Canceled) {
-		t.Errorf("ListIssues: отмена контекста дала err=%v", err)
+		t.Errorf("ListIssues: context cancellation gave err=%v", err)
 	}
 	if _, err := p.ListChangeRequests(cancelled, repo); !errors.Is(err, context.Canceled) {
-		t.Errorf("ListChangeRequests: отмена контекста дала err=%v", err)
+		t.Errorf("ListChangeRequests: context cancellation gave err=%v", err)
 	}
 	if _, err := p.ListPipelines(cancelled, repo); !errors.Is(err, context.Canceled) {
-		t.Errorf("ListPipelines: отмена контекста дала err=%v", err)
+		t.Errorf("ListPipelines: context cancellation gave err=%v", err)
 	}
 
-	// PipelineLogTail: не более N строк; отмена контекста → ошибка.
+	// PipelineLogTail: no more than N lines; context cancellation → error.
 	if len(pipelines) > 0 && len(pipelines[0].Jobs) > 0 {
 		const n = 3
 		job := pipelines[0].Jobs[0]
@@ -93,15 +93,15 @@ func RunProviderContract(t *testing.T, p provider.VCSProvider) {
 			t.Fatalf("PipelineLogTail: %v", err)
 		}
 		if lines := countLines(tail); lines > n {
-			t.Errorf("PipelineLogTail вернул %d строк, ожидалось не более %d", lines, n)
+			t.Errorf("PipelineLogTail returned %d lines, expected at most %d", lines, n)
 		}
 		if _, err := p.PipelineLogTail(cancelled, repo, pipelines[0], job, n); !errors.Is(err, context.Canceled) {
-			t.Errorf("PipelineLogTail: отмена контекста дала err=%v", err)
+			t.Errorf("PipelineLogTail: context cancellation gave err=%v", err)
 		}
 	}
 }
 
-// countLines считает строки, игнорируя один завершающий перевод строки.
+// countLines counts lines, ignoring a single trailing newline.
 func countLines(s string) int {
 	s = strings.TrimRight(s, "\n")
 	if s == "" {
@@ -110,7 +110,7 @@ func countLines(s string) int {
 	return strings.Count(s, "\n") + 1
 }
 
-// TestFakeProvider прогоняет контракт на фейке.
+// TestFakeProvider runs the contract against the fake.
 func TestFakeProvider(t *testing.T) {
 	f := &fake.Provider{
 		Repos: []provider.Repo{

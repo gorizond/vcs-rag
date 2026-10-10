@@ -10,12 +10,12 @@ import (
 	"strings"
 )
 
-// Ollama — клиент Ollama (POST /api/embed).
+// Ollama — Ollama client (POST /api/embed).
 type Ollama struct {
 	base
 }
 
-// NewOllama создаёт клиент; baseURL — например http://localhost:11434.
+// NewOllama creates a client; baseURL — e.g. http://localhost:11434.
 func NewOllama(baseURL, model string, dim, batch int) *Ollama {
 	return &Ollama{base{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -26,8 +26,8 @@ func NewOllama(baseURL, model string, dim, batch int) *Ollama {
 	}}
 }
 
-// Embed вычисляет эмбеддинги батчами по batch текстов.
-// keep_alive=10m — модель не выгружается между проходами.
+// Embed computes embeddings in batches of batch texts.
+// keep_alive=10m — the model is not unloaded between passes.
 func (o *Ollama) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, 0, len(texts))
 	for _, part := range o.batches(texts) {
@@ -52,7 +52,7 @@ func (o *Ollama) Embed(ctx context.Context, texts []string) ([][]float32, error)
 		payload, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		_ = resp.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("ollama: чтение ответа: %w", readErr)
+			return nil, fmt.Errorf("ollama: reading response: %w", readErr)
 		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("ollama: HTTP %d: %s", resp.StatusCode, truncate(payload))
@@ -61,7 +61,7 @@ func (o *Ollama) Embed(ctx context.Context, texts []string) ([][]float32, error)
 			Embeddings [][]float32 `json:"embeddings"`
 		}
 		if err := json.Unmarshal(payload, &parsed); err != nil {
-			return nil, fmt.Errorf("ollama: разбор ответа: %w", err)
+			return nil, fmt.Errorf("ollama: parsing response: %w", err)
 		}
 		if err := o.validate(parsed.Embeddings, len(part)); err != nil {
 			return nil, err

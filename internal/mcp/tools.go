@@ -11,56 +11,56 @@ import (
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// Searcher — узкий интерфейс store для инструментов (мок в тестах).
+// Searcher — a narrow store interface for the tools (mock in tests).
 type Searcher interface {
 	Search(ctx context.Context, vector []float32, f store.Filter, topK int) ([]store.ScoredPoint, error)
 }
 
-// Embedder — узкий интерфейс эмбеддингов для инструментов (мок в тестах).
+// Embedder — a narrow embeddings interface for the tools (mock in tests).
 type Embedder interface {
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
 }
 
 const (
-	toolTimeout = 60 * time.Second // предел на вызов инструмента (таймауты → код timeout)
+	toolTimeout = 60 * time.Second // per-call limit (timeouts → code timeout)
 	defaultTopK = 5
-	maxTopK     = 20 // cap из contracts/mcp-tools.md
+	maxTopK     = 20 // cap from contracts/mcp-tools.md
 	maxSnippet  = 400
 )
 
-// tools — реализация MCP-инструментов поверх узких интерфейсов.
+// tools — MCP tool implementations on top of narrow interfaces.
 type tools struct {
 	embedder Embedder
 	searcher Searcher
 }
 
-// --- входы (contracts/mcp-tools.md) ---
+// --- inputs (contracts/mcp-tools.md) ---
 
 type searchCodeInput struct {
-	Query    string `json:"query" jsonschema:"текст поискового запроса"`
-	VCSType  string `json:"vcs_type,omitempty" jsonschema:"фильтр: gitlab | github"`
-	GroupOrg string `json:"group_org,omitempty" jsonschema:"группа GitLab или организация GitHub"`
-	Repo     string `json:"repo,omitempty" jsonschema:"путь репозитория"`
-	Branch   string `json:"branch,omitempty" jsonschema:"ветка"`
-	TopK     int    `json:"top_k,omitempty" jsonschema:"сколько результатов вернуть (по умолчанию 5, максимум 20)"`
+	Query    string `json:"query" jsonschema:"search query text"`
+	VCSType  string `json:"vcs_type,omitempty" jsonschema:"filter: gitlab | github"`
+	GroupOrg string `json:"group_org,omitempty" jsonschema:"GitLab group or GitHub organization"`
+	Repo     string `json:"repo,omitempty" jsonschema:"repository path"`
+	Branch   string `json:"branch,omitempty" jsonschema:"branch"`
+	TopK     int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
 
 type metadataQueryInput struct {
-	Query    string `json:"query" jsonschema:"текст поискового запроса"`
-	Repo     string `json:"repo,omitempty" jsonschema:"путь репозитория"`
-	GroupOrg string `json:"group_org,omitempty" jsonschema:"группа GitLab или организация GitHub"`
-	State    string `json:"state,omitempty" jsonschema:"состояние: opened | closed | merged"`
-	TopK     int    `json:"top_k,omitempty" jsonschema:"сколько результатов вернуть (по умолчанию 5, максимум 20)"`
+	Query    string `json:"query" jsonschema:"search query text"`
+	Repo     string `json:"repo,omitempty" jsonschema:"repository path"`
+	GroupOrg string `json:"group_org,omitempty" jsonschema:"GitLab group or GitHub organization"`
+	State    string `json:"state,omitempty" jsonschema:"state: opened | closed | merged"`
+	TopK     int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
 
 type ciFailuresInput struct {
-	Query  string `json:"query" jsonschema:"текст поискового запроса"`
-	Repo   string `json:"repo,omitempty" jsonschema:"путь репозитория"`
-	Branch string `json:"branch,omitempty" jsonschema:"ветка"`
-	TopK   int    `json:"top_k,omitempty" jsonschema:"сколько результатов вернуть (по умолчанию 5, максимум 20)"`
+	Query  string `json:"query" jsonschema:"search query text"`
+	Repo   string `json:"repo,omitempty" jsonschema:"repository path"`
+	Branch string `json:"branch,omitempty" jsonschema:"branch"`
+	TopK   int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
 
-// --- элементы ответов (contracts/mcp-tools.md) ---
+// --- response items (contracts/mcp-tools.md) ---
 
 type codeHit struct {
 	Repo      string  `json:"repo"`
@@ -103,28 +103,28 @@ type ciHit struct {
 	Snippet    string  `json:"snippet"`
 }
 
-// registerTools подключает инструменты из contracts/mcp-tools.md.
+// registerTools registers the tools from contracts/mcp-tools.md.
 func registerTools(server *mcp.Server, t *tools) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_code",
-		Description: "Семантический поиск по проиндексированному коду",
+		Description: "Semantic search over indexed code",
 	}, t.searchCode)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_pull_requests",
-		Description: "Семантический поиск по pull/merge requests",
+		Description: "Semantic search over pull/merge requests",
 	}, t.searchPRs)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_issues",
-		Description: "Семантический поиск по issues (индексация — US4/FR-012)",
+		Description: "Semantic search over issues (indexing — US4/FR-012)",
 	}, t.searchIssues)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_ci_failures",
-		Description: "Семантический поиск по логам упавших CI-джобов",
+		Description: "Semantic search over failed CI job logs",
 	}, t.searchCIFailures)
 }
 
-// searchCode — семантический поиск по коду (T046).
-// Out=any: успех — массив codeHit, ошибка — toolError ({"error": {...}}).
+// searchCode — semantic code search (T046).
+// Out=any: success — a []codeHit slice, error — toolError ({"error": {...}}).
 func (t *tools) searchCode(ctx context.Context, _ *mcp.CallToolRequest, in searchCodeInput) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
@@ -158,7 +158,7 @@ func (t *tools) searchCode(ctx context.Context, _ *mcp.CallToolRequest, in searc
 	return nil, hits, nil
 }
 
-// searchPRs — поиск по MR/PR (T071).
+// searchPRs — MR/PR search (T071).
 func (t *tools) searchPRs(ctx context.Context, _ *mcp.CallToolRequest, in metadataQueryInput) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
@@ -192,7 +192,7 @@ func (t *tools) searchPRs(ctx context.Context, _ *mcp.CallToolRequest, in metada
 	return nil, hits, nil
 }
 
-// searchIssues — поиск по issues (T072).
+// searchIssues — issue search (T072).
 func (t *tools) searchIssues(ctx context.Context, _ *mcp.CallToolRequest, in metadataQueryInput) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
@@ -224,7 +224,7 @@ func (t *tools) searchIssues(ctx context.Context, _ *mcp.CallToolRequest, in met
 	return nil, hits, nil
 }
 
-// searchCIFailures — поиск по логам упавших CI-джобов (T073).
+// searchCIFailures — search over failed CI job logs (T073).
 func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in ciFailuresInput) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
@@ -257,19 +257,19 @@ func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in
 	return nil, hits, nil
 }
 
-// queryVector вычисляет эмбеддинг поискового запроса.
+// queryVector computes the embedding of the search query.
 func (t *tools) queryVector(ctx context.Context, query string) ([]float32, error) {
 	vecs, err := t.embedder.Embed(ctx, []string{query})
 	if err != nil {
 		return nil, err
 	}
 	if len(vecs) != 1 {
-		return nil, fmt.Errorf("эмбеддинг запроса: получено %d векторов, ожидался 1", len(vecs))
+		return nil, fmt.Errorf("query embedding: got %d vectors, expected 1", len(vecs))
 	}
 	return vecs[0], nil
 }
 
-// clampTopK применяет дефолт 5 и cap 20 (contracts/mcp-tools.md).
+// clampTopK applies the default of 5 and the cap of 20 (contracts/mcp-tools.md).
 func clampTopK(k int) int {
 	switch {
 	case k <= 0:
@@ -281,7 +281,7 @@ func clampTopK(k int) int {
 	}
 }
 
-// snippet обрезает текст до maxSnippet символов (по рунам, без разрыва UTF-8).
+// snippet truncates text to maxSnippet runes (without breaking UTF-8).
 func snippet(text string) string {
 	runes := []rune(text)
 	if len(runes) <= maxSnippet {
@@ -290,13 +290,13 @@ func snippet(text string) string {
 	return string(runes[:maxSnippet-1]) + "…"
 }
 
-// payloadString читает строковое поле payload.
+// payloadString reads a string payload field.
 func payloadString(p map[string]any, key string) string {
 	s, _ := p[key].(string)
 	return s
 }
 
-// payloadInt64 читает целочисленное поле payload (int64 из Qdrant, с запасом).
+// payloadInt64 reads an integer payload field (int64 from Qdrant, with slack).
 func payloadInt64(p map[string]any, key string) int64 {
 	switch v := p[key].(type) {
 	case int64:
@@ -312,7 +312,7 @@ func payloadInt64(p map[string]any, key string) int64 {
 	}
 }
 
-// marshalJSON — вспомогательное для тестов: детерминированный JSON значения.
+// marshalJSON — a test helper: deterministic JSON of a value.
 func marshalJSON(v any) string {
 	data, err := json.Marshal(v)
 	if err != nil {

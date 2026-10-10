@@ -12,8 +12,8 @@ import (
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// runMetadata — линия метаданных (T054): по тикеру WORKER_INTERVAL
-// обрабатывает репозитории реестра через пул; ошибки не прерывают цикл (FR-014).
+// runMetadata is the metadata lane (T054): on the WORKER_INTERVAL tick it
+// processes registry repositories through the pool; errors do not break the loop (FR-014).
 func runMetadata(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) error {
 	deps.Logger = log.WithPhase(deps.Logger, "metadata")
 	metadataAll(ctx, cfg, deps, snap)
@@ -30,8 +30,8 @@ func runMetadata(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 	}
 }
 
-// metadataAll обрабатывает метаданные всех известных репозиториев через пул;
-// отказы изолируются (FR-014), после прохода пишется сводка (FR-020).
+// metadataAll processes metadata of all known repositories through the pool;
+// failures are isolated (FR-014), a summary is written after the pass (FR-020).
 func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) {
 	repos := snap.get()
 	if len(repos) == 0 {
@@ -58,10 +58,10 @@ func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 	sum.log(deps.Logger)
 }
 
-// ProcessMetadataOnce — один проход метаданных репозитория: issues + MR/PR
-// (upsert по детерминированным ID обновляет state/text), затем CI-фейлы
-// (tail ≤ ciTailLines строк) и prune ci-точек, исчезнувших из текущего окна.
-// Выделен для e2e-теста (T055).
+// ProcessMetadataOnce is one metadata pass of a repository: issues + MR/PR
+// (upsert by deterministic IDs updates state/text), then CI failures
+// (tail ≤ ciTailLines lines) and prune of ci points gone from the current window.
+// Extracted for the e2e test (T055).
 func ProcessMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) error {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 
@@ -85,10 +85,10 @@ func ProcessMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo)
 		return err
 	}
 
-	// --- CI: упавшие jobs текущего окна ---
+	// --- CI: failed jobs of the current window ---
 	pipelines, err := deps.VCS.ListPipelines(ctx, repo)
 	if err != nil {
-		return fmt.Errorf("пайплайны: %w", err)
+		return fmt.Errorf("pipelines: %w", err)
 	}
 	var ciItems []metaItem
 	current := make(map[[2]string]bool)
@@ -99,9 +99,9 @@ func ProcessMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo)
 			}
 			tail, err := deps.VCS.PipelineLogTail(ctx, repo, p, j, ciTailLines)
 			if err != nil {
-				// лог недоступен — точка всё равно полезнее без хвоста;
-				// ошибка не прерывает проход (FR-014).
-				lg.Error("хвост лога job не получен", "pipeline", p.ID, "job", j.ID, "err", err)
+				// the log is unavailable — the point is still useful without the tail;
+				// the error does not break the pass (FR-014).
+				lg.Error("job log tail not fetched", "pipeline", p.ID, "job", j.ID, "err", err)
 				tail = ""
 			}
 			ciItems = append(ciItems, mapCIFailure(deps.VCSType, repo.Namespace, repo.Path, p, j, tail))
@@ -115,11 +115,11 @@ func ProcessMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo)
 		return err
 	}
 
-	lg.Info("метаданные обновлены", "issues", len(issues), "prs", len(prs), "ci_failures", len(ciItems))
+	lg.Info("metadata updated", "issues", len(issues), "prs", len(prs), "ci_failures", len(ciItems))
 	return nil
 }
 
-// upsertItems эмбеддит тексты (батчи внутри провайдера) и пишет точки.
+// upsertItems embeds the texts (batches inside the provider) and writes points.
 func upsertItems(ctx context.Context, deps RepoDeps, items []metaItem) error {
 	if len(items) == 0 {
 		return nil
@@ -130,7 +130,7 @@ func upsertItems(ctx context.Context, deps RepoDeps, items []metaItem) error {
 	}
 	vecs, err := deps.Embed.Embed(ctx, texts)
 	if err != nil {
-		return fmt.Errorf("эмбеддинги метаданных: %w", err)
+		return fmt.Errorf("metadata embeddings: %w", err)
 	}
 	points := make([]store.Point, len(items))
 	for i, it := range items {
@@ -139,8 +139,8 @@ func upsertItems(ctx context.Context, deps RepoDeps, items []metaItem) error {
 	return deps.Store.Upsert(ctx, points)
 }
 
-// pruneCIFailures удаляет ci-точки репозитория, которых нет в текущем
-// наборе (pipeline_id, job_id) — например, после перезапуска job'а в success.
+// pruneCIFailures deletes repository ci points missing from the current
+// (pipeline_id, job_id) set — e.g. after a job was rerun to success.
 func pruneCIFailures(ctx context.Context, deps RepoDeps, repo provider.Repo, current map[[2]string]bool) error {
 	existing, err := deps.Store.ScrollCIFailures(ctx, repo.Path, 1000)
 	if err != nil {
@@ -163,7 +163,7 @@ func pruneCIFailures(ctx context.Context, deps RepoDeps, repo provider.Repo, cur
 	return nil
 }
 
-// payloadString читает строковое поле payload.
+// payloadString reads a string payload field.
 func payloadString(p map[string]any, key string) string {
 	s, _ := p[key].(string)
 	return s

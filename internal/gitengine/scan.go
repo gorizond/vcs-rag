@@ -6,14 +6,14 @@ import (
 	"strings"
 )
 
-// FileChange — изменение файла в коммите.
+// FileChange is a file change in a commit.
 type FileChange struct {
 	Path   string
 	Status string // A (added), M (modified), D (deleted)
 }
 
-// DiffCommit перечисляет изменения коммита; --root — первый коммит тоже даёт
-// полный список. Переименования/копии (R/C) разворачиваются в D(старый) + A(новый).
+// DiffCommit lists the changes of a commit; --root makes the first commit
+// yield the full list too. Renames/copies (R/C) are expanded into D(old) + A(new).
 func (e *Engine) DiffCommit(ctx context.Context, mirror, sha string) ([]FileChange, error) {
 	out, err := e.run(ctx, mirror, "diff-tree", "--no-commit-id", "--name-status", "-r", "-z", "--root", sha)
 	if err != nil {
@@ -48,7 +48,7 @@ func (e *Engine) DiffCommit(ctx context.Context, mirror, sha string) ([]FileChan
 	return changes, nil
 }
 
-// normalizeStatus сводит git-статус к A/M/D (T/U и прочие — как M).
+// normalizeStatus reduces a git status to A/M/D (T/U and others — as M).
 func normalizeStatus(status string) string {
 	switch status[0] {
 	case 'A':
@@ -60,15 +60,15 @@ func normalizeStatus(status string) string {
 	}
 }
 
-// TreeFile — blob дерева коммита.
+// TreeFile is a blob of a commit tree.
 type TreeFile struct {
 	Path string
 	SHA  string
 	Size int64
 }
 
-// TreeFiles перечисляет blob'ы дерева (ls-tree -r -l -z) и отбрасывает
-// type!=blob и size>maxBytes — фильтр ДО чтения содержимого.
+// TreeFiles lists tree blobs (ls-tree -r -l -z) and drops type!=blob and
+// size>maxBytes — the filter is applied BEFORE reading contents.
 func (e *Engine) TreeFiles(ctx context.Context, mirror, sha string, maxBytes int64) ([]TreeFile, error) {
 	out, err := e.run(ctx, mirror, "ls-tree", "-r", "-l", "-z", sha)
 	if err != nil {
@@ -84,7 +84,7 @@ func (e *Engine) TreeFiles(ctx context.Context, mirror, sha string, maxBytes int
 			continue
 		}
 		meta, path := rec[:idx], rec[idx+1:]
-		fields := strings.Fields(meta) // mode type sha size (size выровнен пробелами)
+		fields := strings.Fields(meta) // mode type sha size (size is space-padded)
 		if len(fields) < 4 || fields[1] != "blob" {
 			continue
 		}
@@ -100,7 +100,7 @@ func (e *Engine) TreeFiles(ctx context.Context, mirror, sha string, maxBytes int
 	return files, nil
 }
 
-// splitNUL разбивает вывод git -z на токены.
+// splitNUL splits git -z output into tokens.
 func splitNUL(out []byte) []string {
 	raw := strings.Split(string(out), "\x00")
 	if n := len(raw); n > 0 && raw[n-1] == "" {

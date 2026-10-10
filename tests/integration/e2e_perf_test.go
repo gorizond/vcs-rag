@@ -19,7 +19,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/worker"
 )
 
-// buildBinary собирает бинарь vcs-rag во временный путь.
+// buildBinary builds the vcs-rag binary to a temporary path.
 func buildBinary(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "vcs-rag")
@@ -30,8 +30,8 @@ func buildBinary(t *testing.T, ctx context.Context) string {
 	return bin
 }
 
-// TestE2E_Perf — T067: (а) проход без изменений (повторный ProcessRepoOnce:
-// время + 0 новых точек) и (б) latency search_code через MCP stdio.
+// TestE2E_Perf — T067: (a) no-change pass (repeated ProcessRepoOnce:
+// timing + 0 new points) and (b) search_code latency over MCP stdio.
 //
 //	QDRANT_URL=http://localhost:16334 EMBEDDINGS_BASE_URL=http://localhost:11435 \
 //	go test -tags e2e ./tests/integration -run TestE2E_Perf -v -count=1
@@ -86,13 +86,13 @@ func TestE2E_Perf(t *testing.T) {
 	}
 	count1, err := st.Count(ctx)
 	if err != nil || count1 == 0 {
-		t.Fatalf("count после первичной индексации = %d (err=%v)", count1, err)
+		t.Fatalf("count after initial indexing = %d (err=%v)", count1, err)
 	}
 
-	// (а) проход без изменений: время + отсутствие дублей
+	// (a) no-change pass: timing + no duplicates
 	start := time.Now()
 	if err := worker.ProcessRepoOnce(ctx, deps, repo); err != nil {
-		t.Fatalf("ProcessRepoOnce (повтор): %v", err)
+		t.Fatalf("ProcessRepoOnce (repeat): %v", err)
 	}
 	idle := time.Since(start)
 	count2, err := st.Count(ctx)
@@ -100,12 +100,12 @@ func TestE2E_Perf(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count2 != count1 {
-		t.Errorf("повторный проход создал дубли: %d → %d", count1, count2)
+		t.Errorf("repeated pass created duplicates: %d → %d", count1, count2)
 	}
-	t.Logf("perf: проход без изменений = %s; точек %d → %d (дублей нет)",
+	t.Logf("perf: no-change pass = %s; points %d → %d (no duplicates)",
 		idle.Round(time.Millisecond), count1, count2)
 
-	// (б) latency search_code через MCP stdio (end-to-end)
+	// (b) search_code latency over MCP stdio (end-to-end)
 	bin := buildBinary(t, ctx)
 	proc := startMCP(t, bin, []string{
 		"GITLAB_GROUP_ID=1", "GITLAB_TOKEN=dummy",
@@ -118,9 +118,9 @@ func TestE2E_Perf(t *testing.T) {
 	proc.call(t, 1, "initialize", `{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"perf","version":"0"}}`)
 	proc.notify(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 
-	// прогрев (загрузка модели в Ollama) — вне замера
+	// warm-up (model load into Ollama) — excluded from measurement
 	if resp := proc.call(t, 2, "tools/call", `{"name":"search_code","arguments":{"query":"main"}}`); !strings.Contains(resp, "main.go") {
-		t.Fatalf("прогрев не вернул main.go: %s", truncateForLog(resp, 300))
+		t.Fatalf("warm-up did not return main.go: %s", truncateForLog(resp, 300))
 	}
 
 	const n = 10
@@ -131,7 +131,7 @@ func TestE2E_Perf(t *testing.T) {
 		d := time.Since(callStart)
 		durs = append(durs, d)
 		if !strings.Contains(resp, "main.go") {
-			t.Errorf("запрос %d не вернул main.go: %s", i, truncateForLog(resp, 300))
+			t.Errorf("request %d did not return main.go: %s", i, truncateForLog(resp, 300))
 		}
 	}
 	minD, maxD, sumD := durs[0], durs[0], time.Duration(0)
@@ -151,8 +151,8 @@ func TestE2E_Perf(t *testing.T) {
 	p50 := sorted[len(sorted)/2]
 	t.Logf("perf: search_code latency n=%d: min=%s p50=%s avg=%s max=%s",
 		n, minD.Round(time.Millisecond), p50.Round(time.Millisecond), avg.Round(time.Millisecond), maxD.Round(time.Millisecond))
-	// SC-003: на прогретом контуре типовой запрос < 2 c при доступном CPU.
-	// На общем перегруженном хосте возможны всплески — A/B-контроль (прямой HTTP
-	// к Ollama) даёт тот же разброс, см. perf-baseline.md. Гейтом здесь остаётся
-	// только функциональная корректность ответов (проверена выше).
+	// SC-003: on a warmed-up setup a typical request is < 2 s with CPU available.
+	// Spikes are possible on a shared overloaded host — the A/B control (direct HTTP
+	// to Ollama) shows the same variance, see perf-baseline.md. The gate here remains
+	// functional correctness of responses only (verified above).
 }

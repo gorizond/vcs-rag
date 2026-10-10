@@ -10,13 +10,13 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
-// IsRateLimit распознаёт ошибки лимитов VCS (FR-015) и возвращает задержку
-// до повтора (0 — значение неизвестно, паузу выбирает вызывающий).
+// IsRateLimit recognizes VCS rate limit errors (FR-015) and returns the
+// delay before retry (0 — value unknown, the caller picks the pause).
 //
-// GitHub: *github.AbuseRateLimitError (RetryAfter) и *github.RateLimitError
-// (Rate.Reset). GitLab: client-go/v3 имеет собственный клиентский RateLimiter
-// (WithCustomLimiter) и при 429 возвращает *gitlab.ErrorResponse.
-// Generic: «429»/«Retry-After» в тексте ошибки.
+// GitHub: *github.AbuseRateLimitError (RetryAfter) and *github.RateLimitError
+// (Rate.Reset). GitLab: client-go/v3 has its own client-side RateLimiter
+// (WithCustomLimiter) and returns *gitlab.ErrorResponse on 429.
+// Generic: "429"/"Retry-After" in the error text.
 func IsRateLimit(err error) (time.Duration, bool) {
 	if err == nil {
 		return 0, false

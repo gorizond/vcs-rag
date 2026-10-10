@@ -2,14 +2,14 @@ package gitengine
 
 import "encoding/base64"
 
-// AuthEnv собирает окружение для сетевых git-операций (clone/fetch) с
-// приватными репозиториями: Basic-заголовок через GIT_CONFIG_* (git ≥ 2.31).
-// Токен НЕ попадает в URL и не сохраняется в .git/config зеркала — env
-// действует только на процесс git и его детей.
+// AuthEnv builds the environment for network git operations (clone/fetch)
+// with private repositories: a Basic header via GIT_CONFIG_* (git ≥ 2.31).
+// The token NEVER appears in the URL and is not persisted to the mirror's
+// .git/config — the env applies to the git process and its children only.
 //
-// Пара username:token — по докам хостов: GitLab принимает любое непустое
-// имя (конвенция oauth2), GitHub — x-access-token. Заголовок не привязан к
-// хосту, поэтому GHES/self-hosted работают без изменений.
+// The username:token pair follows host docs: GitLab accepts any non-empty
+// name (the oauth2 convention), GitHub — x-access-token. The header is not
+// host-scoped, so GHES/self-hosted work unchanged.
 func AuthEnv(vcsType, token string) []string {
 	if token == "" {
 		return nil

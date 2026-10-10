@@ -6,8 +6,8 @@ import (
 	"github.com/gorizond/vcs-rag/internal/config"
 )
 
-// New создаёт провайдера эмбеддингов по конфигурации (FR-009).
-// Валидация размерности каждого вектора — в Embed (до записи в Qdrant).
+// New creates an embedding provider from the config (FR-009).
+// Each vector's dimension is validated in Embed (before writing to Qdrant).
 func New(cfg *config.Config) (Provider, error) {
 	switch cfg.Embeddings.Provider {
 	case "ollama":
@@ -15,6 +15,6 @@ func New(cfg *config.Config) (Provider, error) {
 	case "lm-studio":
 		return NewLMStudio(cfg.Embeddings.BaseURL, cfg.Embeddings.Model, cfg.Embeddings.Dim, cfg.Embeddings.Batch), nil
 	default:
-		return nil, fmt.Errorf("неизвестный провайдер эмбеддингов %q", cfg.Embeddings.Provider)
+		return nil, fmt.Errorf("unknown embeddings provider %q", cfg.Embeddings.Provider)
 	}
 }

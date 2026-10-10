@@ -11,7 +11,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// snapshot — последний удачный листинг репозиториев (для линий US2+).
+// snapshot is the last successful repository listing (for US2+ lanes).
 type snapshot struct {
 	mu    sync.Mutex
 	repos []provider.Repo
@@ -29,8 +29,8 @@ func (s *snapshot) get() []provider.Repo {
 	return s.repos
 }
 
-// runDiscovery — линия discovery: периодический листинг репозиториев
-// (интервал WORKER_INTERVAL). Ошибка листинга не прерывает цикл (FR-014).
+// runDiscovery is the discovery lane: periodic repository listing
+// (WORKER_INTERVAL). A listing error does not break the loop (FR-014).
 func runDiscovery(ctx context.Context, p provider.VCSProvider, cfg *config.Config, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "discovery")
 	listOnce(ctx, p, logger, snap)
@@ -47,19 +47,19 @@ func runDiscovery(ctx context.Context, p provider.VCSProvider, cfg *config.Confi
 	}
 }
 
-// listOnce выполняет один проход: листинг, лог по каждому репозиторию,
-// обновление снапшота. Ошибка (кроме отмены контекста) логируется.
+// listOnce performs one pass: listing, a log line per repository,
+// snapshot update. Errors (except context cancellation) are logged.
 func listOnce(ctx context.Context, p provider.VCSProvider, logger *slog.Logger, snap *snapshot) {
 	repos, err := p.ListRepositories(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			return // штатное завершение — не шумим
+			return // normal shutdown — stay quiet
 		}
-		logger.Error("листинг репозиториев не удался", "err", err)
+		logger.Error("repository listing failed", "err", err)
 		return
 	}
 	snap.set(repos)
-	logger.Info("репозитории получены", "provider", p.Type(), "count", len(repos))
+	logger.Info("repositories fetched", "provider", p.Type(), "count", len(repos))
 	for _, r := range repos {
 		log.WithRepo(logger, r.Namespace+"/"+r.Path).Info("repo", "namespace", r.Namespace)
 	}

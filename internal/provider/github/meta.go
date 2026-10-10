@@ -1,4 +1,4 @@
-// GitHub-метаданные: issues, PR, Actions runs и хвосты логов (US4/FR-012).
+// GitHub metadata: issues, PRs, Actions runs and log tails (US4/FR-012).
 package github
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// ListIssues возвращает issues репозитория (все страницы).
+// ListIssues returns the repository issues (all pages).
 func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider.Issue, error) {
 	opt := &gh.IssueListByRepoOptions{State: "all", ListOptions: gh.ListOptions{PerPage: 100}}
 	var out []provider.Issue
@@ -45,7 +45,7 @@ func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider
 	return out, nil
 }
 
-// ListChangeRequests возвращает PR репозитория (все страницы).
+// ListChangeRequests returns the repository PRs (all pages).
 func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]provider.ChangeRequest, error) {
 	opt := &gh.PullRequestListOptions{State: "all", ListOptions: gh.ListOptions{PerPage: 100}}
 	var out []provider.ChangeRequest
@@ -74,8 +74,8 @@ func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]
 	return out, nil
 }
 
-// ListPipelines возвращает окно CI_WINDOW последних workflow runs; jobs
-// подтягиваются только для упавших (metadata-линия смотрит только их).
+// ListPipelines returns the CI_WINDOW of recent workflow runs; jobs are
+// fetched only for failed runs (the metadata lane looks at those only).
 func (c *Client) ListPipelines(ctx context.Context, repo provider.Repo) ([]provider.Pipeline, error) {
 	opt := &gh.ListWorkflowRunsOptions{ListOptions: gh.ListOptions{PerPage: c.ciWindow}}
 	runs, _, err := c.api.Actions.ListRepositoryWorkflowRuns(ctx, repo.Namespace, repo.Path, opt)
@@ -112,7 +112,7 @@ func (c *Client) ListPipelines(ctx context.Context, repo provider.Repo) ([]provi
 	return out, nil
 }
 
-// jobDuration — длительность job'а по started/completed.
+// jobDuration returns the job duration from started/completed.
 func jobDuration(j *gh.WorkflowJob) time.Duration {
 	start, done := j.GetStartedAt(), j.GetCompletedAt()
 	if start.IsZero() || done.IsZero() {
@@ -121,8 +121,8 @@ func jobDuration(j *gh.WorkflowJob) time.Duration {
 	return done.Time.Sub(start.Time)
 }
 
-// PipelineLogTail скачивает архив логов run'а и возвращает последние lines
-// строк лога указанного job'а.
+// PipelineLogTail downloads the run log archive and returns the last lines
+// lines of the specified job log.
 func (c *Client) PipelineLogTail(ctx context.Context, repo provider.Repo, pipeline provider.Pipeline, job provider.Job, lines int) (string, error) {
 	runID, err := strconv.ParseInt(pipeline.ID, 10, 64)
 	if err != nil {
@@ -130,7 +130,7 @@ func (c *Client) PipelineLogTail(ctx context.Context, repo provider.Repo, pipeli
 	}
 	logURL, _, err := c.api.Actions.GetWorkflowRunLogs(ctx, repo.Namespace, repo.Path, runID, 0)
 	if err != nil {
-		return "", fmt.Errorf("github: ссылка на логи run %s: %w", pipeline.ID, err)
+		return "", fmt.Errorf("github: log link for run %s: %w", pipeline.ID, err)
 	}
 	data, err := c.downloadLogs(ctx, logURL.String())
 	if err != nil {
@@ -143,8 +143,8 @@ func (c *Client) PipelineLogTail(ctx context.Context, repo provider.Repo, pipeli
 	return provider.TailLines(text, lines), nil
 }
 
-// downloadLogs скачивает zip логов по подписанному redirect URL — без
-// заголовка Authorization (URL уже авторизован), с таймаутом клиента.
+// downloadLogs fetches the log zip from the signed redirect URL — without
+// the Authorization header (the URL is pre-authorized), using the client timeout.
 func (c *Client) downloadLogs(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -152,21 +152,21 @@ func (c *Client) downloadLogs(ctx context.Context, url string) ([]byte, error) {
 	}
 	resp, err := c.logsHTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("github: загрузка логов: %w", err)
+		return nil, fmt.Errorf("github: log download: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("github: загрузка логов: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("github: log download: HTTP %d", resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 }
 
-// extractJobLog собирает шаги job'а из архива Actions (каталог = имя job'а)
-// и склеивает их по порядку номеров шагов.
+// extractJobLog gathers the job steps from the Actions archive (directory =
+// job name) and concatenates them in step-number order.
 func extractJobLog(data []byte, jobName string) (string, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return "", fmt.Errorf("github: zip логов: %w", err)
+		return "", fmt.Errorf("github: log zip: %w", err)
 	}
 	prefix := jobName + "/"
 	var entries []*zip.File
@@ -176,7 +176,7 @@ func extractJobLog(data []byte, jobName string) (string, error) {
 		}
 	}
 	if len(entries) == 0 {
-		return "", fmt.Errorf("github: лог job %q не найден в архиве", jobName)
+		return "", fmt.Errorf("github: job log %q not found in the archive", jobName)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 
@@ -184,12 +184,12 @@ func extractJobLog(data []byte, jobName string) (string, error) {
 	for _, f := range entries {
 		rc, err := f.Open()
 		if err != nil {
-			return "", fmt.Errorf("github: чтение шага %s: %w", f.Name, err)
+			return "", fmt.Errorf("github: read step %s: %w", f.Name, err)
 		}
 		chunk, err := io.ReadAll(rc)
 		_ = rc.Close()
 		if err != nil {
-			return "", fmt.Errorf("github: чтение шага %s: %w", f.Name, err)
+			return "", fmt.Errorf("github: read step %s: %w", f.Name, err)
 		}
 		sb.Write(chunk)
 		if !strings.HasSuffix(sb.String(), "\n") {

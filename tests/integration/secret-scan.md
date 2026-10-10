@@ -1,39 +1,39 @@
 # Secret-scan (T069)
 
-Дата: 2026-10-10. Репозиторий: `github.com/gorizond/vcs-rag` (public), 11 коммитов.
+Date: 2026-10-10. Repository: `github.com/gorizond/vcs-rag` (public), 11 commits.
 
-## Метод
+## Method
 
 ```bash
-git grep -nE 'glpat-|ghp_|gho_|AKIA|-----BEGIN' $(git rev-list --all)   # вся история
-git grep -nE '...' HEAD                                                  # рабочее дерево
+git grep -nE 'glpat-|ghp_|gho_|AKIA|-----BEGIN' $(git rev-list --all)   # entire history
+git grep -nE '...' HEAD                                                  # working tree
 ```
 
-Результат: 20 совпадений (2 уникальные строки) — **обе** в
-`internal/config/config_test.go`, это заведомо невалидные тестовые плейсхолдеры:
+Result: 20 matches (2 unique lines) — **both** in
+`internal/config/config_test.go`, these are knowingly invalid test placeholders:
 
-- `"GITLAB_TOKEN": "glpat-token"` — фикстура конфиг-теста;
-- `const gitlabSecret = "glpat-SUPERSECRET-123"` — фейк для теста
-  «секрет не утекает в текст ошибки» (`TestSecretNotLeaked`).
+- `"GITLAB_TOKEN": "glpat-token"` — a config test fixture;
+- `const gitlabSecret = "glpat-SUPERSECRET-123"` — a fake for the test
+  "the secret does not leak into the error text" (`TestSecretNotLeaked`).
 
-Строгая проверка реалистичных форматов (вся история):
+Strict check for realistic formats (entire history):
 
 ```bash
 git grep -nE 'glpat-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' $(git rev-list --all)
 ```
 
-Результат: **0**.
+Result: **0**.
 
-## Артефакты
+## Artifacts
 
-- `README.md`, `docs/`, `tests/integration/smoke_us*.md`: только имена env и
-  плейсхолдеры (`<group>`, `<токен>`, `dummy`) — значений реальных токенов нет.
-- e2e/смоук-прогоны использовали только `dummy`-токены; в конфиге сообщения об
-  ошибках содержат только ИМЕНА переменных (проверено тестом).
-- Секреты в окружении прогонов не задавались (`GITLAB_TOKEN=dummy`), реальные
-  значения не покидали env владельца.
+- `README.md`, `docs/`, `tests/integration/smoke_us*.md`: only env names and
+  placeholders (`<group>`, `<token>`, `dummy`) — no real token values.
+- e2e/smoke runs used only `dummy` tokens; config error messages contain only
+  variable NAMES (verified by a test).
+- No secrets were set in the run environment (`GITLAB_TOKEN=dummy`); real values
+  never left the owner's env.
 
-## Вывод
+## Conclusion
 
-Реальных секретов в истории и рабочем дереве нет; единственные совпадения
-паттерн-скана — намеренные тестовые плейсхолдеры (по строгим паттернам — 0).
+There are no real secrets in the history or the working tree; the only
+pattern-scan matches are intentional test placeholders (0 by the strict patterns).

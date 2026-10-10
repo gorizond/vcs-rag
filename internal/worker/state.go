@@ -9,21 +9,21 @@ import (
 	"time"
 )
 
-// BranchState — состояние инкрементальной индексации одной ветки.
+// BranchState is the incremental indexing state of a single branch.
 type BranchState struct {
 	Tip            string    `json:"tip,omitempty"`
 	IndexedCommits []string  `json:"indexed_commits,omitempty"`
 	IndexedAt      time.Time `json:"indexed_at"`
 }
 
-// MirrorState — состояние зеркала: sidecar-файл рядом с зеркалом
-// (data-model §2), запись атомарная (tmp+rename).
+// MirrorState is the mirror state: a sidecar file next to the mirror
+// (data-model §2), written atomically (tmp+rename).
 type MirrorState struct {
 	LastFetchAt time.Time              `json:"last_fetch_at"`
 	Branches    map[string]BranchState `json:"branches"`
 }
 
-// LoadState читает состояние; отсутствие файла — пустое состояние.
+// LoadState reads the state; a missing file yields an empty state.
 func LoadState(path string) (*MirrorState, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -42,7 +42,7 @@ func LoadState(path string) (*MirrorState, error) {
 	return st, nil
 }
 
-// SaveState атомарно пишет состояние: tmp-файл + rename.
+// SaveState writes the state atomically: tmp file + rename.
 func SaveState(path string, st *MirrorState) error {
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -59,11 +59,11 @@ func SaveState(path string, st *MirrorState) error {
 	return nil
 }
 
-// stateMu сериализует load-modify-save: sidecar пишут обе линии (mirror —
-// last_fetch_at, index — branches), файл у репозитория один.
+// stateMu serializes load-modify-save: both lanes write the sidecar
+// (mirror — last_fetch_at, index — branches), there is one file per repository.
 var stateMu sync.Mutex
 
-// updateState применяет изменение к состоянию под общим мьютексом.
+// updateState applies a change to the state under the shared mutex.
 func updateState(path string, fn func(*MirrorState)) error {
 	stateMu.Lock()
 	defer stateMu.Unlock()

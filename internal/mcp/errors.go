@@ -5,8 +5,8 @@ import (
 	"errors"
 )
 
-// Коды структурированных ошибок инструментов (contracts/mcp-tools.md:
-// при ошибке — {"error": {...}}; сервер продолжает работу).
+// Structured tool error codes (contracts/mcp-tools.md:
+// on error — {"error": {...}}; the server keeps running).
 const (
 	codeTimeout      = "timeout"
 	codeCanceled     = "canceled"
@@ -14,14 +14,14 @@ const (
 	codeSearchFailed = "qdrant_unavailable"
 )
 
-// toolError — структурированная ошибка инструмента.
+// toolError — a structured tool error.
 type toolError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
 
-// errorResult классифицирует ошибку бэкенда: таймаут/отмена контекста
-// важнее специфичного кода бэкенда; сообщение — без секретов.
+// errorResult classifies a backend error: context timeout/cancel
+// outranks the specific backend code; the message carries no secrets.
 func errorResult(ctx context.Context, backendCode string, err error) toolError {
 	code := backendCode
 	switch {

@@ -11,12 +11,12 @@ import (
 	"strings"
 )
 
-// LMStudio — клиент LM Studio (OpenAI-совместимый POST /v1/embeddings).
+// LMStudio — LM Studio client (OpenAI-compatible POST /v1/embeddings).
 type LMStudio struct {
 	base
 }
 
-// NewLMStudio создаёт клиент; baseURL — например http://localhost:1234.
+// NewLMStudio creates a client; baseURL — e.g. http://localhost:1234.
 func NewLMStudio(baseURL, model string, dim, batch int) *LMStudio {
 	return &LMStudio{base{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -27,7 +27,7 @@ func NewLMStudio(baseURL, model string, dim, batch int) *LMStudio {
 	}}
 }
 
-// Embed вычисляет эмбеддинги батчами; ответ сортируется по полю index.
+// Embed computes embeddings in batches; the response is sorted by the index field.
 func (l *LMStudio) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, 0, len(texts))
 	for _, part := range l.batches(texts) {
@@ -52,7 +52,7 @@ func (l *LMStudio) Embed(ctx context.Context, texts []string) ([][]float32, erro
 		payload, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		_ = resp.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("lm-studio: чтение ответа: %w", readErr)
+			return nil, fmt.Errorf("lm-studio: reading response: %w", readErr)
 		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("lm-studio: HTTP %d: %s", resp.StatusCode, truncate(payload))
@@ -64,7 +64,7 @@ func (l *LMStudio) Embed(ctx context.Context, texts []string) ([][]float32, erro
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(payload, &parsed); err != nil {
-			return nil, fmt.Errorf("lm-studio: разбор ответа: %w", err)
+			return nil, fmt.Errorf("lm-studio: parsing response: %w", err)
 		}
 		sort.Slice(parsed.Data, func(i, j int) bool { return parsed.Data[i].Index < parsed.Data[j].Index })
 		vecs := make([][]float32, 0, len(parsed.Data))

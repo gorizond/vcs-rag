@@ -13,7 +13,7 @@ import (
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-// TestListOnceStoresSnapshot: удачный проход кладёт репозитории в снапшот.
+// TestListOnceStoresSnapshot: a successful pass stores repositories in the snapshot.
 func TestListOnceStoresSnapshot(t *testing.T) {
 	snap := &snapshot{}
 	repos := []provider.Repo{{ID: "1", Namespace: "g", Path: "g/a", CloneURL: "https://example.com/g/a.git"}}
@@ -23,7 +23,7 @@ func TestListOnceStoresSnapshot(t *testing.T) {
 	}
 }
 
-// TestListOnceKeepsSnapshotOnError: ошибка листинга не затирает снапшот (FR-014).
+// TestListOnceKeepsSnapshotOnError: a listing error does not wipe the snapshot (FR-014).
 func TestListOnceKeepsSnapshotOnError(t *testing.T) {
 	snap := &snapshot{}
 	p := &fake.Provider{Repos: []provider.Repo{{ID: "1"}}}
@@ -33,6 +33,6 @@ func TestListOnceKeepsSnapshotOnError(t *testing.T) {
 	p.ErrListRepositories = errors.New("boom")
 	listOnce(context.Background(), p, testLogger(), snap)
 	if got := snap.get(); len(got) != 1 {
-		t.Fatalf("снапшот затёрт при ошибке: %+v", got)
+		t.Fatalf("snapshot wiped on error: %+v", got)
 	}
 }

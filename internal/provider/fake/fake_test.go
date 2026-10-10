@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestErrorInjection проверяет, что инжектированная ошибка доходит до вызывающего.
+// TestErrorInjection checks that the injected error reaches the caller.
 func TestErrorInjection(t *testing.T) {
 	want := errors.New("boom")
 	p := &Provider{ErrListRepositories: want}

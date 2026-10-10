@@ -12,7 +12,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/config"
 )
 
-// TestOllamaEmbedBatching: батчи по batch, форма /api/embed, валидация размерности.
+// TestOllamaEmbedBatching: batching by batch, /api/embed shape, dimension validation.
 func TestOllamaEmbedBatching(t *testing.T) {
 	var requests atomic.Int32
 	var badPath, badModel, badKeepAlive atomic.Bool
@@ -47,17 +47,17 @@ func TestOllamaEmbedBatching(t *testing.T) {
 		t.Fatalf("Embed: %v", err)
 	}
 	if len(vecs) != 3 || len(vecs[0]) != 2 {
-		t.Fatalf("векторов %d (dim %d), ожидалось 3×2", len(vecs), len(vecs[0]))
+		t.Fatalf("vectors %d (dim %d), expected 3×2", len(vecs), len(vecs[0]))
 	}
 	if n := requests.Load(); n != 2 {
-		t.Errorf("запросов %d, ожидалось 2 (батчи 2+1)", n)
+		t.Errorf("requests %d, expected 2 (batches 2+1)", n)
 	}
 	if badPath.Load() || badModel.Load() || badKeepAlive.Load() {
-		t.Errorf("форма запроса неверна: path=%v model=%v keep_alive=%v", badPath.Load(), badModel.Load(), badKeepAlive.Load())
+		t.Errorf("request shape wrong: path=%v model=%v keep_alive=%v", badPath.Load(), badModel.Load(), badKeepAlive.Load())
 	}
 }
 
-// TestLMStudioOrdering: ответ /v1/embeddings сортируется по index, есть Authorization.
+// TestLMStudioOrdering: the /v1/embeddings response is sorted by index, Authorization present.
 func TestLMStudioOrdering(t *testing.T) {
 	var badAuth, badPath atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +72,7 @@ func TestLMStudioOrdering(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		data := make([]map[string]any, 0, len(req.Input))
-		for i := len(req.Input) - 1; i >= 0; i-- { // намеренно в обратном порядке
+		for i := len(req.Input) - 1; i >= 0; i-- { // deliberately in reverse order
 			data = append(data, map[string]any{"index": i, "embedding": []float32{float32(i), 1}})
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
@@ -85,19 +85,19 @@ func TestLMStudioOrdering(t *testing.T) {
 		t.Fatalf("Embed: %v", err)
 	}
 	if len(vecs) != 3 {
-		t.Fatalf("векторов %d, ожидалось 3", len(vecs))
+		t.Fatalf("vectors %d, expected 3", len(vecs))
 	}
 	for i, v := range vecs {
 		if v[0] != float32(i) {
-			t.Errorf("порядок нарушен: vecs[%d][0] = %v, ожидалось %d", i, v[0], i)
+			t.Errorf("order broken: vecs[%d][0] = %v, expected %d", i, v[0], i)
 		}
 	}
 	if badPath.Load() || badAuth.Load() {
-		t.Errorf("форма запроса неверна: path=%v auth=%v", badPath.Load(), badAuth.Load())
+		t.Errorf("request shape wrong: path=%v auth=%v", badPath.Load(), badAuth.Load())
 	}
 }
 
-// TestDimensionMismatch: несовпадение размерности — ошибка до записи (FR-009).
+// TestDimensionMismatch: dimension mismatch is an error before writing (FR-009).
 func TestDimensionMismatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"embeddings": [][]float32{{1, 2, 3}}})
@@ -106,12 +106,12 @@ func TestDimensionMismatch(t *testing.T) {
 
 	p := NewOllama(srv.URL, "bge-m3", 2, 2)
 	_, err := p.Embed(context.Background(), []string{"a"})
-	if err == nil || !strings.Contains(err.Error(), "размерность") {
-		t.Fatalf("err = %v, ожидалась ошибка о размерности", err)
+	if err == nil || !strings.Contains(err.Error(), "dimension") {
+		t.Fatalf("err = %v, expected a dimension error", err)
 	}
 }
 
-// TestFactory: выбор провайдера по конфигу.
+// TestFactory: provider selection by config.
 func TestFactory(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Embeddings = config.Embeddings{Provider: "ollama", BaseURL: "http://x", Model: "m", Dim: 8, Batch: 4}
@@ -134,6 +134,6 @@ func TestFactory(t *testing.T) {
 
 	cfg.Embeddings.Provider = "openai"
 	if _, err := New(cfg); err == nil {
-		t.Error("New(openai) = nil error, ожидалась ошибка")
+		t.Error("New(openai) = nil error, expected an error")
 	}
 }
