@@ -41,6 +41,9 @@ func New(cfg config.Qdrant) (*Store, error) {
 		Port:   port,
 		APIKey: cfg.APIKey,
 		UseTLS: u.Scheme == "https",
+		// Без version-check RPC: клиент создаётся мгновенно и не зависит от
+		// доступности Qdrant (MCP стартует при недоступном бэкенде, FR-013).
+		SkipCompatibilityCheck: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("qdrant-клиент: %w", err)

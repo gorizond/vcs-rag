@@ -7,6 +7,63 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
+// Filter — фильтр поиска по payload; пустые поля не участвуют
+// (must-условия по payload-индексам, без полного скана).
+type Filter struct {
+	VCSType  string
+	GroupOrg string
+	Repo     string
+	Branch   string
+	Type     string
+	State    string
+}
+
+// ScoredPoint — результат векторного поиска.
+type ScoredPoint struct {
+	ID      string
+	Score   float32
+	Payload map[string]any
+}
+
+// Search выполняет векторный поиск с фильтром; topK задаёт лимит выдачи.
+func (s *Store) Search(ctx context.Context, vector []float32, f Filter, topK int) ([]ScoredPoint, error) {
+	req := &qdrant.QueryPoints{
+		CollectionName: s.collection,
+		Query:          qdrant.NewQuery(vector...),
+		Limit:          qdrant.PtrOf(uint64(topK)),
+		WithPayload:    qdrant.NewWithPayloadEnable(true),
+	}
+	var must []*qdrant.Condition
+	add := func(key, value string) {
+		if value != "" {
+			must = append(must, qdrant.NewMatch(key, value))
+		}
+	}
+	add("vcs_type", f.VCSType)
+	add("group_org", f.GroupOrg)
+	add("repo", f.Repo)
+	add("branch", f.Branch)
+	add("type", f.Type)
+	add("state", f.State)
+	if len(must) > 0 {
+		req.Filter = &qdrant.Filter{Must: must}
+	}
+
+	pts, err := s.client.Query(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("qdrant: поиск: %w", err)
+	}
+	out := make([]ScoredPoint, 0, len(pts))
+	for _, p := range pts {
+		out = append(out, ScoredPoint{
+			ID:      p.GetId().GetUuid(),
+			Score:   p.GetScore(),
+			Payload: qdrant.ValueMapToMap(p.GetPayload()),
+		})
+	}
+	return out, nil
+}
+
 // Count возвращает точное число точек коллекции (read-back для e2e).
 func (s *Store) Count(ctx context.Context) (uint64, error) {
 	n, err := s.client.Count(ctx, &qdrant.CountPoints{
