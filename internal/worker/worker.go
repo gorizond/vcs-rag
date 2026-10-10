@@ -64,9 +64,10 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 	snap := &snapshot{}
 
-	// T150: the indexing status publisher — only with NATS_URL set; a failed
-	// connection disables the status, never the worker.
-	var statusPub *statusPublisher
+	// T150/T153: the indexing status reporter — only with NATS_URL set; a
+	// failed connection disables the status, never the worker. The reporter
+	// publishes on its own ticker, so a long pass does not freeze the snapshot.
+	var statusRep *statusReporter
 	if cfg.NATS.URL != "" {
 		names := config.RefreshNames(cfg.NATS.InstanceID)
 		sp, err := connectWorkerStatus(cfg.NATS.URL, names, logger)
@@ -74,12 +75,12 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 			logger.Warn("worker status disabled", "err", err)
 		} else {
 			defer sp.Close()
-			statusPub = sp
+			statusRep = newStatusReporter(sp, deps, snap)
 		}
 	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 7)
 	run := func(fn func() error) {
 		defer wg.Done()
 		errCh <- fn()
@@ -87,10 +88,14 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	wg.Add(5)
 	go run(func() error { return runDiscovery(ctx, vcs, cfg, logger, snap) })
 	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
-	go run(func() error { return runIndex(ctx, cfg, deps, snap, statusPub) })
+	go run(func() error { return runIndex(ctx, cfg, deps, snap, statusRep) })
 	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
 	// T140: repo-GC — discovery is the source of truth; dry-run by default.
 	go run(func() error { return runGC(ctx, cfg, deps, snap) })
+	if statusRep != nil {
+		wg.Add(1)
+		go run(func() error { return statusRep.run(ctx) })
+	}
 
 	// T108/T112: the on-demand refresh over the local JetStream; NATS_URL is
 	// empty by default — the behavior stays as before.

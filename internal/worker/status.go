@@ -16,10 +16,13 @@ import (
 	"github.com/gorizond/vcs-rag/internal/gitengine"
 )
 
-// Worker indexing status (T150). At most once per minute the index lane
-// publishes a snapshot into the instance KV bucket worker_status_<id> (key
-// "status", TTL 24h) so the MCP index_status tool can answer without touching
-// the index itself. Publishing is best-effort and never affects the lanes:
+// Worker indexing status (T150). At most once per minute the worker publishes
+// a snapshot into the instance KV bucket worker_status_<id> (key "status", TTL
+// 24h) so the MCP index_status tool can answer without touching the index
+// itself. Since T153 the publisher is a standalone ticker (statusReporter),
+// not a pass-end hook: a long backfill pass no longer freezes the published
+// snapshot, and an empty discovery snapshot never overwrites the previous
+// value with zeros. Publishing is best-effort and never affects the lanes:
 // NATS off or down keeps the previous behavior (complete silence). The
 // refresh_status_<id> contract, subjects and consumers are untouched.
 const (
@@ -107,21 +110,101 @@ func (p *statusPublisher) publish(st *workerStatus) {
 	}
 }
 
-// publishIndexStatus publishes the status when the throttle allows (T150);
-// a nil publisher (NATS off) keeps the lane quiet.
-func publishIndexStatus(ctx context.Context, p *statusPublisher, deps RepoDeps, snap *snapshot, sum *summary) {
-	if p == nil || !p.due() {
+// statusReporter periodically publishes the indexing status (T153): a
+// standalone ticker instead of the pass-end hook, so the published snapshot
+// stays fresh during a long pass. The index lane only records its last
+// COMPLETED pass; the reporter goroutine is the single writer of the KV.
+type statusReporter struct {
+	pub    *statusPublisher
+	deps   RepoDeps
+	snap   *snapshot
+	points statusPoints // deps.Store in production (narrow interface for tests)
+
+	mu          sync.Mutex
+	lastPass    *indexPassStats // nil before the first completed pass
+	emptyLogged bool            // one debug line per empty-snapshot episode
+}
+
+// newStatusReporter creates the reporter; nil when the publisher is nil
+// (NATS off — the lanes stay quiet).
+func newStatusReporter(pub *statusPublisher, deps RepoDeps, snap *snapshot) *statusReporter {
+	if pub == nil {
+		return nil
+	}
+	return &statusReporter{pub: pub, deps: deps, snap: snap, points: deps.Store}
+}
+
+// recordPass stores the counters of a completed index pass; before the first
+// completion last_pass stays omitted. Nil-safe: without NATS the index lane
+// has no reporter.
+func (r *statusReporter) recordPass(sum *summary) {
+	if r == nil || sum == nil {
 		return
 	}
-	p.publish(collectWorkerStatus(ctx, deps, snap, sum, deps.Store, p.now()))
+	st := passStats(sum)
+	r.mu.Lock()
+	r.lastPass = st
+	r.mu.Unlock()
+}
+
+// run publishes the status immediately and then once per interval until ctx is
+// done; it starts together with the other lanes.
+func (r *statusReporter) run(ctx context.Context) error {
+	ticker := time.NewTicker(r.pub.interval)
+	defer ticker.Stop()
+	r.tick(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			r.tick(ctx)
+		}
+	}
+}
+
+// tick publishes one snapshot when the throttle allows. An empty discovery
+// snapshot is skipped (debug once per episode): the previous value must not be
+// overwritten with zeros while the discovery lane is still starting.
+func (r *statusReporter) tick(ctx context.Context) {
+	if len(r.snap.get()) == 0 {
+		if !r.emptyLogged {
+			r.emptyLogged = true
+			r.deps.Logger.Debug("worker status deferred: the discovery snapshot is empty")
+		}
+		return
+	}
+	r.emptyLogged = false
+	if !r.pub.due() {
+		return
+	}
+	r.mu.Lock()
+	last := r.lastPass
+	r.mu.Unlock()
+	r.pub.publish(collectWorkerStatus(ctx, r.deps, r.snap, last, r.points, r.pub.now()))
+}
+
+// passStats snapshots the counters of one completed pass.
+func passStats(sum *summary) *indexPassStats {
+	return &indexPassStats{
+		Repos:          sum.repos.Load(),
+		OK:             sum.ok.Load(),
+		Errors:         sum.failed.Load(),
+		IndexedCommits: sum.indexed.Load(),
+		Resumed:        sum.resumed.Load(),
+		Skipped:        sum.skipped.Load(),
+		Pruned:         sum.pruned.Load(),
+		DurationMS:     time.Since(sum.start).Milliseconds(),
+	}
 }
 
 // collectWorkerStatus builds the status from the discovery snapshot and the
 // per-repository state sidecars (T150). The reads are small and bounded by the
 // repository count; the points count is one exact call (skipped on error).
 // A repository counts as indexed when its state has at least one branch with
-// at least one indexed commit.
-func collectWorkerStatus(ctx context.Context, deps RepoDeps, snap *snapshot, sum *summary, counter statusPoints, now time.Time) *workerStatus {
+// at least one indexed commit. lastPass is the last completed pass (nil —
+// omitted).
+func collectWorkerStatus(ctx context.Context, deps RepoDeps, snap *snapshot, lastPass *indexPassStats, counter statusPoints, now time.Time) *workerStatus {
 	repos := snap.get()
 	st := &workerStatus{
 		ReposTotal:    len(repos),
@@ -148,18 +231,7 @@ func collectWorkerStatus(ctx context.Context, deps RepoDeps, snap *snapshot, sum
 			st.Points = &n
 		}
 	}
-	if sum != nil {
-		st.LastPass = &indexPassStats{
-			Repos:          sum.repos.Load(),
-			OK:             sum.ok.Load(),
-			Errors:         sum.failed.Load(),
-			IndexedCommits: sum.indexed.Load(),
-			Resumed:        sum.resumed.Load(),
-			Skipped:        sum.skipped.Load(),
-			Pruned:         sum.pruned.Load(),
-			DurationMS:     time.Since(sum.start).Milliseconds(),
-		}
-	}
+	st.LastPass = lastPass
 	return st
 }
 

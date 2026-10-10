@@ -136,13 +136,95 @@ func TestStatusPublisherThrottle(t *testing.T) {
 	p.publish(&workerStatus{})
 }
 
-// T150: without a publisher (NATS off) the lane stays quiet.
-func TestPublishIndexStatusNoNATS(t *testing.T) {
+// T150/T153: without NATS there is no reporter — the nil receiver is a no-op
+// and every lane stays quiet.
+func TestStatusReporterNoNATS(t *testing.T) {
+	if rep := newStatusReporter(nil, RepoDeps{}, &snapshot{}); rep != nil {
+		t.Errorf("newStatusReporter(nil) = %+v, want nil", rep)
+	}
+	var rep *statusReporter
+	rep.recordPass(newSummary("index")) // must not panic
+}
+
+// newTestReporter builds a reporter over fakes (no NATS).
+func newTestReporter(t *testing.T, store *fakeStatusStore, snap *snapshot, deps RepoDeps) (*statusReporter, *time.Time) {
+	t.Helper()
+	pub := newStatusPublisher(store, testLogger())
+	base := time.Unix(1000, 0)
+	pub.now = func() time.Time { return base }
+	rep := newStatusReporter(pub, deps, snap)
+	rep.points = &fakePointCounter{n: 5}
+	return rep, &base
+}
+
+// T153 (a): an empty discovery snapshot never overwrites the previous value;
+// the first publication happens on the next tick after the snapshot fills.
+func TestStatusReporterEmptySnapshotGuard(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeStatusStore{}
+	deps := RepoDeps{VCSType: "gitlab", Engine: gitengine.New(t.TempDir()), Logger: testLogger()}
+	snap := &snapshot{}
+	rep, base := newTestReporter(t, store, snap, deps)
+
+	rep.tick(ctx)
+	if len(store.puts) != 0 {
+		t.Fatalf("an empty snapshot published: %v", store.puts)
+	}
+	// another empty tick logs the debug line once (not asserted here) and still
+	// publishes nothing.
+	rep.tick(ctx)
+	if len(store.puts) != 0 {
+		t.Fatalf("an empty snapshot published on the second tick: %v", store.puts)
+	}
+
+	// the snapshot fills: the next tick publishes.
+	snap.set([]provider.Repo{{ID: "1", Namespace: "g", Path: "a"}})
+	*base = base.Add(workerStatusInterval)
+	rep.tick(ctx)
+	if len(store.puts) != 1 {
+		t.Fatalf("puts = %d, want the first publication after the snapshot filled", len(store.puts))
+	}
+}
+
+// T153 (b): the reporter publishes while a long pass is still running — before
+// the first completed pass last_pass is omitted; afterwards it appears.
+func TestStatusReporterTicksWithoutCompletedPass(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeStatusStore{}
 	deps := RepoDeps{VCSType: "gitlab", Engine: gitengine.New(t.TempDir()), Logger: testLogger()}
 	snap := &snapshot{}
 	snap.set([]provider.Repo{{ID: "1", Namespace: "g", Path: "a"}})
-	// a nil publisher must return before touching the store (deps.Store is nil here).
-	publishIndexStatus(context.Background(), nil, deps, snap, nil)
+	rep, base := newTestReporter(t, store, snap, deps)
+
+	rep.tick(ctx)
+	if len(store.puts) != 1 {
+		t.Fatalf("puts = %d, want a publication without a completed pass", len(store.puts))
+	}
+	if strings.Contains(string(store.puts[workerStatusKey]), `"last_pass"`) {
+		t.Errorf("last_pass present before the first completed pass: %s", store.puts[workerStatusKey])
+	}
+
+	// a completed pass is recorded; the next tick carries its counters.
+	sum := newSummary("index")
+	sum.countRepo(nil)
+	sum.addIndexed(3)
+	rep.recordPass(sum)
+	*base = base.Add(workerStatusInterval)
+	rep.tick(ctx)
+	if len(store.puts) != 1 {
+		t.Fatalf("puts = %d, want the entry to be overwritten in place", len(store.puts))
+	}
+	if !strings.Contains(string(store.puts[workerStatusKey]), `"indexed_commits":3`) {
+		t.Errorf("last_pass missing after the completed pass: %s", store.puts[workerStatusKey])
+	}
+
+	// T153 (c): the throttle still holds — a second tick within the interval
+	// does not publish again (the same map entry is rewritten only when due).
+	before := string(store.puts[workerStatusKey])
+	rep.tick(ctx)
+	if string(store.puts[workerStatusKey]) != before {
+		t.Error("a tick within the interval republished")
+	}
 }
 
 // T150: indexed/pending counters come from the state sidecars; the sample is
@@ -197,7 +279,7 @@ func TestCollectWorkerStatus(t *testing.T) {
 	sum.addIndexed(3)
 	sum.addResumed(1)
 	sum.addPruned(2)
-	st = collectWorkerStatus(context.Background(), deps, snap, sum, counter, now)
+	st = collectWorkerStatus(context.Background(), deps, snap, passStats(sum), counter, now)
 	if st.LastPass == nil || st.LastPass.Repos != 1 || st.LastPass.OK != 1 ||
 		st.LastPass.IndexedCommits != 3 || st.LastPass.Resumed != 1 || st.LastPass.Pruned != 2 {
 		t.Errorf("last_pass = %+v", st.LastPass)

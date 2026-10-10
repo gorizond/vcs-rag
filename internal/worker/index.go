@@ -40,8 +40,9 @@ type indexStore interface {
 // runIndex is the incremental code indexing lane (T041): an adaptive paced loop
 // over the discovery registry (T129) — the env interval is the ceiling, not a
 // fixed tick. Errors do not break the loop (FR-014). The optional status
-// publisher reports the pass progress into the instance KV (T150).
-func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, status *statusPublisher) error {
+// reporter only records the completed passes; the publication itself is its
+// own ticker (T150/T153).
+func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, status *statusReporter) error {
 	deps.Logger = log.WithPhase(deps.Logger, "index")
 	p := newPacer(cfg.Worker.Interval)
 	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
@@ -68,8 +69,9 @@ func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 			}
 			sum.log(deps.Logger)
 		}
-		// T150: the throttled indexing status (nil publisher — NATS off).
-		publishIndexStatus(ctx, status, deps, snap, sum)
+		// T150/T153: remember the completed pass for the status reporter
+		// (nil-safe without NATS).
+		status.recordPass(sum)
 		if err := p.sleep(ctx, delay); err != nil {
 			return nil
 		}
