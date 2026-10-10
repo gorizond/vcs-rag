@@ -68,15 +68,20 @@ func TestSearchCodeFilterAndResponse(t *testing.T) {
 	if ms.gotTopK != defaultTopK {
 		t.Errorf("top_k = %d, expected default %d", ms.gotTopK, defaultTopK)
 	}
-	hits, ok := out.([]codeHit)
+	resp, ok := out.(resultsResponse[codeHit])
 	if !ok {
-		t.Fatalf("out = %T, expected []codeHit", out)
+		t.Fatalf("out = %T, expected resultsResponse[codeHit]", out)
 	}
+	hits := resp.Results
 	if len(hits) != 1 || hits[0].FilePath != "main.go" || hits[0].Score != 0.87 {
 		t.Errorf("hits = %+v", hits)
 	}
 	js := marshalJSON(out)
-	for _, want := range []string{`"repo":"fixture"`, `"file_path":"main.go"`, `"commit_sha":"abc"`, `"score":0.87`, `"snippet":"func main() {}"`} {
+	// T148 negative control: the structured payload is a record, not an array.
+	if strings.HasPrefix(strings.TrimSpace(js), "[") {
+		t.Errorf("structured output is an array: %s", js)
+	}
+	for _, want := range []string{`"results":[`, `"repo":"fixture"`, `"file_path":"main.go"`, `"commit_sha":"abc"`, `"score":0.87`, `"snippet":"func main() {}"`} {
 		if !strings.Contains(js, want) {
 			t.Errorf("JSON does not contain %s: %s", want, js)
 		}
@@ -101,14 +106,15 @@ func TestTopKClamping(t *testing.T) {
 }
 
 func TestSnippetLimit(t *testing.T) {
-	long := strings.Repeat("я", 1000)
+	// a multi-byte UTF-8 fixture (2 bytes per rune) — the snippet limit is rune-based.
+	long := strings.Repeat("é", 1000)
 	ms := &mockSearcher{points: []store.ScoredPoint{{Payload: map[string]any{"text": long}}}}
 	tl := &tools{embedder: &mockEmbedder{}, searcher: ms}
 	_, out, err := tl.searchCode(context.Background(), nil, searchCodeInput{Query: "x"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	hit := out.([]codeHit)[0]
+	hit := out.(resultsResponse[codeHit]).Results[0]
 	if n := len([]rune(hit.Snippet)); n > maxSnippet {
 		t.Errorf("snippet %d characters > %d", n, maxSnippet)
 	}
@@ -172,7 +178,7 @@ func TestSearchPRsIssuesCIFilters(t *testing.T) {
 	if prSearcher.gotFilter.Type != "pull_request" || prSearcher.gotFilter.State != "opened" {
 		t.Errorf("PR filter = %+v", prSearcher.gotFilter)
 	}
-	pr := out.([]prHit)[0]
+	pr := out.(resultsResponse[prHit]).Results[0]
 	if pr.PRID != 42 || pr.SourceBranch != "feat" || pr.State != "opened" {
 		t.Errorf("prHit = %+v", pr)
 	}
@@ -194,7 +200,7 @@ func TestSearchPRsIssuesCIFilters(t *testing.T) {
 	if issueSearcher.gotFilter.Type != "issue" {
 		t.Errorf("issues filter = %+v", issueSearcher.gotFilter)
 	}
-	if issue := out.([]issueHit)[0]; issue.IssueID != 7 || issue.State != "closed" {
+	if issue := out.(resultsResponse[issueHit]).Results[0]; issue.IssueID != 7 || issue.State != "closed" {
 		t.Errorf("issueHit = %+v", issue)
 	}
 
@@ -213,19 +219,23 @@ func TestSearchPRsIssuesCIFilters(t *testing.T) {
 	if ciSearcher.gotFilter.Type != "ci_failure" || ciSearcher.gotFilter.Branch != "main" {
 		t.Errorf("CI filter = %+v", ciSearcher.gotFilter)
 	}
-	if ci := out.([]ciHit)[0]; ci.PipelineID != "100" || ci.JobName != "build" {
+	if ci := out.(resultsResponse[ciHit]).Results[0]; ci.PipelineID != "100" || ci.JobName != "build" {
 		t.Errorf("ciHit = %+v", ci)
 	}
 }
 
-func TestEmptyResultIsEmptyArray(t *testing.T) {
+// T148: an empty result is the object {"results": []}, never an empty array.
+func TestEmptyResultIsEmptyResults(t *testing.T) {
 	tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}}
 	_, out, err := tl.searchCode(context.Background(), nil, searchCodeInput{Query: "nothing"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if js := marshalJSON(out); js != "[]" {
-		t.Errorf("empty result = %s, expected []", js)
+	if js := marshalJSON(out); js != `{"results":[]}` {
+		t.Errorf("empty result = %s, expected {\"results\":[]}", js)
+	}
+	if _, ok := out.(resultsResponse[codeHit]); !ok {
+		t.Errorf("out = %T, expected the results record", out)
 	}
 }
 

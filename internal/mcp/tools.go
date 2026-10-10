@@ -74,6 +74,16 @@ type ciFailuresInput struct {
 	TopK   int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
 
+// resultsResponse is the structured payload of every search tool (T148):
+// structuredContent must be a JSON object per the MCP spec, so the hits are
+// wrapped into {"results": [...]} — a bare hit array is rejected by strict
+// clients. The handlers keep the `any` output type so the shared structured
+// toolError contract ({"code","message"}) stays untouched; a typed output
+// would route the error path through the output-schema validation.
+type resultsResponse[T any] struct {
+	Results []T `json:"results"`
+}
+
 // --- response items (contracts/mcp-tools.md) ---
 
 type codeHit struct {
@@ -121,19 +131,19 @@ type ciHit struct {
 func registerTools(server *mcp.Server, t *tools) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_code",
-		Description: "Semantic search over indexed code",
+		Description: "Semantic search over indexed code. The result object is {\"results\": [hits]}.",
 	}, t.searchCode)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_pull_requests",
-		Description: "Semantic search over pull/merge requests",
+		Description: "Semantic search over pull/merge requests. The result object is {\"results\": [hits]}.",
 	}, t.searchPRs)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_issues",
-		Description: "Semantic search over issues (indexing — US4/FR-012)",
+		Description: "Semantic search over issues (indexing — US4/FR-012). The result object is {\"results\": [hits]}.",
 	}, t.searchIssues)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_ci_failures",
-		Description: "Semantic search over failed CI job logs",
+		Description: "Semantic search over failed CI job logs. The result object is {\"results\": [hits]}.",
 	}, t.searchCIFailures)
 	// T113: registered only when NATS_URL is set (the refresh mode is on).
 	if t.refresher != nil {
@@ -175,7 +185,7 @@ func (t *tools) searchCode(ctx context.Context, _ *mcp.CallToolRequest, in searc
 			Snippet:   snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, hits, nil
+	return nil, resultsResponse[codeHit]{Results: hits}, nil
 }
 
 // searchPRs — MR/PR search (T071).
@@ -206,7 +216,7 @@ func (t *tools) searchPRs(ctx context.Context, _ *mcp.CallToolRequest, in metada
 			Snippet:      snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, hits, nil
+	return nil, resultsResponse[prHit]{Results: hits}, nil
 }
 
 // searchIssues — issue search (T072).
@@ -235,7 +245,7 @@ func (t *tools) searchIssues(ctx context.Context, _ *mcp.CallToolRequest, in met
 			Snippet: snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, hits, nil
+	return nil, resultsResponse[issueHit]{Results: hits}, nil
 }
 
 // searchCIFailures — search over failed CI job logs (T073).
@@ -266,7 +276,7 @@ func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in
 			Snippet:    snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, hits, nil
+	return nil, resultsResponse[ciHit]{Results: hits}, nil
 }
 
 // splitRepoName splits a full "namespace/path" name into the payload pair:
