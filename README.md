@@ -32,12 +32,13 @@ docker run --rm vcs-rag:dev -mode=worker
 
 ## Релиз
 
-Образы — `ghcr.io/gorizond/vcs-rag:<tag>` (semver-теги + `latest`); версия
-вшивается на сборке (`--build-arg VERSION=...` из имени git-тега, release-workflow):
+Образы — `ghcr.io/gorizond/vcs-rag:<tag>` (semver-теги без префикса `v`, напр.
+`0.0.1`/`0.0`/`0`, и `latest`); версия вшивается на сборке
+(`--build-arg VERSION=...` из имени git-тега, release-workflow):
 
 ```bash
-docker pull ghcr.io/gorizond/vcs-rag:v0.0.1
-docker run --rm ghcr.io/gorizond/vcs-rag:v0.0.1 -version   # → vcs-rag v0.0.1
+docker pull ghcr.io/gorizond/vcs-rag:0.0.1
+docker run --rm ghcr.io/gorizond/vcs-rag:0.0.1 -version   # → vcs-rag v0.0.1
 ```
 
 Полные контракты (CLI, MCP-инструменты, схема Qdrant) — в spec-kit проекта
