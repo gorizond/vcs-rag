@@ -85,6 +85,34 @@ func (e *Engine) EnsureMirror(ctx context.Context, vcsType string, repo provider
 	return path, nil
 }
 
+// mirrorReady reports an existing (cloned) mirror: the HEAD file is present.
+func mirrorReady(path string) bool {
+	_, err := os.Stat(filepath.Join(path, "HEAD"))
+	return err == nil
+}
+
+// EnsureLocalMirror returns the mirror path when the mirror already exists —
+// without any network access; it clones --mirror only when the mirror is
+// absent. Fetching is owned by the mirror lane (EnsureMirror,
+// WORKER_MIRROR_INTERVAL); the index lane only needs an existing mirror.
+func (e *Engine) EnsureLocalMirror(ctx context.Context, vcsType string, repo provider.Repo) (string, error) {
+	path := e.MirrorPath(vcsType, repo)
+	if mirrorReady(path) {
+		return path, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if _, err := e.runNet(ctx, filepath.Dir(path), "clone", "--mirror", repo.CloneURL, path); err != nil {
+		// a concurrent clone may have won the race: the mirror is usable now.
+		if mirrorReady(path) {
+			return path, nil
+		}
+		return "", err
+	}
+	return path, nil
+}
+
 // Snapshot returns an atomic branch snapshot (single for-each-ref call):
 // short branch name → SHA. Format: %(refname:short)%00%(objectname).
 func (e *Engine) Snapshot(ctx context.Context, mirror string) (map[string]string, error) {

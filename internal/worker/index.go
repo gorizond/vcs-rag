@@ -75,15 +75,17 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	sum.log(deps.Logger)
 }
 
-// ProcessRepoOnce is a full pass over a repository: mirror → branch snapshot →
-// new commits (diff → blob → chunks → embeddings → upsert) → prune of
-// rewritten commits and vanished branches. State is saved only after success
-// (FR-014): on error a retry in the next pass is safe — delete/upsert are
-// idempotent (FR-011).
+// ProcessRepoOnce is a full pass over a repository: local mirror (clone only
+// when absent; fetching is owned by the mirror lane — new commits appear in
+// the mirror on a WORKER_MIRROR_INTERVAL tick and are picked up by the next
+// index pass) → branch snapshot → new commits (diff → blob → chunks →
+// embeddings → upsert) → prune of rewritten commits and vanished branches.
+// State is saved only after success (FR-014): on error a retry in the next
+// pass is safe — delete/upsert are idempotent (FR-011).
 func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) error {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 
-	mirror, err := deps.Engine.EnsureMirror(ctx, deps.VCSType, repo)
+	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
 	if err != nil {
 		return fmt.Errorf("mirror: %w", err)
 	}

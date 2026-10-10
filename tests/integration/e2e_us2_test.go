@@ -147,6 +147,11 @@ func TestE2E_US2(t *testing.T) {
 	runGit(t, src, "rm", "feature.txt")
 	runGit(t, src, "commit", "-m", "c5: delete feature.txt")
 	runGit(t, src, "checkout", "main")
+	// the mirror lane fetches new commits (WORKER_MIRROR_INTERVAL); the index
+	// lane reads the local mirror only (T083).
+	if _, err := deps.Engine.EnsureMirror(ctx, "gitlab", repo); err != nil {
+		t.Fatalf("EnsureMirror (mirror lane): %v", err)
+	}
 	if err := worker.ProcessRepoOnce(ctx, deps, repo); err != nil {
 		t.Fatalf("ProcessRepoOnce (prune): %v", err)
 	}

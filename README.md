@@ -35,6 +35,9 @@ re-embedded only when its source `updated_at` changed; a CI job is indexed once
 (a rerun gets new `(pipeline, job)` ids); the first pass over a repository is
 full. Deleting `*.state.json` resets this cache ([`docs/reindex.md`](docs/reindex.md)).
 
+`git fetch` runs on the mirror lane only (`WORKER_MIRROR_INTERVAL`); the index
+lane reads the local mirror — network access only for the initial clone.
+
 Embeddings — the target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
 (`ollama pull bge-m3`) or in LM Studio (GGUF build, e.g. `lm-kit/bge-m3-gguf`;
 the local server is enabled in the UI). The providers are interchangeable —
