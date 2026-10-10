@@ -9,7 +9,6 @@ import (
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/log"
 	"github.com/gorizond/vcs-rag/internal/provider"
-	"github.com/gorizond/vcs-rag/internal/provider/factory"
 )
 
 // snapshot — последний удачный листинг репозиториев (для линий US2+).
@@ -32,14 +31,8 @@ func (s *snapshot) get() []provider.Repo {
 
 // runDiscovery — линия discovery: периодический листинг репозиториев
 // (интервал WORKER_INTERVAL). Ошибка листинга не прерывает цикл (FR-014).
-func runDiscovery(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	p, err := factory.New(cfg)
-	if err != nil {
-		return err
-	}
+func runDiscovery(ctx context.Context, p provider.VCSProvider, cfg *config.Config, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "discovery")
-
-	snap := &snapshot{}
 	listOnce(ctx, p, logger, snap)
 
 	ticker := time.NewTicker(cfg.Worker.Interval)

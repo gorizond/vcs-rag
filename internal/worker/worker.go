@@ -1,15 +1,72 @@
-// Package worker — фоновые линии: discovery, зеркалирование, индексация (FR-005/006/018).
+// Package worker — фоновые линии: discovery, mirror, index (FR-005/006/018).
 package worker
 
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/gorizond/vcs-rag/internal/config"
+	"github.com/gorizond/vcs-rag/internal/embed"
+	"github.com/gorizond/vcs-rag/internal/gitengine"
+	"github.com/gorizond/vcs-rag/internal/provider/factory"
+	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// Run запускает воркер и блокируется до отмены контекста.
-// Сейчас реализована линия discovery (US1); mirror/index — US2+.
+// Run собирает и запускает воркер: провайдер → эмбеддинги → store;
+// размерность коллекции и индексы проверяются ДО первой записи (FR-009,
+// fail-fast), затем параллельно работают линии discovery/mirror/index.
+// Блокируется до отмены контекста.
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	return runDiscovery(ctx, cfg, logger)
+	vcs, err := factory.New(cfg)
+	if err != nil {
+		return err
+	}
+	emb, err := embed.New(cfg)
+	if err != nil {
+		return err
+	}
+	st, err := store.New(cfg.Qdrant)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	if err := st.EnsureCollection(ctx, uint64(cfg.Embeddings.Dim)); err != nil {
+		return err
+	}
+	if err := st.EnsureIndexes(ctx); err != nil {
+		return err
+	}
+
+	deps := RepoDeps{
+		VCSType: vcs.Type(),
+		Engine:  gitengine.New(cfg.Worker.MirrorsDir),
+		Embed:   emb,
+		Store:   st,
+		Cfg:     cfg,
+		Logger:  logger,
+	}
+	snap := &snapshot{}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 3)
+	run := func(fn func() error) {
+		defer wg.Done()
+		errCh <- fn()
+	}
+	wg.Add(3)
+	go run(func() error { return runDiscovery(ctx, vcs, cfg, logger, snap) })
+	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
+	go run(func() error { return runIndex(ctx, cfg, deps, snap) })
+
+	wg.Wait() // горутины завершаются по ctx.Done()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	logger.Info("worker остановлен")
+	return nil
 }
