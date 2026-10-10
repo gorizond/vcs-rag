@@ -91,17 +91,43 @@ func (s *Store) CountByFilter(ctx context.Context, f *qdrant.Filter) (uint64, er
 
 // ScrollPayloads возвращает payload'ы первых limit точек (read-back для e2e).
 func (s *Store) ScrollPayloads(ctx context.Context, limit uint32) ([]map[string]any, error) {
+	pts, err := s.scrollByFilter(ctx, nil, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(pts))
+	for _, p := range pts {
+		out = append(out, p.Payload)
+	}
+	return out, nil
+}
+
+// ScrollCIFailures возвращает существующие ci-точки репозитория (prune).
+// ponytail: одна страница до limit; хвосты за limit обработаются следующим циклом.
+func (s *Store) ScrollCIFailures(ctx context.Context, repo string, limit uint32) ([]ScoredPoint, error) {
+	return s.scrollByFilter(ctx, &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatch("type", "ci_failure"),
+		qdrant.NewMatch("repo", repo),
+	}}, limit)
+}
+
+// scrollByFilter — одна страница scroll по фильтру (nil — без фильтра).
+func (s *Store) scrollByFilter(ctx context.Context, f *qdrant.Filter, limit uint32) ([]ScoredPoint, error) {
 	pts, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
 		CollectionName: s.collection,
+		Filter:         f,
 		Limit:          qdrant.PtrOf(limit),
 		WithPayload:    qdrant.NewWithPayloadEnable(true),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("qdrant: scroll: %w", err)
 	}
-	out := make([]map[string]any, 0, len(pts))
+	out := make([]ScoredPoint, 0, len(pts))
 	for _, p := range pts {
-		out = append(out, qdrant.ValueMapToMap(p.GetPayload()))
+		out = append(out, ScoredPoint{
+			ID:      p.GetId().GetUuid(),
+			Payload: qdrant.ValueMapToMap(p.GetPayload()),
+		})
 	}
 	return out, nil
 }

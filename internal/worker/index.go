@@ -19,6 +19,7 @@ import (
 // RepoDeps — зависимости обработки одного репозитория (T041/T044).
 type RepoDeps struct {
 	VCSType string
+	VCS     provider.VCSProvider // нужен линии метаданных (US4)
 	Engine  *gitengine.Engine
 	Embed   embed.Provider
 	Store   *store.Store

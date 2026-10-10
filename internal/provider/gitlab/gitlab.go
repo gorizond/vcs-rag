@@ -14,8 +14,9 @@ import (
 
 // Client — GitLab-провайдер: листинг проектов групп (включая подгруппы).
 type Client struct {
-	api    *gitlab.Client
-	groups []string
+	api      *gitlab.Client
+	groups   []string
+	ciWindow int
 }
 
 // New создаёт клиент GitLab; сетевых вызовов не выполняет.
@@ -24,7 +25,11 @@ func New(cfg *config.Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gitlab-клиент: %w", err)
 	}
-	return &Client{api: api, groups: cfg.Provider.GitLabGroups}, nil
+	ciWindow := cfg.Worker.CIWindow
+	if ciWindow < 1 {
+		ciWindow = 50 // ponytail: фолбэк, если конфиг собран в обход Load
+	}
+	return &Client{api: api, groups: cfg.Provider.GitLabGroups, ciWindow: ciWindow}, nil
 }
 
 // Type возвращает "gitlab".
@@ -64,24 +69,4 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 		}
 	}
 	return provider.MergeRepos(all), nil
-}
-
-// ListIssues — заглушка (US4).
-func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider.Issue, error) {
-	return nil, provider.ErrNotImplemented
-}
-
-// ListChangeRequests — заглушка (US4).
-func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]provider.ChangeRequest, error) {
-	return nil, provider.ErrNotImplemented
-}
-
-// ListPipelines — заглушка (US4).
-func (c *Client) ListPipelines(ctx context.Context, repo provider.Repo) ([]provider.Pipeline, error) {
-	return nil, provider.ErrNotImplemented
-}
-
-// PipelineLogTail — заглушка (US4).
-func (c *Client) PipelineLogTail(ctx context.Context, repo provider.Repo, pipeline provider.Pipeline, job provider.Job, lines int) (string, error) {
-	return "", provider.ErrNotImplemented
 }

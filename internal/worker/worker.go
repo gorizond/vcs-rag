@@ -41,6 +41,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 
 	deps := RepoDeps{
 		VCSType: vcs.Type(),
+		VCS:     vcs,
 		Engine:  gitengine.New(cfg.Worker.MirrorsDir),
 		Embed:   emb,
 		Store:   st,
@@ -50,15 +51,16 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	snap := &snapshot{}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	run := func(fn func() error) {
 		defer wg.Done()
 		errCh <- fn()
 	}
-	wg.Add(3)
+	wg.Add(4)
 	go run(func() error { return runDiscovery(ctx, vcs, cfg, logger, snap) })
 	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
 	go run(func() error { return runIndex(ctx, cfg, deps, snap) })
+	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
 
 	wg.Wait() // горутины завершаются по ctx.Done()
 	close(errCh)

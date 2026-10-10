@@ -4,7 +4,9 @@ package github
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strconv"
+	"time"
 
 	gh "github.com/google/go-github/v92/github"
 
@@ -14,8 +16,10 @@ import (
 
 // Client — GitHub-провайдер: листинг репозиториев организаций.
 type Client struct {
-	api  *gh.Client
-	orgs []string
+	api      *gh.Client
+	orgs     []string
+	ciWindow int
+	logsHTTP *http.Client
 }
 
 // New создаёт клиент GitHub; сетевых вызовов не выполняет.
@@ -29,7 +33,17 @@ func New(cfg *config.Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("github-клиент: %w", err)
 	}
-	return &Client{api: api, orgs: cfg.Provider.GitHubOrgs}, nil
+	ciWindow := cfg.Worker.CIWindow
+	if ciWindow < 1 {
+		ciWindow = 50 // ponytail: фолбэк, если конфиг собран в обход Load
+	}
+	return &Client{
+		api:      api,
+		orgs:     cfg.Provider.GitHubOrgs,
+		ciWindow: ciWindow,
+		// Загрузка логов Actions — по подписанному redirect URL, без Authorization.
+		logsHTTP: &http.Client{Timeout: 60 * time.Second},
+	}, nil
 }
 
 // Type возвращает "github".
@@ -62,24 +76,4 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 		}
 	}
 	return provider.MergeRepos(all), nil
-}
-
-// ListIssues — заглушка (US4).
-func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider.Issue, error) {
-	return nil, provider.ErrNotImplemented
-}
-
-// ListChangeRequests — заглушка (US4).
-func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]provider.ChangeRequest, error) {
-	return nil, provider.ErrNotImplemented
-}
-
-// ListPipelines — заглушка (US4).
-func (c *Client) ListPipelines(ctx context.Context, repo provider.Repo) ([]provider.Pipeline, error) {
-	return nil, provider.ErrNotImplemented
-}
-
-// PipelineLogTail — заглушка (US4).
-func (c *Client) PipelineLogTail(ctx context.Context, repo provider.Repo, pipeline provider.Pipeline, job provider.Job, lines int) (string, error) {
-	return "", provider.ErrNotImplemented
 }

@@ -5,11 +5,25 @@ package provider
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
 // ErrNotImplemented возвращают заглушки методов; реализация — US4.
 var ErrNotImplemented = errors.New("not implemented")
+
+// TailLines возвращает последние n строк текста (n<=0 — без обрезки).
+func TailLines(s string, n int) string {
+	if n <= 0 || s == "" {
+		return s
+	}
+	s = strings.TrimRight(s, "\n")
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
+}
 
 // VCSProvider — источник репозиториев и метаданных (FR-003/004).
 type VCSProvider interface {

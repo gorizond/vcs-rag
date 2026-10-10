@@ -39,6 +39,17 @@ func (s *Store) DeleteCodeCommits(ctx context.Context, repo, branch string, shas
 	return s.DeleteByFilter(ctx, codeFilter(repo, branch, qdrant.NewMatchKeywords("commit_sha", shas...)))
 }
 
+// DeleteCIFailure удаляет точку CI-фейла (repo, pipeline_id, job_id) —
+// prune после перезапуска job'а в success (data-model §6).
+func (s *Store) DeleteCIFailure(ctx context.Context, repo, pipelineID, jobID string) error {
+	return s.DeleteByFilter(ctx, &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatch("type", "ci_failure"),
+		qdrant.NewMatch("repo", repo),
+		qdrant.NewMatch("pipeline_id", pipelineID),
+		qdrant.NewMatch("job_id", jobID),
+	}})
+}
+
 // codeFilter собирает must-условия для code-точек репозитория/ветки.
 func codeFilter(repo, branch string, extra ...*qdrant.Condition) *qdrant.Filter {
 	must := []*qdrant.Condition{
