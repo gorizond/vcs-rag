@@ -18,6 +18,13 @@ import (
 // fail-fast), затем параллельно работают линии discovery/mirror/index.
 // Блокируется до отмены контекста.
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	// FR-014: второй воркер на том же MirrorsDir не запускается.
+	release, err := AcquireLock(cfg.Worker.MirrorsDir)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	vcs, err := factory.New(cfg)
 	if err != nil {
 		return err

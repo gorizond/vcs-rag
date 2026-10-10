@@ -30,12 +30,15 @@ func runMetadata(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 	}
 }
 
-// metadataAll обрабатывает метаданные всех известных репозиториев через пул.
+// metadataAll обрабатывает метаданные всех известных репозиториев через пул;
+// отказы изолируются (FR-014), после прохода пишется сводка (FR-020).
 func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) {
 	repos := snap.get()
 	if len(repos) == 0 {
 		return
 	}
+	sum := newSummary("metadata")
+	deps.stats = sum
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
 	for _, repo := range repos {
@@ -46,15 +49,13 @@ func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 				return
 			}
 			defer p.Release()
-			if err := ProcessMetadataOnce(ctx, deps, repo); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				deps.Logger.Error("обновление метаданных не удалось", "repo", repo.Namespace+"/"+repo.Path, "err", err)
-			}
+			sum.countRepo(processSafely(ctx, deps.Logger, repo, "metadata", func() error {
+				return ProcessMetadataOnce(ctx, deps, repo)
+			}))
 		}(repo)
 	}
 	wg.Wait()
+	sum.log(deps.Logger)
 }
 
 // ProcessMetadataOnce — один проход метаданных репозитория: issues + MR/PR
@@ -145,6 +146,7 @@ func pruneCIFailures(ctx context.Context, deps RepoDeps, repo provider.Repo, cur
 	if err != nil {
 		return err
 	}
+	pruned := 0
 	for _, p := range existing {
 		key := [2]string{payloadString(p.Payload, "pipeline_id"), payloadString(p.Payload, "job_id")}
 		if current[key] {
@@ -153,6 +155,10 @@ func pruneCIFailures(ctx context.Context, deps RepoDeps, repo provider.Repo, cur
 		if err := deps.Store.DeleteCIFailure(ctx, repo.Path, key[0], key[1]); err != nil {
 			return err
 		}
+		pruned++
+	}
+	if deps.stats != nil {
+		deps.stats.addPruned(pruned)
 	}
 	return nil
 }

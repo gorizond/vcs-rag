@@ -25,6 +25,7 @@ type RepoDeps struct {
 	Store   *store.Store
 	Cfg     *config.Config
 	Logger  *slog.Logger
+	stats   *summary // необязательные счётчики прохода (T060)
 }
 
 // runIndex — линия инкрементальной индексации кода (T041): по тикеру
@@ -46,12 +47,15 @@ func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	}
 }
 
-// indexAll индексирует все известные репозитории через пул.
+// indexAll индексирует все известные репозитории через пул; отказы
+// изолируются (FR-014), после прохода пишется сводка (FR-020).
 func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) {
 	repos := snap.get()
 	if len(repos) == 0 {
 		return
 	}
+	sum := newSummary("index")
+	deps.stats = sum
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
 	for _, repo := range repos {
@@ -62,15 +66,13 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 				return
 			}
 			defer p.Release()
-			if err := ProcessRepoOnce(ctx, deps, repo); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				deps.Logger.Error("индексация репозитория не удалась", "repo", repo.Namespace+"/"+repo.Path, "err", err)
-			}
+			sum.countRepo(processSafely(ctx, deps.Logger, repo, "index", func() error {
+				return ProcessRepoOnce(ctx, deps, repo)
+			}))
 		}(repo)
 	}
 	wg.Wait()
+	sum.log(deps.Logger)
 }
 
 // ProcessRepoOnce — полный проход по репозиторию: зеркало → снимок веток →
@@ -133,21 +135,13 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 		window = window[:max]
 	}
 
-	indexed := make(map[string]bool, len(prev.IndexedCommits))
-	for _, sha := range prev.IndexedCommits {
-		indexed[sha] = true
-	}
-	newCount := 0
-	for i := len(window) - 1; i >= 0; i-- { // oldest → newest
-		sha := window[i]
-		if indexed[sha] {
-			continue
-		}
+	toIndex := newCommits(window, prev.IndexedCommits)
+	for _, sha := range toIndex { // oldest → newest
 		if err := processCommit(ctx, deps, repo, mirror, branch, sha, reader, lg); err != nil {
 			return err
 		}
-		newCount++
 	}
+	newCount := len(toIndex)
 
 	// prune: проиндексированные коммиты, недостижимые из нового tip
 	// (force-push/rewrite, FR-016).
@@ -166,6 +160,10 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 			return err
 		}
 	}
+	if deps.stats != nil {
+		deps.stats.addIndexed(newCount)
+		deps.stats.addPruned(len(pruned))
+	}
 	if newCount > 0 || len(pruned) > 0 {
 		lg.Info("ветка проиндексирована", "branch", branch, "new_commits", newCount, "pruned", len(pruned))
 	}
@@ -176,6 +174,26 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 		IndexedAt:      time.Now().UTC(),
 	}
 	return nil
+}
+
+// newCommits отбирает коммиты окна (newest→oldest), не попавшие в indexed;
+// порядок результата — oldest→newest (порядок индексации). Повторный проход
+// с полным indexed не даёт коммитов — resume/идемпотентность (FR-006/011).
+func newCommits(window, indexed []string) []string {
+	if len(window) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(indexed))
+	for _, sha := range indexed {
+		seen[sha] = true
+	}
+	var out []string
+	for i := len(window) - 1; i >= 0; i-- {
+		if !seen[window[i]] {
+			out = append(out, window[i])
+		}
+	}
+	return out
 }
 
 // processCommit индексирует изменённые файлы коммита: старые точки файла

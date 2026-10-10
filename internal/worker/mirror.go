@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -31,12 +32,14 @@ func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 	}
 }
 
-// mirrorAll обновляет зеркала всех известных репозиториев через пул.
+// mirrorAll обновляет зеркала всех известных репозиториев через пул;
+// отказы изолируются (FR-014), после прохода пишется сводка (FR-020).
 func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) {
 	repos := snap.get()
 	if len(repos) == 0 {
 		return
 	}
+	sum := newSummary("mirror")
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
 	for _, repo := range repos {
@@ -47,25 +50,27 @@ func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 				return
 			}
 			defer p.Release()
-			mirrorRepo(ctx, vcsType, eng, logger, repo)
+			sum.countRepo(processSafely(ctx, logger, repo, "mirror", func() error {
+				return mirrorRepo(ctx, vcsType, eng, logger, repo)
+			}))
 		}(repo)
 	}
 	wg.Wait()
+	sum.log(logger)
 }
 
 // mirrorRepo зеркалирует один репозиторий и фиксирует LastFetchAt.
-func mirrorRepo(ctx context.Context, vcsType string, eng *gitengine.Engine, logger *slog.Logger, repo provider.Repo) {
+func mirrorRepo(ctx context.Context, vcsType string, eng *gitengine.Engine, logger *slog.Logger, repo provider.Repo) error {
 	name := repo.Namespace + "/" + repo.Path
 	mirror, err := eng.EnsureMirror(ctx, vcsType, repo)
 	if err != nil {
-		logger.Error("зеркало: обновление не удалось", "repo", name, "err", err)
-		return
+		return fmt.Errorf("зеркало: %w", err)
 	}
 	if err := updateState(gitengine.StatePath(mirror), func(st *MirrorState) {
 		st.LastFetchAt = time.Now().UTC()
 	}); err != nil {
-		logger.Error("state: запись не удалась", "repo", name, "err", err)
-		return
+		return fmt.Errorf("state: %w", err)
 	}
 	logger.Info("зеркало обновлено", "repo", name)
+	return nil
 }
