@@ -4,8 +4,12 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrNotImplemented возвращают заглушки методов; реализация — US4.
+var ErrNotImplemented = errors.New("not implemented")
 
 // VCSProvider — источник репозиториев и метаданных (FR-003/004).
 type VCSProvider interface {

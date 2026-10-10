@@ -51,7 +51,7 @@ func run() int {
 	case "worker":
 		runErr = worker.Run(ctx, cfg, logger)
 	case "mcp":
-		runErr = mcp.Run(ctx, cfg, logger)
+		runErr = mcp.Run(ctx, cfg, logger, version)
 	}
 	if runErr != nil {
 		logger.Error("завершение с ошибкой", "err", runErr)

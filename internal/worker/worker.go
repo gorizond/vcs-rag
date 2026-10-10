@@ -1,4 +1,4 @@
-// Package worker — фоновый цикл зеркалирования и индексации (FR-005/006/018).
+// Package worker — фоновые линии: discovery, зеркалирование, индексация (FR-005/006/018).
 package worker
 
 import (
@@ -8,9 +8,8 @@ import (
 	"github.com/gorizond/vcs-rag/internal/config"
 )
 
-// Run запускает worker и блокируется до отмены контекста.
-// Заглушка: реальная реализация — в US1+.
+// Run запускает воркер и блокируется до отмены контекста.
+// Сейчас реализована линия discovery (US1); mirror/index — US2+.
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	logger.Info("worker: ещё не реализовано (US1+)")
-	return nil
+	return runDiscovery(ctx, cfg, logger)
 }
