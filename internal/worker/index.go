@@ -28,6 +28,15 @@ type RepoDeps struct {
 	stats   *summary // optional pass counters (T060)
 }
 
+// indexStore is the store surface of the index lane: a narrow interface so
+// unit tests can inject failures/counters without Qdrant (T088).
+type indexStore interface {
+	DeleteCodeFile(ctx context.Context, repo, branch, filePath string) error
+	DeleteBranch(ctx context.Context, repo, branch string) error
+	DeleteCodeCommits(ctx context.Context, repo, branch string, shas []string) error
+	Upsert(ctx context.Context, points []store.Point) error
+}
+
 // runIndex is the incremental code indexing lane (T041): on the
 // WORKER_INTERVAL tick it processes registry repositories through the pool
 // (WORKER_CONCURRENCY); errors do not break the loop (FR-014).
@@ -80,9 +89,17 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 // the mirror on a WORKER_MIRROR_INTERVAL tick and are picked up by the next
 // index pass) → branch snapshot → new commits (diff → blob → chunks →
 // embeddings → upsert) → prune of rewritten commits and vanished branches.
-// State is saved only after success (FR-014): on error a retry in the next
-// pass is safe — delete/upsert are idempotent (FR-011).
+// The branch progress is checkpointed after every indexed commit (T088): a
+// failure/restart resumes from the last commit instead of the whole repository;
+// the retry is safe — delete/upsert are idempotent (FR-014/FR-011). The sidecar
+// is written only through updateState closures (T089): the index lane touches
+// Branches only, so the meta/last_fetch_at sections of the other lanes survive.
 func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) error {
+	return processRepoOnce(ctx, deps, repo, deps.Store)
+}
+
+// processRepoOnce is ProcessRepoOnce over the narrow indexStore interface.
+func processRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo, st indexStore) error {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 
 	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
@@ -90,7 +107,7 @@ func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) err
 		return fmt.Errorf("mirror: %w", err)
 	}
 	statePath := gitengine.StatePath(mirror)
-	st, err := LoadState(statePath)
+	state, err := LoadState(statePath)
 	if err != nil {
 		return err
 	}
@@ -104,33 +121,50 @@ func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) err
 	}
 	defer reader.Close()
 
+	finals := make(map[string]BranchState, len(refs))
 	for branch, tip := range refs {
-		if err := processBranch(ctx, deps, repo, mirror, branch, tip, st, reader, lg); err != nil {
+		bst, err := processBranch(ctx, deps, st, repo, mirror, branch, tip, state.Branches[branch], reader, lg, statePath)
+		if err != nil {
 			return fmt.Errorf("branch %s: %w", branch, err)
 		}
+		finals[branch] = bst
 	}
 
-	// Vanished branches → delete all their points (data-model §2).
-	for branch := range st.Branches {
-		if _, ok := refs[branch]; ok {
-			continue
+	// Vanished branches → delete their points (data-model §2). The points go
+	// first: if the deletion fails, the keys stay in the state for a retry.
+	var vanished []string
+	for branch := range state.Branches {
+		if _, ok := refs[branch]; !ok {
+			vanished = append(vanished, branch)
 		}
-		if err := deps.Store.DeleteBranch(ctx, repo.Path, branch); err != nil {
+	}
+	for _, branch := range vanished {
+		if err := st.DeleteBranch(ctx, repo.Path, branch); err != nil {
 			return err
 		}
-		delete(st.Branches, branch)
 		lg.Info("branch removed from the index", "branch", branch)
 	}
 
-	return SaveState(statePath, st)
+	// T089: the single terminal write over the FRESH state — final branch
+	// states and vanished keys only; meta/last_fetch_at written concurrently by
+	// the other lanes are preserved (Branches is written by the index lane only).
+	return updateState(statePath, func(fresh *MirrorState) {
+		for branch, bst := range finals {
+			fresh.Branches[branch] = bst
+		}
+		for _, branch := range vanished {
+			delete(fresh.Branches, branch)
+		}
+	})
 }
 
-// processBranch indexes new branch commits and prunes unreachable ones.
-func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirror, branch, tip string, st *MirrorState, reader *gitengine.BlobReader, lg *slog.Logger) error {
-	prev := st.Branches[branch]
+// processBranch indexes new branch commits — checkpointing the branch state
+// after every commit (T088) — and prunes unreachable ones. It does not hold on
+// to the state outside updateState closures: prev is a value copy.
+func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provider.Repo, mirror, branch, tip string, prev BranchState, reader *gitengine.BlobReader, lg *slog.Logger, statePath string) (BranchState, error) {
 	allRev, err := deps.Engine.RevList(ctx, mirror, tip, 0)
 	if err != nil {
-		return fmt.Errorf("rev-list: %w", err)
+		return BranchState{}, fmt.Errorf("rev-list: %w", err)
 	}
 	window := allRev
 	if max := deps.Cfg.Worker.HistoryMaxCommits; max > 0 && len(window) > max {
@@ -138,9 +172,15 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 	}
 
 	toIndex := newCommits(window, prev.IndexedCommits)
+	done := make([]string, 0, len(toIndex))
 	for _, sha := range toIndex { // oldest → newest
-		if err := processCommit(ctx, deps, repo, mirror, branch, sha, reader, lg); err != nil {
-			return err
+		if err := processCommit(ctx, deps, st, repo, mirror, branch, sha, reader, lg); err != nil {
+			return BranchState{}, err
+		}
+		done = append(done, sha)
+		// T088: persist the branch progress — a crash/restart resumes from here.
+		if err := checkpointBranch(statePath, branch, tip, window, prev.IndexedCommits, done); err != nil {
+			return BranchState{}, fmt.Errorf("state: %w", err)
 		}
 	}
 	newCount := len(toIndex)
@@ -158,24 +198,60 @@ func processBranch(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 		}
 	}
 	if len(pruned) > 0 {
-		if err := deps.Store.DeleteCodeCommits(ctx, repo.Path, branch, pruned); err != nil {
-			return err
+		if err := st.DeleteCodeCommits(ctx, repo.Path, branch, pruned); err != nil {
+			return BranchState{}, err
 		}
 	}
+	resumed := len(window) - newCount
 	if deps.stats != nil {
 		deps.stats.addIndexed(newCount)
 		deps.stats.addPruned(len(pruned))
+		deps.stats.addResumed(resumed) // T091
 	}
 	if newCount > 0 || len(pruned) > 0 {
-		lg.Info("branch indexed", "branch", branch, "new_commits", newCount, "pruned", len(pruned))
+		lg.Info("branch indexed", "branch", branch, "new_commits", newCount,
+			"skipped_commits", resumed, "pruned", len(pruned))
 	}
 
-	st.Branches[branch] = BranchState{
-		Tip:            tip,
-		IndexedCommits: window,
-		IndexedAt:      time.Now().UTC(),
+	return BranchState{Tip: tip, IndexedCommits: window, IndexedAt: time.Now().UTC()}, nil
+}
+
+// checkpointBranch persists the intermediate branch progress after a commit
+// (T088): only st.Branches[branch] is touched inside the closure — the fresh
+// state's meta/last_fetch_at and the other branches are preserved (the index
+// lane is the only writer of Branches).
+func checkpointBranch(statePath, branch, tip string, window, prev, done []string) error {
+	idx := mergedIndexed(window, prev, done)
+	at := time.Now().UTC()
+	return updateState(statePath, func(st *MirrorState) {
+		st.Branches[branch] = BranchState{Tip: tip, IndexedCommits: idx, IndexedAt: at}
+	})
+}
+
+// mergedIndexed returns prev ∪ done in the window order (newest→oldest); prev
+// shas that left the window are kept for the prune bookkeeping on resume.
+func mergedIndexed(window, prev, done []string) []string {
+	indexed := make(map[string]bool, len(prev)+len(done))
+	for _, sha := range prev {
+		indexed[sha] = true
 	}
-	return nil
+	for _, sha := range done {
+		indexed[sha] = true
+	}
+	inWindow := make(map[string]bool, len(window))
+	out := make([]string, 0, len(indexed))
+	for _, sha := range window {
+		inWindow[sha] = true
+		if indexed[sha] {
+			out = append(out, sha)
+		}
+	}
+	for _, sha := range prev {
+		if !inWindow[sha] {
+			out = append(out, sha)
+		}
+	}
+	return out
 }
 
 // newCommits selects window commits (newest→oldest) missing from indexed;
@@ -200,7 +276,7 @@ func newCommits(window, indexed []string) []string {
 
 // processCommit indexes the changed files of a commit: old file points are
 // deleted, eligible blobs are chunked and written anew.
-func processCommit(ctx context.Context, deps RepoDeps, repo provider.Repo, mirror, branch, sha string, reader *gitengine.BlobReader, lg *slog.Logger) error {
+func processCommit(ctx context.Context, deps RepoDeps, st indexStore, repo provider.Repo, mirror, branch, sha string, reader *gitengine.BlobReader, lg *slog.Logger) error {
 	changes, err := deps.Engine.DiffCommit(ctx, mirror, sha)
 	if err != nil {
 		return fmt.Errorf("diff %s: %w", sha, err)
@@ -215,7 +291,7 @@ func processCommit(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 	}
 
 	for _, ch := range changes {
-		if err := deps.Store.DeleteCodeFile(ctx, repo.Path, branch, ch.Path); err != nil {
+		if err := st.DeleteCodeFile(ctx, repo.Path, branch, ch.Path); err != nil {
 			return err
 		}
 		if ch.Status == "D" {
@@ -252,7 +328,7 @@ func processCommit(ctx context.Context, deps RepoDeps, repo provider.Repo, mirro
 				Payload: store.CodePayload(deps.VCSType, repo.Namespace, repo.Path, branch, sha, ch.Path, c.Text, c.Index),
 			}
 		}
-		if err := deps.Store.Upsert(ctx, points); err != nil {
+		if err := st.Upsert(ctx, points); err != nil {
 			return err
 		}
 	}

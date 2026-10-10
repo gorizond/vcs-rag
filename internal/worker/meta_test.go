@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -320,5 +321,68 @@ func TestMetadataIncrementalCIOnce(t *testing.T) {
 	}
 	if len(saved.Meta) != 0 {
 		t.Errorf("state ci keys not pruned: %v", saved.Meta)
+	}
+}
+
+// T090: a failure between the issues/MR and CI phases keeps the first-phase
+// checkpoint; the retry skips the written items and completes the CI phase.
+func TestMetadataCheckpointBetweenPhases(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Unix(1000, 0)
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	vcs := &fake.Provider{
+		Repos: []provider.Repo{repo},
+		Issues: map[string][]provider.Issue{
+			"1": {{ID: 1, Title: "Issue", UpdatedAt: t0}},
+		},
+		ChangeRequests: map[string][]provider.ChangeRequest{
+			"1": {{ID: 2, Title: "PR", UpdatedAt: t0}},
+		},
+		Pipelines: map[string][]provider.Pipeline{
+			"1": {{ID: "100", Status: "failed", Ref: "main", SHA: "abc",
+				Jobs: []provider.Job{{ID: "1000", Name: "build", Status: "failed"}}}},
+		},
+		Logs:             map[string]string{"1000": "boom\n"},
+		ErrListPipelines: errors.New("injected pipelines failure"),
+	}
+	emb := &countingEmbed{}
+	deps := newMetaDeps(t, vcs, emb, testLogger())
+	stats := newSummary("metadata")
+	deps.stats = stats
+	st := &countingStore{}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	// 1) the CI phase fails after the issues/MR checkpoint.
+	if err := processMetadataOnce(ctx, deps, repo, st); err == nil {
+		t.Fatal("expected the injected pipelines failure")
+	}
+	if emb.texts != 2 {
+		t.Errorf("embeddings before the failure = %d, want 2 (issues/MR only)", emb.texts)
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if saved.Meta["issue:1"] != t0.Unix() || saved.Meta["mr:2"] != t0.Unix() {
+		t.Fatalf("issues/MR checkpoint not persisted: %v", saved.Meta)
+	}
+
+	// 2) retry: issues/MR are skipped (no re-embedding), the CI phase is written.
+	vcs.ErrListPipelines = nil
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if emb.texts != 3 {
+		t.Errorf("embeddings after the retry = %d, want 3 (issues/MR not re-embedded)", emb.texts)
+	}
+	saved, err = LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if saved.Meta["ci:100:1000"] != 1 {
+		t.Errorf("CI checkpoint missing: %v", saved.Meta)
+	}
+	if got := stats.skipped.Load(); got != 2 {
+		t.Errorf("summary skipped = %d, want 2 (issues/MR)", got)
 	}
 }

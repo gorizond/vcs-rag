@@ -125,6 +125,18 @@ func itemsOf(cands []metaCandidate) []metaItem {
 	return items
 }
 
+// checkpointMeta merges freshly written keys into Meta (T090): a crash between
+// the issues/MR and CI phases keeps the progress of the written items — the
+// next pass skips them. Only Meta is touched; the fresh state's branches and
+// last_fetch_at (other lanes) are preserved.
+func checkpointMeta(statePath string, seen map[string]int64) error {
+	return updateState(statePath, func(st *MirrorState) {
+		for key, at := range seen {
+			st.Meta[key] = at
+		}
+	})
+}
+
 // ProcessMetadataOnce is one metadata pass of a repository: issues + MR/PR
 // (upsert by deterministic IDs updates state/text), then CI failures
 // (tail ≤ ciTailLines lines) and prune of ci points gone from the current window.
@@ -174,6 +186,13 @@ func processMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo,
 		return err
 	}
 	markMeta(seen, pending)
+	// T090: checkpoint after the issues/MR phase — a failure later in the pass
+	// keeps this progress (the retry skips the written items).
+	if len(pending) > 0 {
+		if err := checkpointMeta(statePath, seen); err != nil {
+			return fmt.Errorf("state: %w", err)
+		}
+	}
 
 	// --- CI: failed jobs of the current window; a job is indexed once ---
 	pipelines, err := deps.VCS.ListPipelines(ctx, repo)
@@ -211,17 +230,27 @@ func processMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo,
 		return err
 	}
 	markMeta(seen, ciCands)
+	// T090: checkpoint after the CI phase (the prune below may still fail).
+	if len(ciCands) > 0 {
+		if err := checkpointMeta(statePath, seen); err != nil {
+			return fmt.Errorf("state: %w", err)
+		}
+	}
 	if err := pruneCIFailures(ctx, st, repo, current, deps.stats); err != nil {
 		return err
 	}
 	pruneSeenCI(seen, current)
 
-	// the sidecar is shared with the mirror/index lanes: write under the mutex.
+	// the sidecar is shared with the mirror/index lanes: the terminal write
+	// replaces Meta (prune removals included) under the mutex.
 	if err := updateState(statePath, func(s *MirrorState) { s.Meta = seen }); err != nil {
 		return fmt.Errorf("state: %w", err)
 	}
 
 	skipped := (len(cands) - len(pending)) + (ciFailed - len(ciCands))
+	if deps.stats != nil {
+		deps.stats.addSkipped(skipped) // T091
+	}
 	lg.Info("metadata updated", "issues", len(issues), "prs", len(prs),
 		"ci_failures", ciFailed, "skipped", skipped)
 	return nil

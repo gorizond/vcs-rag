@@ -71,8 +71,11 @@ func SaveState(path string, st *MirrorState) error {
 	return nil
 }
 
-// stateMu serializes load-modify-save: both lanes write the sidecar
-// (mirror — last_fetch_at, index — branches), there is one file per repository.
+// stateMu serializes load-modify-save: there is one sidecar per repository.
+// Single-writer invariant: each lane owns its section and writes it only
+// through updateState — mirror is the only writer of last_fetch_at, index of
+// branches, metadata of meta. A closure must touch the owning section only;
+// then the concurrent lanes never clobber each other (T088/T089).
 var stateMu sync.Mutex
 
 // updateState applies a change to the state under the shared mutex.
