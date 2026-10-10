@@ -63,7 +63,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	snap := &snapshot{}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 	run := func(fn func() error) {
 		defer wg.Done()
 		errCh <- fn()
@@ -73,6 +73,13 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
 	go run(func() error { return runIndex(ctx, cfg, deps, snap) })
 	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
+
+	// T108/T112: the on-demand refresh over the local JetStream; NATS_URL is
+	// empty by default — the behavior stays as before.
+	if cfg.NATS.URL != "" {
+		wg.Add(1)
+		go run(func() error { return runRefreshLane(ctx, cfg, deps, snap, logger) })
+	}
 
 	wg.Wait() // goroutines exit on ctx.Done()
 	close(errCh)

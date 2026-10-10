@@ -17,6 +17,14 @@ type Config struct {
 	Qdrant     Qdrant
 	Worker     Worker
 	MCP        MCP
+	NATS       NATS
+}
+
+// NATS is the local JetStream connection for on-demand refresh (T108/T117):
+// an empty URL disables the feature — the behavior stays as before.
+type NATS struct {
+	URL        string // NATS_URL
+	InstanceID string // NATS_INSTANCE_ID (default "default"), see RefreshNames
 }
 
 // Provider describes the selected VCS provider (FR-003): exactly one of the two.
@@ -208,6 +216,20 @@ func Load() (*Config, error) {
 		MaxFileBytes:      int64(maxFileBytes),
 		CIWindow:          ciWindow,
 	}
+
+	// --- NATS (T108/T117): empty URL — the refresh mode is off; the instance
+	// id is validated only when the mode is on (behavior stays as before).
+	natsURL := os.Getenv("NATS_URL")
+	instanceID := NATSDefaultInstance
+	if natsURL != "" {
+		if v := os.Getenv("NATS_INSTANCE_ID"); v != "" {
+			if !instanceIDRe.MatchString(v) {
+				return nil, &ConfigError{Problem: "NATS_INSTANCE_ID: invalid value (want " + instanceIDRe.String() + ")"}
+			}
+			instanceID = v
+		}
+	}
+	cfg.NATS = NATS{URL: natsURL, InstanceID: instanceID}
 
 	// --- MCP ---
 	transport := envDefault("MCP_TRANSPORT", "stdio")

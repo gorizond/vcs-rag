@@ -12,17 +12,23 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
+// Fixtures are explicit example markers, not real tokens (T121).
+const (
+	exampleGitLabToken = "glpat-EXAMPLE-NOT-A-TOKEN"
+	exampleGitHubToken = "ghp-EXAMPLE-NOT-A-TOKEN"
+)
+
 // TestAuthEnv checks the Basic pair and header per provider type (T074).
 func TestAuthEnv(t *testing.T) {
-	gitlab := AuthEnv("gitlab", "glpat-secret")
+	gitlab := AuthEnv("gitlab", exampleGitLabToken)
 	assertEnvKV(t, gitlab, "GIT_CONFIG_COUNT", "1")
 	assertEnvKV(t, gitlab, "GIT_CONFIG_KEY_0", "http.extraHeader")
 	assertEnvKV(t, gitlab, "GIT_CONFIG_VALUE_0",
-		"Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("oauth2:glpat-secret")))
+		"Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("oauth2:"+exampleGitLabToken)))
 
-	gh := AuthEnv("github", "tok123")
+	gh := AuthEnv("github", exampleGitHubToken)
 	assertEnvKV(t, gh, "GIT_CONFIG_VALUE_0",
-		"Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:tok123")))
+		"Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:"+exampleGitHubToken)))
 
 	if AuthEnv("gitlab", "") != nil {
 		t.Error("empty token: env must be nil")
@@ -91,7 +97,7 @@ func TestCloneAndFetchGetAuthEnv(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "git.log")
 	eng := New(t.TempDir())
 	eng.GitBin = gitWrapper(t, logPath)
-	eng.AuthEnv = AuthEnv("gitlab", "fake-token-123")
+	eng.AuthEnv = AuthEnv("gitlab", exampleGitLabToken)
 
 	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture", CloneURL: "file://" + src, DefaultBranch: "main"}
 	mirror, err := eng.EnsureMirror(ctx, "gitlab", repo)
@@ -110,7 +116,7 @@ func TestCloneAndFetchGetAuthEnv(t *testing.T) {
 		t.Fatalf("wrapper log: %v", err)
 	}
 	log := string(data)
-	wantCred := base64.StdEncoding.EncodeToString([]byte("oauth2:fake-token-123"))
+	wantCred := base64.StdEncoding.EncodeToString([]byte("oauth2:" + exampleGitLabToken))
 
 	for _, tc := range []struct{ name, args string }{
 		{"clone", "ARGS:clone --mirror " + repo.CloneURL + " " + mirror},
@@ -123,7 +129,7 @@ func TestCloneAndFetchGetAuthEnv(t *testing.T) {
 		if !strings.Contains(line, "ENV:Authorization: Basic "+wantCred) {
 			t.Errorf("%s: missing auth env: %s", tc.name, line)
 		}
-		if strings.Contains(line, "fake-token-123") {
+		if strings.Contains(line, exampleGitLabToken) {
 			t.Errorf("%s: token leaked into argv: %s", tc.name, line)
 		}
 	}
@@ -138,7 +144,7 @@ func TestCloneAndFetchGetAuthEnv(t *testing.T) {
 	}
 
 	// negative control: neither the token nor the base64 pair is in the mirror
-	for _, needle := range []string{"fake-token-123", wantCred} {
+	for _, needle := range []string{exampleGitLabToken, wantCred} {
 		out, err := exec.Command("grep", "-r", "-l", "--", needle, mirror).CombinedOutput()
 		if err == nil && len(out) > 0 {
 			t.Errorf("negative control: %q found in the mirror: %s", needle, out)

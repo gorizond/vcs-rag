@@ -8,10 +8,11 @@ import (
 // Structured tool error codes (contracts/mcp-tools.md:
 // on error — {"error": {...}}; the server keeps running).
 const (
-	codeTimeout      = "timeout"
-	codeCanceled     = "canceled"
-	codeEmbedFailed  = "embedding_unavailable"
-	codeSearchFailed = "qdrant_unavailable"
+	codeTimeout            = "timeout"
+	codeCanceled           = "canceled"
+	codeEmbedFailed        = "embedding_unavailable"
+	codeSearchFailed       = "qdrant_unavailable"
+	codeRefreshUnavailable = "refresh_unavailable" // T113
 )
 
 // toolError — a structured tool error.

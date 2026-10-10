@@ -30,8 +30,19 @@ const (
 
 // tools — MCP tool implementations on top of narrow interfaces.
 type tools struct {
-	embedder Embedder
-	searcher Searcher
+	embedder  Embedder
+	searcher  Searcher
+	refresher refresher    // nil when NATS_URL is empty (refresh_repo is off)
+	inflight  *flightGroup // in-flight share of refresh_repo (T113)
+}
+
+// newTools assembles the tool set; a nil refresher disables refresh_repo.
+func newTools(embedder Embedder, searcher Searcher, refresher refresher) *tools {
+	t := &tools{embedder: embedder, searcher: searcher, refresher: refresher}
+	if refresher != nil {
+		t.inflight = newFlightGroup()
+	}
+	return t
 }
 
 // --- inputs (contracts/mcp-tools.md) ---
@@ -121,6 +132,16 @@ func registerTools(server *mcp.Server, t *tools) {
 		Name:        "search_ci_failures",
 		Description: "Semantic search over failed CI job logs",
 	}, t.searchCIFailures)
+	// T113: registered only when NATS_URL is set (the refresh mode is on).
+	if t.refresher != nil {
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "refresh_repo",
+			Description: "Refresh the index of one repository before searching: fetch + index new commits + metadata. " +
+				"Use when the question depends on very recent changes. Blocks up to timeout_ms (default 20000); " +
+				"if status=in_progress — the task continues in background: retry once or proceed with current data. " +
+				"Do not call repeatedly for one repository.",
+		}, t.refreshRepo)
+	}
 }
 
 // searchCode — semantic code search (T046).

@@ -1,0 +1,155 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/gorizond/vcs-rag/internal/gitengine"
+	"github.com/gorizond/vcs-rag/internal/provider"
+)
+
+// refreshStatus is the refresh_status KV value (T109/T112 wire contract; the
+// MCP read model repeats it in internal/mcp/refresh.go).
+type refreshStatus struct {
+	State          string    `json:"state"` // in_progress | done | failed
+	RequestID      string    `json:"request_id,omitempty"`
+	StartedAt      time.Time `json:"started_at,omitempty"`
+	FinishedAt     time.Time `json:"finished_at,omitempty"`
+	CommitsIndexed int       `json:"commits_indexed"`
+	MetaUpdated    int       `json:"meta_updated"`
+	Errors         []string  `json:"errors,omitempty"`
+	DurationMS     int64     `json:"duration_ms"`
+}
+
+// RefreshResult is the outcome of one on-demand repository refresh (T111).
+type RefreshResult struct {
+	CommitsIndexed int
+	MetaUpdated    int
+	Errors         []string // per-phase errors; the phases are best-effort
+	Duration       time.Duration
+}
+
+// errRefreshTransient marks retryable resolve failures (an empty discovery
+// snapshot — the listing has not produced data yet).
+var errRefreshTransient = errors.New("transient")
+
+// RefreshOnce performs an on-demand refresh of one repository (T111): fetch
+// (mirror-lane semantics) → index new commits (per-commit checkpoints, T088) →
+// metadata. An error of a phase does not cancel the next one — it is collected
+// in Errors. The whole composition runs under the per-repo lock (T110); the
+// NATS consumer is the production caller (T112). The idempotent checkpointed
+// pipelines make a redelivery safe.
+func RefreshOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) RefreshResult {
+	return refreshOnce(ctx, deps, deps.Store, deps.Store, repo)
+}
+
+// refreshOnce is RefreshOnce over the narrow store interfaces (fakes in tests).
+func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaStore, repo provider.Repo) RefreshResult {
+	start := time.Now()
+	res := RefreshResult{}
+	_ = withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
+		statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+		before, err := LoadState(statePath)
+		if err != nil {
+			res.Errors = append(res.Errors, "state: "+err.Error())
+			before = &MirrorState{}
+		}
+
+		// phase 1: fetch — the refresh owns network access (mirror lane semantics).
+		if _, err := deps.Engine.EnsureMirror(ctx, deps.VCSType, repo); err != nil {
+			res.Errors = append(res.Errors, "mirror: "+err.Error())
+		}
+		// phase 2: index new commits.
+		if err := processRepoOnce(ctx, deps, repo, idx); err != nil {
+			res.Errors = append(res.Errors, "index: "+err.Error())
+		}
+		if after, err := LoadState(statePath); err == nil {
+			res.CommitsIndexed = indexedDelta(before.Branches, after.Branches)
+		}
+		// phase 3: metadata (best-effort).
+		metaBefore, err := LoadState(statePath)
+		if err != nil {
+			res.Errors = append(res.Errors, "state: "+err.Error())
+		} else if err := processMetadataOnce(ctx, deps, repo, meta); err != nil {
+			res.Errors = append(res.Errors, "metadata: "+err.Error())
+		}
+		if metaAfter, err := LoadState(statePath); err == nil && metaBefore != nil {
+			res.MetaUpdated = metaDelta(metaBefore.Meta, metaAfter.Meta)
+		}
+		return nil
+	})
+	res.Duration = time.Since(start)
+	return res
+}
+
+// indexedDelta counts the commits that appeared in the branch state since the
+// previous snapshot (checkpointed partial progress included).
+func indexedDelta(before, after map[string]BranchState) int {
+	n := 0
+	for branch, st := range after {
+		known := make(map[string]bool, len(before[branch].IndexedCommits))
+		for _, sha := range before[branch].IndexedCommits {
+			known[sha] = true
+		}
+		for _, sha := range st.IndexedCommits {
+			if !known[sha] {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// metaDelta counts new/changed meta keys of one metadata phase.
+func metaDelta(before, after map[string]int64) int {
+	n := 0
+	for key, at := range after {
+		if old, ok := before[key]; !ok || old != at {
+			n++
+		}
+	}
+	return n
+}
+
+// resolveRepo resolves a requested repository against the discovery snapshot
+// (T111): an exact "namespace/path" match, otherwise a unique suffix match
+// (e.g. "fixture" or "grp/fixture"); no match and an ambiguous suffix are
+// errors — the latter lists the candidates.
+func resolveRepo(repos []provider.Repo, want string) (provider.Repo, error) {
+	want = strings.Trim(strings.TrimSpace(want), "/")
+	if want == "" {
+		return provider.Repo{}, errors.New("refresh: empty repository name")
+	}
+	var exact *provider.Repo
+	var suffix []provider.Repo
+	for i := range repos {
+		r := repos[i]
+		full := r.Namespace + "/" + r.Path
+		switch {
+		case full == want:
+			exact = &repos[i]
+		case strings.HasSuffix(full, "/"+want):
+			suffix = append(suffix, r)
+		}
+	}
+	if exact != nil {
+		return *exact, nil
+	}
+	switch len(suffix) {
+	case 0:
+		return provider.Repo{}, fmt.Errorf("refresh: repository %q not found in the discovery snapshot", want)
+	case 1:
+		return suffix[0], nil
+	default:
+		names := make([]string, 0, len(suffix))
+		for _, r := range suffix {
+			names = append(names, r.Namespace+"/"+r.Path)
+		}
+		sort.Strings(names)
+		return provider.Repo{}, fmt.Errorf("refresh: repository %q is ambiguous: %s", want, strings.Join(names, ", "))
+	}
+}

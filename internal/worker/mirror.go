@@ -60,18 +60,21 @@ func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 	sum.log(logger)
 }
 
-// mirrorRepo mirrors a single repository and records LastFetchAt.
+// mirrorRepo mirrors a single repository and records LastFetchAt; the per-repo
+// lock (T110) serializes it with the index/metadata lanes and the refresh.
 func mirrorRepo(ctx context.Context, vcsType string, eng *gitengine.Engine, logger *slog.Logger, repo provider.Repo) error {
-	name := repo.Namespace + "/" + repo.Path
-	mirror, err := eng.EnsureMirror(ctx, vcsType, repo)
-	if err != nil {
-		return fmt.Errorf("mirror: %w", err)
-	}
-	if err := updateState(gitengine.StatePath(mirror), func(st *MirrorState) {
-		st.LastFetchAt = time.Now().UTC()
-	}); err != nil {
-		return fmt.Errorf("state: %w", err)
-	}
-	logger.Info("mirror updated", "repo", name)
-	return nil
+	return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
+		name := repo.Namespace + "/" + repo.Path
+		mirror, err := eng.EnsureMirror(ctx, vcsType, repo)
+		if err != nil {
+			return fmt.Errorf("mirror: %w", err)
+		}
+		if err := updateState(gitengine.StatePath(mirror), func(st *MirrorState) {
+			st.LastFetchAt = time.Now().UTC()
+		}); err != nil {
+			return fmt.Errorf("state: %w", err)
+		}
+		logger.Info("mirror updated", "repo", name)
+		return nil
+	})
 }

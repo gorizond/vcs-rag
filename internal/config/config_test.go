@@ -19,6 +19,7 @@ var allEnv = []string{
 	"WORKER_CONCURRENCY", "MIRRORS_DIR",
 	"HISTORY_MAX_COMMITS", "MAX_FILE_BYTES", "CI_WINDOW",
 	"MCP_TRANSPORT", "MCP_ADDR",
+	"NATS_URL", "NATS_INSTANCE_ID",
 }
 
 // prepareEnv resets the environment and applies the test case.
@@ -42,7 +43,7 @@ func TestLoadValid(t *testing.T) {
 			name: "gitlab: groups, defaults",
 			env: map[string]string{
 				"GITLAB_GROUP_ID":     " 111, 222 ,,",
-				"GITLAB_TOKEN":        "glpat-token",
+				"GITLAB_TOKEN":        "glpat-EXAMPLE-NOT-A-TOKEN",
 				"EMBEDDINGS_PROVIDER": "ollama",
 			},
 			check: func(t *testing.T, cfg *Config) {
@@ -80,13 +81,49 @@ func TestLoadValid(t *testing.T) {
 				if cfg.MCP.Transport != "stdio" || cfg.MCP.Addr != ":8080" {
 					t.Errorf("default mcp: %+v", cfg.MCP)
 				}
+				// T108/T117: empty NATS_URL — the refresh mode is off (default instance).
+				if cfg.NATS.URL != "" || cfg.NATS.InstanceID != NATSDefaultInstance {
+					t.Errorf("default NATS = %+v, want empty URL / %q", cfg.NATS, NATSDefaultInstance)
+				}
+			},
+		},
+		{
+			name: "nats: url and instance id are loaded",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":     "1",
+				"GITLAB_TOKEN":        "t",
+				"EMBEDDINGS_PROVIDER": "ollama",
+				"NATS_URL":            "nats://127.0.0.1:4222",
+				"NATS_INSTANCE_ID":    "team-a",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.NATS.URL != "nats://127.0.0.1:4222" {
+					t.Errorf("NATS.URL = %q", cfg.NATS.URL)
+				}
+				if cfg.NATS.InstanceID != "team-a" {
+					t.Errorf("NATS.InstanceID = %q, want team-a", cfg.NATS.InstanceID)
+				}
+			},
+		},
+		{
+			name: "nats: instance id defaults",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":     "1",
+				"GITLAB_TOKEN":        "t",
+				"EMBEDDINGS_PROVIDER": "ollama",
+				"NATS_URL":            "nats://127.0.0.1:4222",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.NATS.InstanceID != NATSDefaultInstance {
+					t.Errorf("NATS.InstanceID = %q, want %q", cfg.NATS.InstanceID, NATSDefaultInstance)
+				}
 			},
 		},
 		{
 			name: "github: organization, custom values",
 			env: map[string]string{
 				"GITHUB_ORG":          "acme, inc",
-				"GITHUB_TOKEN":        "ghp-token",
+				"GITHUB_TOKEN":        "ghp-EXAMPLE-NOT-A-TOKEN",
 				"GITHUB_BASE_URL":     "https://ghe.example.com/api/v3",
 				"EMBEDDINGS_PROVIDER": "lm-studio",
 				"WORKER_INTERVAL":     "90s",
@@ -212,6 +249,16 @@ func TestLoadErrors(t *testing.T) {
 			wantProblem: "WORKER_META_INTERVAL",
 		},
 		{
+			name: "nats: invalid instance id (mode on)",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama",
+				"NATS_URL":            "nats://127.0.0.1:4222",
+				"NATS_INSTANCE_ID":    "Bad Id",
+			},
+			wantProblem: "NATS_INSTANCE_ID",
+		},
+		{
 			name: "mcp: invalid transport",
 			env: map[string]string{
 				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
@@ -243,8 +290,8 @@ func TestLoadErrors(t *testing.T) {
 
 // TestSecretNotLeaked: token values do not appear in the error text.
 func TestSecretNotLeaked(t *testing.T) {
-	const gitlabSecret = "glpat-SUPERSECRET-123"
-	const githubSecret = "ghp-ANOTHER-SECRET-456"
+	const gitlabSecret = "glpat-EXAMPLE-NOT-A-TOKEN"
+	const githubSecret = "ghp-EXAMPLE-NOT-A-TOKEN"
 	prepareEnv(t, map[string]string{
 		"GITLAB_GROUP_ID":     "1",
 		"GITLAB_TOKEN":        gitlabSecret,

@@ -26,6 +26,8 @@ One binary — two modes:
 | `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | discovery/index pass tick and concurrency |
 | `WORKER_META_INTERVAL` / `WORKER_MIRROR_INTERVAL` | metadata / mirror pass tick (default — `WORKER_INTERVAL`) |
 | `MIRRORS_DIR` | bare mirror directory (default `./mirrors`) |
+| `NATS_URL` | local JetStream for on-demand refresh (`refresh_repo`); empty — the feature is off |
+| `NATS_INSTANCE_ID` | instance id scoping consumers/subjects/KV on a shared NATS (default `default`) |
 
 Switching GitLab ↔ GitHub is env-only: the core does not change (both providers
 share one interface and pass one contract suite).
@@ -37,6 +39,12 @@ full. Deleting `*.state.json` resets this cache ([`docs/reindex.md`](docs/reinde
 
 `git fetch` runs on the mirror lane only (`WORKER_MIRROR_INTERVAL`); the index
 lane reads the local mirror — network access only for the initial clone.
+
+With `NATS_URL` set, the MCP adds the `refresh_repo` tool: the LLM can pull one
+repository's fresh commits and metadata before searching (the worker executes
+the task from the local JetStream). `NATS_INSTANCE_ID` scopes the consumer,
+subject and KV bucket, so several deployments can share one NATS server — see
+[`docs/refresh.md`](docs/refresh.md) for the full flow, semantics and limits.
 
 Embeddings — the target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
 (`ollama pull bge-m3`) or in LM Studio (GGUF build, e.g. `lm-kit/bge-m3-gguf`;
@@ -76,6 +84,25 @@ Private repositories: the token is passed to git processes through the
 environment (`http.extraHeader`, Basic: GitLab `oauth2:<token>`, GitHub
 `x-access-token:<token>`) — it is not stored in the clone URL or the mirror's
 `.git/config`; local git operations run without the token.
+
+## Deploy example
+
+`docker-compose.yml` (repository root) brings up the whole stack — worker, MCP
+search, Qdrant and a local NATS JetStream:
+
+```bash
+GITLAB_GROUP_ID=<your-group-id> GITLAB_TOKEN=<your-read-api-token> docker compose up -d
+# or put the same variables into a local .env (never commit real values)
+```
+
+- The embeddings endpoint points at your Ollama/LM Studio
+  (`EMBEDDINGS_BASE_URL`, default `http://host.docker.internal:11434`; on Linux
+  the compose file adds `host.docker.internal:host-gateway`).
+- MCP is exposed on `http://127.0.0.1:8080/mcp` (`MCP_TRANSPORT=sse`).
+- `NATS_URL` enables `refresh_repo`; `NATS_INSTANCE_ID` allows several
+  deployments on one NATS server.
+- All values in the compose file are `${ENV}` placeholders or example values —
+  no real tokens, groups or private endpoints belong in the repository.
 
 ## MCP: Cursor / Claude
 

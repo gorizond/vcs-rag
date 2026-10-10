@@ -1,0 +1,87 @@
+# vcs-rag deploy example: worker + MCP search + Qdrant + local NATS JetStream.
+# Every secret/endpoint below is an ${ENV} placeholder or an example value —
+# never put real tokens, groups or private endpoints into the repository.
+services:
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222" # client
+      - "127.0.0.1:8222:8222" # monitoring (/jsz)
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.2
+    ports:
+      - "127.0.0.1:6333:6333" # REST
+      - "127.0.0.1:6334:6334" # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+  worker:
+    image: ${VCS_RAG_IMAGE:-ghcr.io/gorizond/vcs-rag:latest} # or build: .
+    command: ["-mode=worker"]
+    environment:
+      # VCS source (exactly one provider): placeholders — set them via env/.env
+      GITLAB_GROUP_ID: "${GITLAB_GROUP_ID:-<your-group-id>}"
+      GITLAB_TOKEN: "${GITLAB_TOKEN:-<your-read-api-token>}"
+      # GITHUB_ORG: "${GITHUB_ORG:-<your-org>}"
+      # GITHUB_TOKEN: "${GITHUB_TOKEN:-<your-token>}"
+      EMBEDDINGS_PROVIDER: "${EMBEDDINGS_PROVIDER:-ollama}"
+      EMBEDDINGS_BASE_URL: "${EMBEDDINGS_BASE_URL:-http://host.docker.internal:11434}"
+      EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-bge-m3}"
+      EMBEDDINGS_DIM: "${EMBEDDINGS_DIM:-1024}"
+      QDRANT_URL: "http://qdrant:6334"
+      QDRANT_COLLECTION: "${QDRANT_COLLECTION:-vcs_rag}"
+      MIRRORS_DIR: "/mirrors"
+      # Background lanes: the per-lane ticks default to WORKER_INTERVAL
+      WORKER_INTERVAL: "${WORKER_INTERVAL:-60s}"
+      WORKER_META_INTERVAL: "${WORKER_META_INTERVAL:-}"
+      WORKER_MIRROR_INTERVAL: "${WORKER_MIRROR_INTERVAL:-}"
+      # On-demand refresh by the LLM (empty NATS_URL disables the feature)
+      NATS_URL: "nats://nats:4222"
+      NATS_INSTANCE_ID: "${NATS_INSTANCE_ID:-default}"
+    volumes:
+      - mirrors:/mirrors
+    depends_on:
+      - nats
+      - qdrant
+    extra_hosts:
+      # Linux: reach an Ollama/LM Studio on the host (no-op on Docker Desktop)
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  mcp:
+    image: ${VCS_RAG_IMAGE:-ghcr.io/gorizond/vcs-rag:latest} # or build: .
+    command: ["-mode=mcp"]
+    environment:
+      # search needs no VCS access: the provider env is validation-only
+      GITLAB_GROUP_ID: "1"
+      GITLAB_TOKEN: "dummy"
+      EMBEDDINGS_PROVIDER: "${EMBEDDINGS_PROVIDER:-ollama}"
+      EMBEDDINGS_BASE_URL: "${EMBEDDINGS_BASE_URL:-http://host.docker.internal:11434}"
+      EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-bge-m3}"
+      EMBEDDINGS_DIM: "${EMBEDDINGS_DIM:-1024}"
+      QDRANT_URL: "http://qdrant:6334"
+      QDRANT_COLLECTION: "${QDRANT_COLLECTION:-vcs_rag}"
+      MCP_TRANSPORT: "sse"
+      MCP_ADDR: ":8080"
+      # refresh_repo is registered only when NATS_URL is set
+      NATS_URL: "nats://nats:4222"
+      NATS_INSTANCE_ID: "${NATS_INSTANCE_ID:-default}"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - nats
+      - qdrant
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  nats-data:
+  qdrant-data:
+  mirrors:

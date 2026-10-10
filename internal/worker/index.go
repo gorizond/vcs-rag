@@ -76,7 +76,10 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 			}
 			defer p.Release()
 			sum.countRepo(processSafely(ctx, deps.Logger, repo, "index", func() error {
-				return ProcessRepoOnce(ctx, deps, repo)
+				// T110: the per-repo lock is taken at the call site only.
+				return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
+					return ProcessRepoOnce(ctx, deps, repo)
+				})
 			}))
 		}(repo)
 	}

@@ -54,7 +54,10 @@ func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 			}
 			defer p.Release()
 			sum.countRepo(processSafely(ctx, deps.Logger, repo, "metadata", func() error {
-				return ProcessMetadataOnce(ctx, deps, repo)
+				// T110: the per-repo lock is taken at the call site only.
+				return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
+					return ProcessMetadataOnce(ctx, deps, repo)
+				})
 			}))
 		}(repo)
 	}

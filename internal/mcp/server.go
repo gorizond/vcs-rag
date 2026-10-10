@@ -7,6 +7,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -34,7 +35,27 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 		&mcp.Implementation{Name: "vcs-rag", Version: version},
 		&mcp.ServerOptions{Logger: logger},
 	)
-	registerTools(server, &tools{embedder: emb, searcher: st})
+
+	// T113/T119: refresh_repo is registered only with NATS_URL set; the
+	// subject/KV names come from the instance id; search itself keeps working
+	// regardless of the NATS availability.
+	tl := newTools(emb, st, nil)
+	if cfg.NATS.URL != "" {
+		names := config.RefreshNames(cfg.NATS.InstanceID)
+		ref, err := connectRefreshClient(cfg.NATS.URL, names)
+		if err != nil {
+			return fmt.Errorf("nats: %w", err)
+		}
+		defer ref.Close()
+		if ref.Connected() {
+			logger.Info("NATS connected", "instance", names.InstanceID)
+		} else {
+			logger.Warn("NATS unreachable, reconnecting in background", "instance", names.InstanceID)
+		}
+		tl.refresher = ref
+		tl.inflight = newFlightGroup()
+	}
+	registerTools(server, tl)
 
 	if cfg.MCP.Transport == "sse" {
 		return runHTTP(ctx, cfg, logger, server)
