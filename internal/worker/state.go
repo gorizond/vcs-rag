@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -21,13 +22,16 @@ type BranchState struct {
 type MirrorState struct {
 	LastFetchAt time.Time              `json:"last_fetch_at"`
 	Branches    map[string]BranchState `json:"branches"`
+	// Meta is the incremental metadata cache (T080): key → updated_at unix:
+	// "issue:<id>", "mr:<id>", "ci:<pipeline>:<job>".
+	Meta map[string]int64 `json:"meta,omitempty"`
 }
 
 // LoadState reads the state; a missing file yields an empty state.
 func LoadState(path string) (*MirrorState, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return &MirrorState{Branches: map[string]BranchState{}}, nil
+		return &MirrorState{Branches: map[string]BranchState{}, Meta: map[string]int64{}}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("state %s: %w", path, err)
@@ -39,6 +43,9 @@ func LoadState(path string) (*MirrorState, error) {
 	if st.Branches == nil {
 		st.Branches = map[string]BranchState{}
 	}
+	if st.Meta == nil {
+		st.Meta = map[string]int64{}
+	}
 	return st, nil
 }
 
@@ -49,6 +56,11 @@ func SaveState(path string, st *MirrorState) error {
 		return err
 	}
 	data = append(data, '\n')
+	// The metadata lane writes state before the mirror exists (no clone yet),
+	// so the parent directory may be missing.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("state %s: %w", path, err)
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return fmt.Errorf("state %s: %w", path, err)

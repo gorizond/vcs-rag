@@ -1,12 +1,20 @@
 package worker
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gorizond/vcs-rag/internal/embed"
+	"github.com/gorizond/vcs-rag/internal/gitengine"
 	"github.com/gorizond/vcs-rag/internal/provider"
+	"github.com/gorizond/vcs-rag/internal/provider/fake"
+	"github.com/gorizond/vcs-rag/internal/store"
 )
 
 // Golden IDs match the values in internal/store/payload_test.go
@@ -108,5 +116,209 @@ func TestJobFailed(t *testing.T) {
 	}
 	if jobFailed(provider.Job{Status: "success", Conclusion: "success"}) {
 		t.Error("success treated as a failure")
+	}
+}
+
+// --- T080: incremental metadata (skip unchanged, CI once) ---
+
+// countingEmbed is an embed.Provider double: counts calls and texts.
+type countingEmbed struct {
+	calls int
+	texts int
+}
+
+func (c *countingEmbed) Dim() int { return 4 }
+
+func (c *countingEmbed) Embed(_ context.Context, texts []string) ([][]float32, error) {
+	c.calls++
+	c.texts += len(texts)
+	vecs := make([][]float32, len(texts))
+	for i := range vecs {
+		vecs[i] = []float32{1, 0, 0, 0}
+	}
+	return vecs, nil
+}
+
+// countingStore is a metaStore double: records upserts/deletes, serves the
+// configured existing ci points for prune.
+type countingStore struct {
+	upserts  [][]store.Point
+	deletes  [][2]string
+	existing []store.ScoredPoint
+}
+
+func (c *countingStore) Upsert(_ context.Context, points []store.Point) error {
+	c.upserts = append(c.upserts, points)
+	return nil
+}
+
+func (c *countingStore) ScrollCIFailures(_ context.Context, _ string, _ uint32) ([]store.ScoredPoint, error) {
+	return c.existing, nil
+}
+
+func (c *countingStore) DeleteCIFailure(_ context.Context, _, pipelineID, jobID string) error {
+	c.deletes = append(c.deletes, [2]string{pipelineID, jobID})
+	return nil
+}
+
+// points returns every upserted point.
+func (c *countingStore) points() []store.Point {
+	var out []store.Point
+	for _, batch := range c.upserts {
+		out = append(out, batch...)
+	}
+	return out
+}
+
+// newMetaDeps builds RepoDeps for a metadata pass without Qdrant (Store is
+// passed to processMetadataOnce separately; the engine only resolves the state path).
+func newMetaDeps(t *testing.T, vcs provider.VCSProvider, emb embed.Provider, logger *slog.Logger) RepoDeps {
+	t.Helper()
+	return RepoDeps{
+		VCSType: "gitlab",
+		VCS:     vcs,
+		Engine:  gitengine.New(t.TempDir()),
+		Embed:   emb,
+		Logger:  logger,
+	}
+}
+
+// T080 (a)/(b)/(c): the first pass is full; an unchanged pass re-embeds
+// nothing (skipped=all); a changed item is embedded alone.
+func TestMetadataIncrementalIssuesPRs(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Unix(1000, 0)
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	vcs := &fake.Provider{
+		Repos: []provider.Repo{repo},
+		Issues: map[string][]provider.Issue{
+			"1": {{ID: 1, Title: "Issue", UpdatedAt: t0}},
+		},
+		ChangeRequests: map[string][]provider.ChangeRequest{
+			"1": {{ID: 2, Title: "PR", UpdatedAt: t0}},
+		},
+	}
+	emb := &countingEmbed{}
+	var logBuf bytes.Buffer
+	deps := newMetaDeps(t, vcs, emb, slog.New(slog.NewTextHandler(&logBuf, nil)))
+	st := &countingStore{}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	// (a) first pass (empty state) — everything is embedded and written.
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if emb.texts != 2 || len(st.points()) != 2 {
+		t.Errorf("first pass: embed texts = %d, upserted = %d, want 2/2", emb.texts, len(st.points()))
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if saved.Meta["issue:1"] != t0.Unix() || saved.Meta["mr:2"] != t0.Unix() {
+		t.Errorf("state meta = %v, want issue:1/mr:2 = %d", saved.Meta, t0.Unix())
+	}
+
+	// (b) unchanged pass — no re-embed, no upsert, skipped=2 in the log.
+	embTexts, upserted := emb.texts, len(st.points())
+	logBuf.Reset()
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if emb.texts != embTexts || len(st.points()) != upserted {
+		t.Errorf("unchanged pass: embed texts %d→%d, points %d→%d, want no growth",
+			embTexts, emb.texts, upserted, len(st.points()))
+	}
+	if !strings.Contains(logBuf.String(), "skipped=2") {
+		t.Errorf("log does not report skipped=2: %q", logBuf.String())
+	}
+
+	// (c) one changed item (updated_at++) — only it is embedded.
+	vcs.ChangeRequests["1"] = []provider.ChangeRequest{
+		{ID: 2, Title: "PR v2", UpdatedAt: t0.Add(time.Second)},
+	}
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("third pass: %v", err)
+	}
+	if emb.texts != embTexts+1 {
+		t.Errorf("changed pass: embed texts = %d, want %d", emb.texts, embTexts+1)
+	}
+	got := st.points()
+	if len(got) != upserted+1 || got[len(got)-1].ID != store.PullRequestID("gitlab", "r", 2) {
+		t.Errorf("changed pass: upserted %d points, want the changed PR only", len(got)-upserted)
+	}
+	saved, err = LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if saved.Meta["mr:2"] != t0.Add(time.Second).Unix() {
+		t.Errorf("state mr:2 = %d, want %d", saved.Meta["mr:2"], t0.Add(time.Second).Unix())
+	}
+}
+
+// T080 (d): a failed CI job is embedded once; a rerun (new job id) is
+// embedded again; prune removes the point and its state key.
+func TestMetadataIncrementalCIOnce(t *testing.T) {
+	ctx := context.Background()
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	failed := provider.Pipeline{ID: "100", Status: "failed", Ref: "main", SHA: "abc",
+		Jobs: []provider.Job{{ID: "1000", Name: "build", Status: "failed"}}}
+	vcs := &fake.Provider{
+		Repos:     []provider.Repo{repo},
+		Pipelines: map[string][]provider.Pipeline{"1": {failed}},
+		Logs:      map[string]string{"1000": "boom\n"},
+	}
+	emb := &countingEmbed{}
+	deps := newMetaDeps(t, vcs, emb, testLogger())
+	st := &countingStore{}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if emb.texts != 1 || len(st.points()) != 1 {
+		t.Fatalf("first pass: embed texts = %d, points = %d, want 1/1", emb.texts, len(st.points()))
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if saved.Meta["ci:100:1000"] != 1 {
+		t.Errorf("state ci:100:1000 = %d, want 1", saved.Meta["ci:100:1000"])
+	}
+
+	// repeated pass: the same job is not re-embedded.
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if emb.texts != 1 || len(st.points()) != 1 {
+		t.Errorf("repeat: embed texts = %d, points = %d, want unchanged", emb.texts, len(st.points()))
+	}
+
+	// a rerun gets a new job id → embedded once more.
+	vcs.Pipelines["1"] = []provider.Pipeline{{ID: "100", Status: "failed", Ref: "main", SHA: "abc",
+		Jobs: []provider.Job{{ID: "1001", Name: "build", Status: "failed"}}}}
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("rerun: %v", err)
+	}
+	if emb.texts != 2 || len(st.points()) != 2 {
+		t.Errorf("rerun: embed texts = %d, points = %d, want 2/2", emb.texts, len(st.points()))
+	}
+
+	// the window no longer has failures and the old point exists → prune + state cleanup.
+	st.existing = []store.ScoredPoint{{Payload: map[string]any{"pipeline_id": "100", "job_id": "1000"}}}
+	vcs.Pipelines["1"] = []provider.Pipeline{{ID: "100", Status: "success", Ref: "main", SHA: "abc"}}
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("prune pass: %v", err)
+	}
+	if len(st.deletes) != 1 || st.deletes[0] != [2]string{"100", "1000"} {
+		t.Errorf("prune deletes = %v, want 100/1000", st.deletes)
+	}
+	saved, err = LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(saved.Meta) != 0 {
+		t.Errorf("state ci keys not pruned: %v", saved.Meta)
 	}
 }

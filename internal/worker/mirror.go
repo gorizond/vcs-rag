@@ -14,13 +14,14 @@ import (
 )
 
 // runMirror is the continuous mirror refresh lane (T040): on the
-// WORKER_INTERVAL tick it mirrors repositories from the discovery registry,
-// concurrency — WORKER_CONCURRENCY; errors do not break the loop (FR-014).
+// WORKER_MIRROR_INTERVAL tick (default WORKER_INTERVAL) it mirrors
+// repositories from the discovery registry, concurrency — WORKER_CONCURRENCY;
+// errors do not break the loop (FR-014).
 func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "mirror")
 	mirrorAll(ctx, cfg, vcsType, eng, logger, snap)
 
-	ticker := time.NewTicker(cfg.Worker.Interval)
+	ticker := time.NewTicker(cfg.Worker.MirrorInterval)
 	defer ticker.Stop()
 	for {
 		select {

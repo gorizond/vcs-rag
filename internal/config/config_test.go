@@ -15,7 +15,8 @@ var allEnv = []string{
 	"EMBEDDINGS_PROVIDER", "EMBEDDINGS_BASE_URL", "EMBEDDINGS_MODEL",
 	"EMBEDDINGS_DIM", "EMBEDDINGS_BATCH",
 	"QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION",
-	"WORKER_INTERVAL", "WORKER_CONCURRENCY", "MIRRORS_DIR",
+	"WORKER_INTERVAL", "WORKER_META_INTERVAL", "WORKER_MIRROR_INTERVAL",
+	"WORKER_CONCURRENCY", "MIRRORS_DIR",
 	"HISTORY_MAX_COMMITS", "MAX_FILE_BYTES", "CI_WINDOW",
 	"MCP_TRANSPORT", "MCP_ADDR",
 }
@@ -71,6 +72,11 @@ func TestLoadValid(t *testing.T) {
 					cfg.Worker.MaxFileBytes != 1048576 || cfg.Worker.CIWindow != 50 {
 					t.Errorf("default worker: %+v", cfg.Worker)
 				}
+				// T080: the dedicated lanes default to WORKER_INTERVAL.
+				if cfg.Worker.MetaInterval != 60*time.Second || cfg.Worker.MirrorInterval != 60*time.Second {
+					t.Errorf("lane intervals = %v/%v, want 60s/60s",
+						cfg.Worker.MetaInterval, cfg.Worker.MirrorInterval)
+				}
 				if cfg.MCP.Transport != "stdio" || cfg.MCP.Addr != ":8080" {
 					t.Errorf("default mcp: %+v", cfg.MCP)
 				}
@@ -100,6 +106,30 @@ func TestLoadValid(t *testing.T) {
 				}
 				if cfg.Worker.Interval != 90*time.Second {
 					t.Errorf("Interval = %v, want 90s", cfg.Worker.Interval)
+				}
+				// T080: WORKER_INTERVAL propagates to the lane defaults.
+				if cfg.Worker.MetaInterval != 90*time.Second || cfg.Worker.MirrorInterval != 90*time.Second {
+					t.Errorf("lane intervals = %v/%v, want 90s/90s",
+						cfg.Worker.MetaInterval, cfg.Worker.MirrorInterval)
+				}
+			},
+		},
+		{
+			name: "worker: separate meta/mirror intervals",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":        "1",
+				"GITLAB_TOKEN":           "t",
+				"EMBEDDINGS_PROVIDER":    "ollama",
+				"WORKER_META_INTERVAL":   "15m",
+				"WORKER_MIRROR_INTERVAL": "2m",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Worker.Interval != 60*time.Second {
+					t.Errorf("Interval = %v, want the 60s default", cfg.Worker.Interval)
+				}
+				if cfg.Worker.MetaInterval != 15*time.Minute || cfg.Worker.MirrorInterval != 2*time.Minute {
+					t.Errorf("lane intervals = %v/%v, want 15m/2m",
+						cfg.Worker.MetaInterval, cfg.Worker.MirrorInterval)
 				}
 			},
 		},
@@ -172,6 +202,14 @@ func TestLoadErrors(t *testing.T) {
 				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_INTERVAL": "abc",
 			},
 			wantProblem: "WORKER_INTERVAL",
+		},
+		{
+			name: "worker: invalid meta interval",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_META_INTERVAL": "abc",
+			},
+			wantProblem: "WORKER_META_INTERVAL",
 		},
 		{
 			name: "mcp: invalid transport",

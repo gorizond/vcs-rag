@@ -26,6 +26,9 @@ case (**0 mixed vectors**).
    find <MIRRORS_DIR> -name '*.state.json' -delete
    ```
 
+   The deletion also resets the incremental metadata cache — issues/MR/CI points
+   are re-embedded in full.
+
 4. **Start the worker** with the new configuration:
 
    ```bash

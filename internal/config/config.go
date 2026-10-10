@@ -50,8 +50,10 @@ type Qdrant struct {
 
 // Worker holds background loop parameters (FR-005/006/018).
 type Worker struct {
-	Interval          time.Duration
-	Concurrency       int // ponytail: starting default, to be refined based on facts
+	Interval          time.Duration // discovery/index pass tick (WORKER_INTERVAL)
+	MetaInterval      time.Duration // metadata pass tick (WORKER_META_INTERVAL, default Interval)
+	MirrorInterval    time.Duration // mirror pass tick (WORKER_MIRROR_INTERVAL, default Interval)
+	Concurrency       int           // ponytail: starting default, to be refined based on facts
 	MirrorsDir        string
 	HistoryMaxCommits int   // ponytail: starting default, to be refined based on facts
 	MaxFileBytes      int64 // ponytail: starting default, to be refined based on facts
@@ -171,6 +173,15 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// the dedicated lanes default to the common tick (T080).
+	metaInterval, err := envDuration("WORKER_META_INTERVAL", interval)
+	if err != nil {
+		return nil, err
+	}
+	mirrorInterval, err := envDuration("WORKER_MIRROR_INTERVAL", interval)
+	if err != nil {
+		return nil, err
+	}
 	concurrency, err := envInt("WORKER_CONCURRENCY", 4)
 	if err != nil {
 		return nil, err
@@ -189,6 +200,8 @@ func Load() (*Config, error) {
 	}
 	cfg.Worker = Worker{
 		Interval:          interval,
+		MetaInterval:      metaInterval,
+		MirrorInterval:    mirrorInterval,
 		Concurrency:       concurrency,
 		MirrorsDir:        envDefault("MIRRORS_DIR", "./mirrors"),
 		HistoryMaxCommits: historyMax,

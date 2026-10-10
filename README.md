@@ -23,11 +23,17 @@ One binary — two modes:
 | `EMBEDDINGS_DIM` | vector dimension (default 1024) |
 | `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant gRPC address and collection name |
 | `MCP_TRANSPORT` / `MCP_ADDR` | `stdio` (default) or `sse`; address for sse |
-| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | pass tick and concurrency |
+| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | discovery/index pass tick and concurrency |
+| `WORKER_META_INTERVAL` / `WORKER_MIRROR_INTERVAL` | metadata / mirror pass tick (default — `WORKER_INTERVAL`) |
 | `MIRRORS_DIR` | bare mirror directory (default `./mirrors`) |
 
 Switching GitLab ↔ GitHub is env-only: the core does not change (both providers
 share one interface and pass one contract suite).
+
+Metadata (issues, MR/PR, CI failures) is indexed incrementally: a point is
+re-embedded only when its source `updated_at` changed; a CI job is indexed once
+(a rerun gets new `(pipeline, job)` ids); the first pass over a repository is
+full. Deleting `*.state.json` resets this cache ([`docs/reindex.md`](docs/reindex.md)).
 
 Embeddings — the target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
 (`ollama pull bge-m3`) or in LM Studio (GGUF build, e.g. `lm-kit/bge-m3-gguf`;
