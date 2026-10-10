@@ -26,7 +26,18 @@ Self-hosted, VCS-agnostic RAG-сервис по исходному коду и �
 ```bash
 docker build -t vcs-rag:dev .
 docker run --rm vcs-rag:dev            # → vcs-rag dev
+docker run --rm vcs-rag:dev -version   # → vcs-rag <version>
 docker run --rm vcs-rag:dev -mode=worker
+```
+
+## Релиз
+
+Образы — `ghcr.io/gorizond/vcs-rag:<tag>` (semver-теги + `latest`); версия
+вшивается на сборке (`--build-arg VERSION=...` из имени git-тега, release-workflow):
+
+```bash
+docker pull ghcr.io/gorizond/vcs-rag:v0.0.1
+docker run --rm ghcr.io/gorizond/vcs-rag:v0.0.1 -version   # → vcs-rag v0.0.1
 ```
 
 Полные контракты (CLI, MCP-инструменты, схема Qdrant) — в spec-kit проекта
