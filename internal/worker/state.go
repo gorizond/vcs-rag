@@ -25,6 +25,9 @@ type MirrorState struct {
 	// Meta is the incremental metadata cache (T080): key → updated_at unix:
 	// "issue:<id>", "mr:<id>", "ci:<pipeline>:<job>".
 	Meta map[string]int64 `json:"meta,omitempty"`
+	// MetaSyncedAt is the end of the last successful metadata pass (T135):
+	// an "auto"-origin refresh skips the metadata phase when it is fresh.
+	MetaSyncedAt time.Time `json:"meta_synced_at"`
 }
 
 // LoadState reads the state; a missing file yields an empty state.

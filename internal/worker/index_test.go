@@ -175,6 +175,30 @@ func TestIndexCheckpointResumes(t *testing.T) {
 	}
 }
 
+// T130: the index lane yields while a refresh is active; with the flag off the
+// dispatch happens exactly as before (negative control).
+func TestIndexAllYieldsToRefresh(t *testing.T) {
+	ctx := context.Background()
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture", CloneURL: "file:///nonexistent/void.git"}
+	deps, _ := newIndexDeps(t, repo)
+	deps.Cfg.Worker.Concurrency = 2
+	snap := &snapshot{}
+	snap.set([]provider.Repo{repo})
+
+	t.Cleanup(func() { refreshActive.Store(false) })
+	refreshActive.Store(true)
+	sum := indexAll(ctx, deps.Cfg, deps, snap)
+	refreshActive.Store(false)
+	if sum != nil {
+		t.Errorf("the index pass ran while a refresh was active: %+v", sum)
+	}
+
+	sum = indexAll(ctx, deps.Cfg, deps, snap)
+	if sum == nil || sum.failed.Load() != 1 {
+		t.Errorf("flag off: summary = %+v, want a dispatched pass with 1 error", sum)
+	}
+}
+
 // TestIndexPassPreservesConcurrentLanes — T089: a meta/last_fetch_at write
 // landing DURING the index pass (simulated in the store hook, after the state
 // was loaded) survives the pass, and a following no-change pass keeps it.

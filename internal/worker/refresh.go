@@ -37,18 +37,24 @@ type RefreshResult struct {
 // snapshot — the listing has not produced data yet).
 var errRefreshTransient = errors.New("transient")
 
+// metaAutoFresh is the freshness window of the metadata phase for "auto"
+// refreshes (T135): a non-user trigger skips metadata when it ran recently.
+const metaAutoFresh = time.Hour
+
 // RefreshOnce performs an on-demand refresh of one repository (T111): fetch
 // (mirror-lane semantics) → index new commits (per-commit checkpoints, T088) →
 // metadata. An error of a phase does not cancel the next one — it is collected
 // in Errors. The whole composition runs under the per-repo lock (T110); the
 // NATS consumer is the production caller (T112). The idempotent checkpointed
-// pipelines make a redelivery safe.
+// pipelines make a redelivery safe. The exported wrapper is an explicit request
+// (origin ""): it always refreshes metadata.
 func RefreshOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) RefreshResult {
-	return refreshOnce(ctx, deps, deps.Store, deps.Store, repo)
+	return refreshOnce(ctx, deps, deps.Store, deps.Store, repo, "")
 }
 
-// refreshOnce is RefreshOnce over the narrow store interfaces (fakes in tests).
-func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaStore, repo provider.Repo) RefreshResult {
+// refreshOnce is RefreshOnce over the narrow store interfaces (fakes in tests);
+// origin "auto" marks a non-user trigger (T135).
+func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaStore, repo provider.Repo, origin string) RefreshResult {
 	start := time.Now()
 	res := RefreshResult{}
 	_ = withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
@@ -70,15 +76,23 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 		if after, err := LoadState(statePath); err == nil {
 			res.CommitsIndexed = indexedDelta(before.Branches, after.Branches)
 		}
-		// phase 3: metadata (best-effort).
+		// phase 3: metadata (best-effort). T135: an "auto" refresh skips it when
+		// the repository was metadata-synced recently — the background metadata
+		// lane covers it; an explicit request always refreshes metadata.
 		metaBefore, err := LoadState(statePath)
-		if err != nil {
+		switch {
+		case err != nil:
 			res.Errors = append(res.Errors, "state: "+err.Error())
-		} else if err := processMetadataOnce(ctx, deps, repo, meta); err != nil {
-			res.Errors = append(res.Errors, "metadata: "+err.Error())
-		}
-		if metaAfter, err := LoadState(statePath); err == nil && metaBefore != nil {
-			res.MetaUpdated = metaDelta(metaBefore.Meta, metaAfter.Meta)
+		case origin == "auto" && !metaBefore.MetaSyncedAt.IsZero() &&
+			time.Since(metaBefore.MetaSyncedAt) < metaAutoFresh:
+			// skip: the metadata phase is fresh enough
+		default:
+			if err := processMetadataOnce(ctx, deps, repo, meta); err != nil {
+				res.Errors = append(res.Errors, "metadata: "+err.Error())
+			}
+			if metaAfter, err := LoadState(statePath); err == nil {
+				res.MetaUpdated = metaDelta(metaBefore.Meta, metaAfter.Meta)
+			}
 		}
 		return nil
 	})

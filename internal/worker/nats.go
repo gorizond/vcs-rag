@@ -36,11 +36,20 @@ const (
 )
 
 // refreshTask is the published request (T112/T113 wire contract).
+// Origin "auto" marks a non-user trigger (T135): such a refresh skips the
+// metadata phase when the state has a fresh MetaSyncedAt.
 type refreshTask struct {
 	Repo      string `json:"repo"`
 	RequestID string `json:"request_id"`
 	TS        int64  `json:"ts"`
+	Origin    string `json:"origin,omitempty"`
 }
+
+// refreshActive is true while the consumer executes a refresh (T130): the index
+// lane yields (skips its dispatch) so the embeddings backend and the VCS rate
+// budget are left to the user-visible task. With NATS off the flag stays false
+// and the lanes behave exactly as before.
+var refreshActive atomic.Bool
 
 // refreshKV is the KV surface used by the worker consumer (fake in tests).
 type refreshKV interface {
@@ -219,7 +228,7 @@ type refreshConsumer struct {
 	source  refreshSource
 	kv      refreshKV
 	resolve func(id string) (provider.Repo, error)
-	run     func(ctx context.Context, repo provider.Repo) RefreshResult
+	run     func(ctx context.Context, repo provider.Repo, origin string) RefreshResult
 	logger  *slog.Logger
 	stats   refreshStats
 }
@@ -237,7 +246,9 @@ func newRefreshConsumer(source refreshSource, kv refreshKV, snap *snapshot, deps
 			}
 			return resolveRepo(repos, id)
 		},
-		run:    func(ctx context.Context, repo provider.Repo) RefreshResult { return RefreshOnce(ctx, deps, repo) },
+		run: func(ctx context.Context, repo provider.Repo, origin string) RefreshResult {
+			return refreshOnce(ctx, deps, deps.Store, deps.Store, repo, origin)
+		},
 		logger: logger,
 	}
 }
@@ -319,7 +330,10 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 		return
 	}
 
-	res := c.run(ctx, repo)
+	// T130: while the refresh runs, the index lane yields.
+	refreshActive.Store(true)
+	res := c.run(ctx, repo, task.Origin)
+	refreshActive.Store(false)
 	status := refreshStatus{
 		State: "done", RequestID: task.RequestID, StartedAt: started,
 		FinishedAt: time.Now().UTC(), CommitsIndexed: res.CommitsIndexed,

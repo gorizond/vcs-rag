@@ -214,7 +214,7 @@ func (m *fakeMsg) Nak() error           { m.naks++; return nil }
 func (m *fakeMsg) Term() error          { m.terms++; return nil }
 
 // newTestConsumer builds a consumer over fakes: resolution always succeeds.
-func newTestConsumer(kv refreshKV, run func(ctx context.Context, repo provider.Repo) RefreshResult) *refreshConsumer {
+func newTestConsumer(kv refreshKV, run func(ctx context.Context, repo provider.Repo, origin string) RefreshResult) *refreshConsumer {
 	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture"}
 	return &refreshConsumer{
 		kv:      kv,
@@ -237,7 +237,7 @@ func TestRefreshConsumerCoalesces(t *testing.T) {
 	ctx := context.Background()
 	kv := newFakeKV()
 	runs := 0
-	c := newTestConsumer(kv, func(context.Context, provider.Repo) RefreshResult {
+	c := newTestConsumer(kv, func(context.Context, provider.Repo, string) RefreshResult {
 		runs++
 		return RefreshResult{CommitsIndexed: 2}
 	})
@@ -285,7 +285,7 @@ func TestRefreshConsumerFailures(t *testing.T) {
 
 	// a partial failure before MaxDeliver → Nak (retry) with the KV failed kept.
 	kv := newFakeKV()
-	c := newTestConsumer(kv, func(context.Context, provider.Repo) RefreshResult {
+	c := newTestConsumer(kv, func(context.Context, provider.Repo, string) RefreshResult {
 		return RefreshResult{CommitsIndexed: 1, Errors: []string{"metadata: boom"}}
 	})
 	msg := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: 1}
@@ -302,7 +302,7 @@ func TestRefreshConsumerFailures(t *testing.T) {
 
 	// at MaxDeliver → Term (terminal) with the KV failed.
 	kv2 := newFakeKV()
-	c2 := newTestConsumer(kv2, func(context.Context, provider.Repo) RefreshResult {
+	c2 := newTestConsumer(kv2, func(context.Context, provider.Repo, string) RefreshResult {
 		return RefreshResult{Errors: []string{"index: boom"}}
 	})
 	last := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: refreshMaxDeliver}
@@ -320,7 +320,7 @@ func TestRefreshConsumerFailures(t *testing.T) {
 	kv3 := newFakeKV()
 	kv3.putErr = context.DeadlineExceeded
 	runs := 0
-	c3 := newTestConsumer(kv3, func(context.Context, provider.Repo) RefreshResult {
+	c3 := newTestConsumer(kv3, func(context.Context, provider.Repo, string) RefreshResult {
 		runs++
 		return RefreshResult{}
 	})
@@ -341,7 +341,7 @@ func TestRefreshConsumerFailures(t *testing.T) {
 	c4 := &refreshConsumer{
 		kv:      newFakeKV(),
 		resolve: func(string) (provider.Repo, error) { return provider.Repo{}, errRefreshTransient },
-		run:     func(context.Context, provider.Repo) RefreshResult { runs++; return RefreshResult{} },
+		run:     func(context.Context, provider.Repo, string) RefreshResult { runs++; return RefreshResult{} },
 		logger:  testLogger(),
 	}
 	empty := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: 1}
@@ -383,7 +383,7 @@ func TestRefreshConsumerE2E(t *testing.T) {
 		resolve: func(string) (provider.Repo, error) {
 			return provider.Repo{ID: "1", Namespace: "grp", Path: "fixture"}, nil
 		},
-		run: func(context.Context, provider.Repo) RefreshResult {
+		run: func(context.Context, provider.Repo, string) RefreshResult {
 			close(ran)
 			return RefreshResult{CommitsIndexed: 2, MetaUpdated: 1}
 		},

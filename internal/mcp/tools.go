@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -34,6 +35,8 @@ type tools struct {
 	searcher  Searcher
 	refresher refresher    // nil when NATS_URL is empty (refresh_repo is off)
 	inflight  *flightGroup // in-flight share of refresh_repo (T113)
+	repos     *repoIndex   // nil — the repo filter is passed through as before (T132)
+	auto      *autoClient  // nil when NATS_URL is empty — auto-refresh is off (T134)
 }
 
 // newTools assembles the tool set; a nil refresher disables refresh_repo.
@@ -51,14 +54,14 @@ type searchCodeInput struct {
 	Query    string `json:"query" jsonschema:"search query text"`
 	VCSType  string `json:"vcs_type,omitempty" jsonschema:"filter: gitlab | github"`
 	GroupOrg string `json:"group_org,omitempty" jsonschema:"GitLab group or GitHub organization"`
-	Repo     string `json:"repo,omitempty" jsonschema:"repository as shown in search results (e.g. 'nats', 'secrets/runner')"`
+	Repo     string `json:"repo,omitempty" jsonschema:"repository path, or a unique short form (e.g. \"nats\", \"secrets/runner\")"`
 	Branch   string `json:"branch,omitempty" jsonschema:"branch"`
 	TopK     int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
 
 type metadataQueryInput struct {
 	Query    string `json:"query" jsonschema:"search query text"`
-	Repo     string `json:"repo,omitempty" jsonschema:"repository path"`
+	Repo     string `json:"repo,omitempty" jsonschema:"repository path, or a unique short form (e.g. \"nats\", \"secrets/runner\")"`
 	GroupOrg string `json:"group_org,omitempty" jsonschema:"GitLab group or GitHub organization"`
 	State    string `json:"state,omitempty" jsonschema:"state: opened | closed | merged"`
 	TopK     int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
@@ -66,7 +69,7 @@ type metadataQueryInput struct {
 
 type ciFailuresInput struct {
 	Query  string `json:"query" jsonschema:"search query text"`
-	Repo   string `json:"repo,omitempty" jsonschema:"repository path"`
+	Repo   string `json:"repo,omitempty" jsonschema:"repository path, or a unique short form (e.g. \"nats\", \"secrets/runner\")"`
 	Branch string `json:"branch,omitempty" jsonschema:"branch"`
 	TopK   int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
@@ -154,13 +157,9 @@ func (t *tools) searchCode(ctx context.Context, _ *mcp.CallToolRequest, in searc
 	if err != nil {
 		return nil, errorResult(ctx, codeEmbedFailed, err), nil
 	}
-	points, err := t.searcher.Search(ctx, vec, store.Filter{
-		VCSType:  in.VCSType,
-		GroupOrg: in.GroupOrg,
-		Repo:     in.Repo,
-		Branch:   in.Branch,
-		Type:     "code",
-	}, clampTopK(in.TopK))
+	f := store.Filter{VCSType: in.VCSType, GroupOrg: in.GroupOrg, Branch: in.Branch, Type: "code"}
+	t.applyRepoFilter(ctx, &f, in.Repo, in.GroupOrg)
+	points, err := t.searcher.Search(ctx, vec, f, clampTopK(in.TopK))
 	if err != nil {
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
@@ -188,12 +187,9 @@ func (t *tools) searchPRs(ctx context.Context, _ *mcp.CallToolRequest, in metada
 	if err != nil {
 		return nil, errorResult(ctx, codeEmbedFailed, err), nil
 	}
-	points, err := t.searcher.Search(ctx, vec, store.Filter{
-		GroupOrg: in.GroupOrg,
-		Repo:     in.Repo,
-		Type:     "pull_request",
-		State:    in.State,
-	}, clampTopK(in.TopK))
+	f := store.Filter{GroupOrg: in.GroupOrg, Type: "pull_request", State: in.State}
+	t.applyRepoFilter(ctx, &f, in.Repo, in.GroupOrg)
+	points, err := t.searcher.Search(ctx, vec, f, clampTopK(in.TopK))
 	if err != nil {
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
@@ -222,12 +218,9 @@ func (t *tools) searchIssues(ctx context.Context, _ *mcp.CallToolRequest, in met
 	if err != nil {
 		return nil, errorResult(ctx, codeEmbedFailed, err), nil
 	}
-	points, err := t.searcher.Search(ctx, vec, store.Filter{
-		GroupOrg: in.GroupOrg,
-		Repo:     in.Repo,
-		Type:     "issue",
-		State:    in.State,
-	}, clampTopK(in.TopK))
+	f := store.Filter{GroupOrg: in.GroupOrg, Type: "issue", State: in.State}
+	t.applyRepoFilter(ctx, &f, in.Repo, in.GroupOrg)
+	points, err := t.searcher.Search(ctx, vec, f, clampTopK(in.TopK))
 	if err != nil {
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
@@ -254,11 +247,9 @@ func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, errorResult(ctx, codeEmbedFailed, err), nil
 	}
-	points, err := t.searcher.Search(ctx, vec, store.Filter{
-		Repo:   in.Repo,
-		Branch: in.Branch,
-		Type:   "ci_failure",
-	}, clampTopK(in.TopK))
+	f := store.Filter{Branch: in.Branch, Type: "ci_failure"}
+	t.applyRepoFilter(ctx, &f, in.Repo, "")
+	points, err := t.searcher.Search(ctx, vec, f, clampTopK(in.TopK))
 	if err != nil {
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
@@ -276,6 +267,65 @@ func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in
 		})
 	}
 	return nil, hits, nil
+}
+
+// splitRepoName splits a full "namespace/path" name into the payload pair:
+// group_org (the full namespace) and repo (the short path) — exactly as
+// worker/index.go stores them (r.Namespace, r.Path). A name without "/" is a
+// path-only repository (namespace empty).
+func splitRepoName(full string) (namespace, path string) {
+	if i := strings.LastIndex(full, "/"); i >= 0 {
+		return full[:i], full[i+1:]
+	}
+	return "", full
+}
+
+// applyRepoFilter resolves the repo input and fills the filter fields; the
+// auto-refresh decision runs on the resolved full name (T133-fix/T134).
+func (t *tools) applyRepoFilter(ctx context.Context, f *store.Filter, raw, groupOrg string) {
+	f.GroupOrg, f.Repo, f.RepoRefs = t.normalizeRepoFilter(ctx, raw, groupOrg)
+}
+
+// normalizeRepoFilter turns the raw repo input into the filter fields as
+// stored in the payload (repo is the short path, group_org the namespace):
+//   - one candidate — the direct pair (group_org=namespace, repo=short);
+//   - 2–16 candidates — RepoRefs (OR of pairs), the loose group_org is dropped;
+//   - none (no index / no match) — the raw value passthrough as before.
+//
+// The pair wins over a user-provided group_org: an exact match on group_org
+// requires the full namespace, not the top-level group name.
+func (t *tools) normalizeRepoFilter(ctx context.Context, raw, groupOrg string) (string, string, []store.RepoRef) {
+	raw = strings.Trim(strings.TrimSpace(raw), "/")
+	if raw == "" {
+		return "", "", nil
+	}
+	var candidates []string
+	if t.repos != nil {
+		if cs, err := t.repos.resolve(ctx, raw); err == nil {
+			candidates = cs
+		}
+	}
+	if t.auto != nil {
+		t.auto.beforeSearch(ctx, raw, candidates)
+	}
+	switch len(candidates) {
+	case 0:
+		return groupOrg, raw, nil
+	case 1:
+		ns, path := splitRepoName(candidates[0])
+		if ns == "" {
+			ns = groupOrg
+		}
+		return ns, path, nil
+	default:
+		candidates = clampCandidates(candidates)
+		refs := make([]store.RepoRef, 0, len(candidates))
+		for _, c := range candidates {
+			ns, path := splitRepoName(c)
+			refs = append(refs, store.RepoRef{GroupOrg: ns, Repo: path})
+		}
+		return "", "", refs
+	}
 }
 
 // queryVector computes the embedding of the search query.

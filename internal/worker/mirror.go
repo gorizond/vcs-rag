@@ -13,32 +13,43 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// runMirror is the continuous mirror refresh lane (T040): on the
-// WORKER_MIRROR_INTERVAL tick (default WORKER_INTERVAL) it mirrors
-// repositories from the discovery registry, concurrency — WORKER_CONCURRENCY;
-// errors do not break the loop (FR-014).
+// runMirror is the continuous mirror refresh lane (T040): an adaptive paced
+// loop (T129) — WORKER_MIRROR_INTERVAL (default WORKER_INTERVAL) is the
+// ceiling, not a tick; concurrency — WORKER_CONCURRENCY. Errors do not break
+// the loop (FR-014).
 func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "mirror")
-	mirrorAll(ctx, cfg, vcsType, eng, logger, snap)
-
-	ticker := time.NewTicker(cfg.Worker.MirrorInterval)
-	defer ticker.Stop()
+	p := newPacer(cfg.Worker.MirrorInterval)
+	lastRepos := -1
 	for {
-		select {
-		case <-ctx.Done():
+		sum := mirrorAll(ctx, cfg, vcsType, eng, logger, snap)
+		busy := sum != nil && sum.failed.Load() > 0
+		rl, retry := false, time.Duration(0)
+		if sum != nil {
+			rl, retry = sum.rateLimited()
+		}
+		if n := len(snap.get()); n > 0 && lastRepos >= 0 && n != lastRepos {
+			busy = true // new repositories appeared — mirror them immediately
+		}
+		lastRepos = len(snap.get())
+		delay := p.next(busy, rl, retry)
+		if sum != nil {
+			sum.withPace(delay, p.reason)
+			sum.log(logger)
+		}
+		if err := p.sleep(ctx, delay); err != nil {
 			return nil
-		case <-ticker.C:
-			mirrorAll(ctx, cfg, vcsType, eng, logger, snap)
 		}
 	}
 }
 
 // mirrorAll refreshes mirrors of all known repositories through the pool;
-// failures are isolated (FR-014), a summary is written after the pass (FR-020).
-func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) {
+// failures are isolated (FR-014). It returns the pass summary (nil — nothing to
+// do) for the pacer and the pass log (T129).
+func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) *summary {
 	repos := snap.get()
 	if len(repos) == 0 {
-		return
+		return nil
 	}
 	sum := newSummary("mirror")
 	p := newPool(cfg.Worker.Concurrency)
@@ -57,7 +68,7 @@ func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 		}(repo)
 	}
 	wg.Wait()
-	sum.log(logger)
+	return sum
 }
 
 // mirrorRepo mirrors a single repository and records LastFetchAt; the per-repo

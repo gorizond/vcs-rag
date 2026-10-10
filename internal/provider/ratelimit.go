@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,11 +38,37 @@ func IsRateLimit(err error) (time.Duration, bool) {
 	}
 	var glErr *gitlab.ErrorResponse
 	if errors.As(err, &glErr) && glErr.HasStatusCode(http.StatusTooManyRequests) {
-		return 0, true
+		return retryAfterFromHeader(glErr.Response), true
 	}
+	// git-fetch/transport errors carry no typed response: the raw text fallback
+	// classifies them ("The requested URL returned error: 429", "Retry-After").
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "429") || strings.Contains(msg, "retry-after") {
+	if strings.Contains(msg, "429") || strings.Contains(msg, "retry-after") || strings.Contains(msg, "too many requests") {
 		return 0, true
 	}
 	return 0, false
+}
+
+// retryAfterFromHeader parses the Retry-After header of a GitLab error response:
+// seconds ("7") or an HTTP-date; invalid/absent → 0 (the caller picks the pause).
+func retryAfterFromHeader(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
+	}
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if at, err := http.ParseTime(v); err == nil {
+		if d := time.Until(at); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

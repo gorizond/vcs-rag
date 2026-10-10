@@ -190,7 +190,9 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	concurrency, err := envInt("WORKER_CONCURRENCY", 4)
+	// T128: the embeddings limiter ceiling — 2 concurrent calls are gentle to
+	// a single local model (the AIMD limiter scales within this ceiling).
+	concurrency, err := envInt("WORKER_CONCURRENCY", 2)
 	if err != nil {
 		return nil, err
 	}

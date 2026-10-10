@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -224,5 +226,118 @@ func TestEmptyResultIsEmptyArray(t *testing.T) {
 	}
 	if js := marshalJSON(out); js != "[]" {
 		t.Errorf("empty result = %s, expected []", js)
+	}
+}
+
+// T133-fix/T134: all four search tools share the normalization — a unique
+// short form becomes the payload pair (group_org=namespace, repo=short path),
+// ambiguity becomes an OR of pairs, unknown stays raw.
+func TestNormalizeRepoFilterAllTools(t *testing.T) {
+	lister := &fakeRepoLister{repos: mkRepos(
+		"gorizond/devops/nats", "gorizond/devops/api", "gorizond/secrets/runner")}
+	tl := &tools{embedder: &mockEmbedder{}, repos: newRepoIndex(lister)}
+
+	ms := &mockSearcher{}
+	tl.searcher = ms
+	if _, _, err := tl.searchCode(context.Background(), nil, searchCodeInput{Query: "x", Repo: "nats"}); err != nil {
+		t.Fatal(err)
+	}
+	if ms.gotFilter.GroupOrg != "gorizond/devops" || ms.gotFilter.Repo != "nats" || len(ms.gotFilter.RepoRefs) != 0 {
+		t.Errorf("searchCode filter = %+v", ms.gotFilter)
+	}
+
+	ms = &mockSearcher{}
+	tl.searcher = ms
+	if _, _, err := tl.searchPRs(context.Background(), nil, metadataQueryInput{Query: "x", Repo: "secrets/runner"}); err != nil {
+		t.Fatal(err)
+	}
+	if ms.gotFilter.GroupOrg != "gorizond/secrets" || ms.gotFilter.Repo != "runner" {
+		t.Errorf("searchPRs filter = %+v", ms.gotFilter)
+	}
+
+	ms = &mockSearcher{}
+	tl.searcher = ms
+	if _, _, err := tl.searchIssues(context.Background(), nil, metadataQueryInput{Query: "x", Repo: "api"}); err != nil {
+		t.Fatal(err)
+	}
+	if ms.gotFilter.GroupOrg != "gorizond/devops" || ms.gotFilter.Repo != "api" {
+		t.Errorf("searchIssues filter = %+v", ms.gotFilter)
+	}
+
+	ms = &mockSearcher{}
+	tl.searcher = ms
+	if _, _, err := tl.searchCIFailures(context.Background(), nil, ciFailuresInput{Query: "x", Repo: "nats"}); err != nil {
+		t.Fatal(err)
+	}
+	if ms.gotFilter.GroupOrg != "gorizond/devops" || ms.gotFilter.Repo != "nats" {
+		t.Errorf("searchCIFailures filter = %+v", ms.gotFilter)
+	}
+
+	// ambiguity → OR of pairs, the raw value is not used.
+	amb := &tools{embedder: &mockEmbedder{},
+		repos: newRepoIndex(&fakeRepoLister{repos: mkRepos("a/x/nats", "b/y/nats")})}
+	ms = &mockSearcher{}
+	amb.searcher = ms
+	if _, _, err := amb.searchCode(context.Background(), nil, searchCodeInput{Query: "x", Repo: "nats"}); err != nil {
+		t.Fatal(err)
+	}
+	if ms.gotFilter.Repo != "" || len(ms.gotFilter.RepoRefs) != 2 ||
+		ms.gotFilter.RepoRefs[0] != (store.RepoRef{GroupOrg: "a/x", Repo: "nats"}) ||
+		ms.gotFilter.RepoRefs[1] != (store.RepoRef{GroupOrg: "b/y", Repo: "nats"}) {
+		t.Errorf("ambiguous filter = %+v", ms.gotFilter)
+	}
+
+	// the OR list is capped at 16 pairs.
+	var many []string
+	for i := 0; i < 20; i++ {
+		many = append(many, fmt.Sprintf("g%02d/x/dup", i))
+	}
+	capped := &tools{embedder: &mockEmbedder{}, repos: newRepoIndex(&fakeRepoLister{repos: mkRepos(many...)})}
+	ms = &mockSearcher{}
+	capped.searcher = ms
+	if _, _, err := capped.searchCode(context.Background(), nil, searchCodeInput{Query: "x", Repo: "dup"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ms.gotFilter.RepoRefs) != repoMaxCandidates ||
+		ms.gotFilter.RepoRefs[0] != (store.RepoRef{GroupOrg: "g00/x", Repo: "dup"}) {
+		t.Errorf("capped refs = %d %+v", len(ms.gotFilter.RepoRefs), ms.gotFilter.RepoRefs)
+	}
+}
+
+// T133-fix: the negative control — a full-path input and its short form build
+// the same payload filter (both resolved through the index).
+func TestNormalizeRepoFilterFullPathSameAsShort(t *testing.T) {
+	lister := &fakeRepoLister{repos: mkRepos("example-orgexample-group/gitops/databases")}
+	tl := &tools{embedder: &mockEmbedder{}, repos: newRepoIndex(lister)}
+
+	msFull := &mockSearcher{}
+	tl.searcher = msFull
+	if _, _, err := tl.searchCode(context.Background(), nil, searchCodeInput{
+		Query: "x", Repo: "example-orgexample-group/gitops/databases"}); err != nil {
+		t.Fatal(err)
+	}
+	msShort := &mockSearcher{}
+	tl.searcher = msShort
+	if _, _, err := tl.searchCode(context.Background(), nil, searchCodeInput{Query: "x", Repo: "databases"}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(msFull.gotFilter, msShort.gotFilter) {
+		t.Errorf("full path filter = %+v, short form = %+v", msFull.gotFilter, msShort.gotFilter)
+	}
+	want := store.Filter{GroupOrg: "example-orgexample-group/gitops", Repo: "databases", Type: "code"}
+	if !reflect.DeepEqual(msFull.gotFilter, want) {
+		t.Errorf("filter = %+v, want the stored pair %+v", msFull.gotFilter, want)
+	}
+}
+
+// T133-fix: without the index the raw value is passed through as before.
+func TestNormalizeRepoFilterNoIndex(t *testing.T) {
+	ms := &mockSearcher{}
+	tl := &tools{embedder: &mockEmbedder{}, searcher: ms}
+	if _, _, err := tl.searchCode(context.Background(), nil, searchCodeInput{Query: "x", Repo: "nats"}); err != nil {
+		t.Fatal(err)
+	}
+	if ms.gotFilter.Repo != "nats" || ms.gotFilter.RepoRefs != nil || ms.gotFilter.GroupOrg != "" {
+		t.Errorf("passthrough filter = %+v", ms.gotFilter)
 	}
 }

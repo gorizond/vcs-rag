@@ -68,7 +68,7 @@ func TestLoadValid(t *testing.T) {
 				if cfg.Qdrant.URL != "http://localhost:6334" || cfg.Qdrant.Collection != "vcs_rag" {
 					t.Errorf("default qdrant: %+v", cfg.Qdrant)
 				}
-				if cfg.Worker.Interval != 60*time.Second || cfg.Worker.Concurrency != 4 ||
+				if cfg.Worker.Interval != 60*time.Second || cfg.Worker.Concurrency != 2 ||
 					cfg.Worker.MirrorsDir != "./mirrors" || cfg.Worker.HistoryMaxCommits != 2000 ||
 					cfg.Worker.MaxFileBytes != 1048576 || cfg.Worker.CIWindow != 50 {
 					t.Errorf("default worker: %+v", cfg.Worker)

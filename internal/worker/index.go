@@ -37,31 +37,55 @@ type indexStore interface {
 	Upsert(ctx context.Context, points []store.Point) error
 }
 
-// runIndex is the incremental code indexing lane (T041): on the
-// WORKER_INTERVAL tick it processes registry repositories through the pool
-// (WORKER_CONCURRENCY); errors do not break the loop (FR-014).
+// runIndex is the incremental code indexing lane (T041): an adaptive paced loop
+// over the discovery registry (T129) — the env interval is the ceiling, not a
+// fixed tick. Errors do not break the loop (FR-014).
 func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) error {
 	deps.Logger = log.WithPhase(deps.Logger, "index")
-	indexAll(ctx, cfg, deps, snap)
-
-	ticker := time.NewTicker(cfg.Worker.Interval)
-	defer ticker.Stop()
+	p := newPacer(cfg.Worker.Interval)
+	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
+	if err := p.sleep(ctx, p.startDelay()); err != nil {
+		return nil
+	}
+	lastRepos := -1
 	for {
-		select {
-		case <-ctx.Done():
+		sum := indexAll(ctx, cfg, deps, snap)
+		busy := sum != nil && (sum.indexed.Load() > 0 || sum.failed.Load() > 0)
+		rl, retry := false, time.Duration(0)
+		if sum != nil {
+			rl, retry = sum.rateLimited()
+		}
+		if n := len(snap.get()); n > 0 && lastRepos >= 0 && n != lastRepos {
+			busy = true // new repositories appeared — work immediately
+		}
+		lastRepos = len(snap.get())
+		delay := p.next(busy, rl, retry)
+		if sum != nil {
+			sum.withPace(delay, p.reason)
+			if l, ok := deps.Embed.(*limiter); ok {
+				sum.withEmbed(l.stats())
+			}
+			sum.log(deps.Logger)
+		}
+		if err := p.sleep(ctx, delay); err != nil {
 			return nil
-		case <-ticker.C:
-			indexAll(ctx, cfg, deps, snap)
 		}
 	}
 }
 
 // indexAll indexes all known repositories through the pool; failures are
-// isolated (FR-014), a summary is written after the pass (FR-020).
-func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) {
+// isolated (FR-014). It returns the pass summary (nil — nothing to do) for the
+// pacer and the pass log (T129).
+func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) *summary {
 	repos := snap.get()
 	if len(repos) == 0 {
-		return
+		return nil
+	}
+	// T130: yield to an active on-demand refresh — the embeddings backend and
+	// the VCS rate budget belong to the user-visible task.
+	if refreshActive.Load() {
+		deps.Logger.Info("index pass skipped: refresh is active")
+		return nil
 	}
 	sum := newSummary("index")
 	deps.stats = sum
@@ -84,7 +108,7 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 		}(repo)
 	}
 	wg.Wait()
-	sum.log(deps.Logger)
+	return sum
 }
 
 // ProcessRepoOnce is a full pass over a repository: local mirror (clone only

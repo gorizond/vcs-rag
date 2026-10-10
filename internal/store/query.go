@@ -7,12 +7,24 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
+// RepoRef — one repository as stored in the payload (T133-fix, live-verified):
+// the worker writes repo=<short path> (r.Path) and group_org=<full namespace>
+// (r.Namespace). Matching "repo" against a full "ns/path" gives 0 points
+// (vcs_rag_example-org: repo="databases" → 82, repo="example-orgexample-group/
+// gitops/databases" → 0; vcs_rag: "runner" → 9, "secrets/runner" → 0), so a
+// resolved filter carries the pair, never the dashed full name.
+type RepoRef struct {
+	GroupOrg string // payload group_org: the full namespace
+	Repo     string // payload repo: the short repository path
+}
+
 // Filter — payload search filter; empty fields do not participate
 // (must conditions on payload indexes, no full scan).
 type Filter struct {
 	VCSType  string
 	GroupOrg string
-	Repo     string
+	Repo     string    // one repository (short form as stored); raw passthrough when unresolved
+	RepoRefs []RepoRef // T133-fix: resolved pairs; 1 — direct pair, 2+ — OR (pairs win over GroupOrg/Repo)
 	Branch   string
 	Type     string
 	State    string
@@ -25,6 +37,53 @@ type ScoredPoint struct {
 	Payload map[string]any
 }
 
+// buildFilter translates Filter into a Qdrant payload filter; nil means "no
+// conditions at all". A single repository (Repo or one RepoRef) is a Must
+// pair; 2+ RepoRefs become an OR of nested (group_org AND repo) filters with
+// min_should=1 — T133-fix.
+func buildFilter(f Filter) *qdrant.Filter {
+	var must []*qdrant.Condition
+	add := func(key, value string) {
+		if value != "" {
+			must = append(must, qdrant.NewMatch(key, value))
+		}
+	}
+	add("vcs_type", f.VCSType)
+	switch len(f.RepoRefs) {
+	case 0:
+		add("group_org", f.GroupOrg)
+		add("repo", f.Repo)
+	case 1:
+		add("group_org", f.RepoRefs[0].GroupOrg)
+		add("repo", f.RepoRefs[0].Repo)
+	}
+	add("branch", f.Branch)
+	add("type", f.Type)
+	add("state", f.State)
+
+	var flt *qdrant.Filter
+	if len(must) > 0 {
+		flt = &qdrant.Filter{Must: must}
+	}
+	if len(f.RepoRefs) > 1 {
+		should := make([]*qdrant.Condition, 0, len(f.RepoRefs))
+		for _, ref := range f.RepoRefs {
+			inner := &qdrant.Filter{}
+			if ref.GroupOrg != "" {
+				inner.Must = append(inner.Must, qdrant.NewMatch("group_org", ref.GroupOrg))
+			}
+			inner.Must = append(inner.Must, qdrant.NewMatch("repo", ref.Repo))
+			should = append(should, qdrant.NewFilterAsCondition(inner))
+		}
+		if flt == nil {
+			flt = &qdrant.Filter{}
+		}
+		flt.Should = should
+		flt.MinShould = &qdrant.MinShould{Conditions: should, MinCount: 1}
+	}
+	return flt
+}
+
 // Search performs a filtered vector search; topK sets the result limit.
 func (s *Store) Search(ctx context.Context, vector []float32, f Filter, topK int) ([]ScoredPoint, error) {
 	req := &qdrant.QueryPoints{
@@ -33,21 +92,7 @@ func (s *Store) Search(ctx context.Context, vector []float32, f Filter, topK int
 		Limit:          qdrant.PtrOf(uint64(topK)),
 		WithPayload:    qdrant.NewWithPayloadEnable(true),
 	}
-	var must []*qdrant.Condition
-	add := func(key, value string) {
-		if value != "" {
-			must = append(must, qdrant.NewMatch(key, value))
-		}
-	}
-	add("vcs_type", f.VCSType)
-	add("group_org", f.GroupOrg)
-	add("repo", f.Repo)
-	add("branch", f.Branch)
-	add("type", f.Type)
-	add("state", f.State)
-	if len(must) > 0 {
-		req.Filter = &qdrant.Filter{Must: must}
-	}
+	req.Filter = buildFilter(f)
 
 	pts, err := s.client.Query(ctx, req)
 	if err != nil {

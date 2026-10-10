@@ -40,10 +40,13 @@ type refreshStatus struct {
 }
 
 // refreshTask is the published request (worker/refresh.go reads it).
+// Origin is additive (T134): "auto" for the autonomous freshness task,
+// empty for the manual refresh_repo (backward compatible).
 type refreshTask struct {
 	Repo      string `json:"repo"`
 	RequestID string `json:"request_id"`
 	TS        int64  `json:"ts"`
+	Origin    string `json:"origin,omitempty"`
 }
 
 // refreshOutcome is the client result: the last known status plus the flow flags.

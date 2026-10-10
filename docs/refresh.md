@@ -1,9 +1,11 @@
-# On-demand refresh (`refresh_repo`) — v0.0.7
+# Refresh & auto-freshness (`refresh_repo`) — v0.0.7+
 
 Hybrid freshness: the background lanes keep the index approximately up to date
 (`WORKER_MIRROR_INTERVAL` / `WORKER_META_INTERVAL`, the safety net), while the
-LLM can pull one repository **on demand** before searching. The feature is off
-by default: an empty `NATS_URL` keeps the previous behavior bit for bit (the
+LLM can pull one repository **on demand** before searching. Since v0.0.9 a
+repository-scoped search also refreshes itself when the index looks stale
+(**Auto freshness** below) — no LLM action required. The feature is off by
+default: an empty `NATS_URL` keeps the previous behavior bit for bit (the
 `refresh_repo` tool is not registered and no NATS connection is opened).
 
 ## Flow
@@ -24,7 +26,9 @@ MCP refresh_repo ──publish──▶ JetStream stream ──▶ worker consum
 2. Otherwise the tool publishes `{repo, request_id, ts}` to
    `vcsrag.<id>.refresh` (header `Nats-Msg-Id=request_id`) and polls the status
    KV every 500 ms until `done` / `failed` or the timeout
-   (default **20 s**, capped at **120 s**).
+   (default **20 s**, capped at **120 s**). An autonomous task adds the
+   optional `origin:"auto"` field (additive; the KV/key/subject contract does
+   not change); a manual `refresh_repo` call leaves it empty.
 3. The worker consumer resolves the repository against the discovery snapshot
    (exact `namespace/path`, otherwise a unique suffix; an ambiguous suffix is an
    error listing the candidates), then runs `RefreshOnce` under the per-repo
@@ -47,11 +51,37 @@ commit, so a retry indexes only the remainder (duplicates are impossible).
 
 Repository forms:
 
-- the search tools filter by the `repo` payload **as shown in search results**
-  (e.g. `nats`, `secrets/runner`) — the full `namespace/path` matches nothing
-  there;
+- the search tools accept the full `namespace/path` **or a short form**
+  (e.g. `nats`, `secrets/runner`): the MCP resolves it against the instance
+  repository list and normalizes it into the payload pair
+  `(group_org=<namespace>, repo=<path>)` — the exact form the worker stores, so
+  a raw full path alone would match nothing. 2–16 matches become an OR over
+  pairs; the raw value is passed through only while the list is unavailable;
 - `refresh_repo` accepts `namespace/path` or a unique suffix (resolved against
   the discovery snapshot).
+
+## Auto freshness (v0.0.9)
+
+Before a search with a `repo` filter the MCP reads the instance status KV and
+acts on its own (the extra latency is capped at **+3 s**; the search proceeds
+regardless of the refresh outcome):
+
+| State | Action |
+|-------|--------|
+| `done` younger than **10 min** | fresh — no task |
+| `in_progress` younger than 15 min | wait (≤3 s) for that run, no publication |
+| anything else | publish `origin:"auto"` with a fresh request id, wait ≤3 s for the correlated `done`/`failed` |
+
+Anti-DDoS budgets: one publication per repository per **5 min**, plus a global
+fixed window of **6/min** and **60/h**; a 0–300 ms jitter is added before the
+publication. Suppressed decisions are counted (`suppressed_interval`,
+`suppressed_bucket`, `suppressed_ambiguous`) and summarized in an INFO log at
+most once per 5 min.
+
+The worker treats an `auto` task gently: the metadata phase is skipped when the
+state has `MetaSyncedAt` younger than **1 h** (the background metadata lane
+still covers it). The KV status shape and the stream/consumer/subject names are
+unchanged.
 
 ## Delivery semantics
 

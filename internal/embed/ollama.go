@@ -47,7 +47,7 @@ func (o *Ollama) Embed(ctx context.Context, texts []string) ([][]float32, error)
 
 		resp, err := o.http.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("ollama: %w", err)
+			return nil, netError("ollama", err)
 		}
 		payload, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		_ = resp.Body.Close()
@@ -55,7 +55,7 @@ func (o *Ollama) Embed(ctx context.Context, texts []string) ([][]float32, error)
 			return nil, fmt.Errorf("ollama: reading response: %w", readErr)
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("ollama: HTTP %d: %s", resp.StatusCode, truncate(payload))
+			return nil, httpError("ollama", resp.StatusCode, payload)
 		}
 		var parsed struct {
 			Embeddings [][]float32 `json:"embeddings"`

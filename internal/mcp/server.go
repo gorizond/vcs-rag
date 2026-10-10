@@ -15,6 +15,7 @@ import (
 
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/embed"
+	"github.com/gorizond/vcs-rag/internal/provider/factory"
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
@@ -40,6 +41,14 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	// subject/KV names come from the instance id; search itself keeps working
 	// regardless of the NATS availability.
 	tl := newTools(emb, st, nil)
+	// T132: the repository list index resolves short-form repo filters without
+	// extra API calls; the provider constructor makes no network calls, and a
+	// failure only degrades to the raw path (the search keeps working).
+	if p, err := factory.New(cfg); err != nil {
+		logger.Warn("repo index disabled", "err", err)
+	} else {
+		tl.repos = newRepoIndex(p)
+	}
 	if cfg.NATS.URL != "" {
 		names := config.RefreshNames(cfg.NATS.InstanceID)
 		ref, err := connectRefreshClient(cfg.NATS.URL, names)
@@ -54,6 +63,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 		}
 		tl.refresher = ref
 		tl.inflight = newFlightGroup()
+		tl.auto = newAutoClient(ref, logger) // T134: auto-freshness before repo searches
 	}
 	registerTools(server, tl)
 

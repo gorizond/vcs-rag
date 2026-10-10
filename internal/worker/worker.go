@@ -55,10 +55,12 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		VCSType: vcs.Type(),
 		VCS:     vcs,
 		Engine:  engine,
-		Embed:   emb,
-		Store:   st,
-		Cfg:     cfg,
-		Logger:  logger,
+		// T128: every worker-side embeddings call (lanes + refresh) goes through
+		// the AIMD limiter; the ceiling is WORKER_CONCURRENCY.
+		Embed:  newLimiter(emb, cfg.Worker.Concurrency, logger),
+		Store:  st,
+		Cfg:    cfg,
+		Logger: logger,
 	}
 	snap := &snapshot{}
 

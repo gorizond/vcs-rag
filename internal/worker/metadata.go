@@ -15,31 +15,49 @@ import (
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
-// runMetadata is the metadata lane (T054): on the WORKER_META_INTERVAL tick
-// (default WORKER_INTERVAL) it processes registry repositories through the
-// pool; errors do not break the loop (FR-014).
+// runMetadata is the metadata lane (T054): an adaptive paced loop (T129) —
+// WORKER_META_INTERVAL (default WORKER_INTERVAL) is the ceiling, not a tick.
+// Errors do not break the loop (FR-014).
 func runMetadata(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) error {
 	deps.Logger = log.WithPhase(deps.Logger, "metadata")
-	metadataAll(ctx, cfg, deps, snap)
-
-	ticker := time.NewTicker(cfg.Worker.MetaInterval)
-	defer ticker.Stop()
+	p := newPacer(cfg.Worker.MetaInterval)
+	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
+	if err := p.sleep(ctx, p.startDelay()); err != nil {
+		return nil
+	}
+	lastRepos := -1
 	for {
-		select {
-		case <-ctx.Done():
+		sum := metadataAll(ctx, cfg, deps, snap)
+		busy := sum != nil && (sum.updated.Load() > 0 || sum.failed.Load() > 0)
+		rl, retry := false, time.Duration(0)
+		if sum != nil {
+			rl, retry = sum.rateLimited()
+		}
+		if n := len(snap.get()); n > 0 && lastRepos >= 0 && n != lastRepos {
+			busy = true
+		}
+		lastRepos = len(snap.get())
+		delay := p.next(busy, rl, retry)
+		if sum != nil {
+			sum.withPace(delay, p.reason)
+			if l, ok := deps.Embed.(*limiter); ok {
+				sum.withEmbed(l.stats())
+			}
+			sum.log(deps.Logger)
+		}
+		if err := p.sleep(ctx, delay); err != nil {
 			return nil
-		case <-ticker.C:
-			metadataAll(ctx, cfg, deps, snap)
 		}
 	}
 }
 
 // metadataAll processes metadata of all known repositories through the pool;
-// failures are isolated (FR-014), a summary is written after the pass (FR-020).
-func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) {
+// failures are isolated (FR-014). It returns the pass summary (nil — nothing to
+// do) for the pacer and the pass log (T129).
+func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) *summary {
 	repos := snap.get()
 	if len(repos) == 0 {
-		return
+		return nil
 	}
 	sum := newSummary("metadata")
 	deps.stats = sum
@@ -62,7 +80,7 @@ func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 		}(repo)
 	}
 	wg.Wait()
-	sum.log(deps.Logger)
+	return sum
 }
 
 // metaStore is the store surface of the metadata lane: a narrow interface so
@@ -245,14 +263,19 @@ func processMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo,
 	pruneSeenCI(seen, current)
 
 	// the sidecar is shared with the mirror/index lanes: the terminal write
-	// replaces Meta (prune removals included) under the mutex.
-	if err := updateState(statePath, func(s *MirrorState) { s.Meta = seen }); err != nil {
+	// replaces Meta (prune removals included) and stamps the successful
+	// metadata pass (T135) under the mutex.
+	if err := updateState(statePath, func(s *MirrorState) {
+		s.Meta = seen
+		s.MetaSyncedAt = time.Now().UTC()
+	}); err != nil {
 		return fmt.Errorf("state: %w", err)
 	}
 
 	skipped := (len(cands) - len(pending)) + (ciFailed - len(ciCands))
 	if deps.stats != nil {
-		deps.stats.addSkipped(skipped) // T091
+		deps.stats.addSkipped(skipped)                     // T091
+		deps.stats.addUpdated(len(pending) + len(ciCands)) // T129 busy signal
 	}
 	lg.Info("metadata updated", "issues", len(issues), "prs", len(prs),
 		"ci_failures", ciFailed, "skipped", skipped)

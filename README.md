@@ -23,7 +23,7 @@ One binary — two modes:
 | `EMBEDDINGS_DIM` | vector dimension (default 1024) |
 | `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant gRPC address and collection name |
 | `MCP_TRANSPORT` / `MCP_ADDR` | `stdio` (default) or `sse`; address for sse |
-| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | discovery/index pass tick and concurrency |
+| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | discovery/index pass tick (a ceiling, see Adaptive tuning) and the embeddings limiter ceiling (default 2) |
 | `WORKER_META_INTERVAL` / `WORKER_MIRROR_INTERVAL` | metadata / mirror pass tick (default — `WORKER_INTERVAL`) |
 | `MIRRORS_DIR` | bare mirror directory (default `./mirrors`) |
 | `NATS_URL` | local JetStream for on-demand refresh (`refresh_repo`); empty — the feature is off |
@@ -45,6 +45,48 @@ repository's fresh commits and metadata before searching (the worker executes
 the task from the local JetStream). `NATS_INSTANCE_ID` scopes the consumer,
 subject and KV bucket, so several deployments can share one NATS server — see
 [`docs/refresh.md`](docs/refresh.md) for the full flow, semantics and limits.
+
+## Adaptive tuning
+
+The worker tunes itself to one local embeddings model — no manual env edits or
+restarts after the initial deploy:
+
+- **AIMD embeddings limiter**: every worker-side embedding call (background
+  lanes and the refresh path) goes through a concurrency limiter that starts at
+  1 and grows additively (+1 after 10 consecutive fast successes, ≤10 s each)
+  up to the ceiling `WORKER_CONCURRENCY` (default **2**). An overload signal
+  (HTTP 429/5xx, timeouts, a refused connection, Ollama "no models loaded")
+  halves the limit and opens an exponential cooldown (5 s → 10 s → … capped at
+  60 s).
+- **Adaptive lane pacing**: `WORKER_*_INTERVAL` values are ceilings, not fixed
+  ticks. A busy pass retries after ≥5 s; an idle lane backs off exponentially up
+  to its ceiling; a VCS rate limit (`429`/`Retry-After`) dominates the delay
+  (30 s floor, 5 min cap). All delays get ±25 % jitter.
+- The current limit, latency p50/p95, throttle count, and the next pace delay
+  with its reason are printed in the per-pass summary.
+
+## Auto freshness
+
+With `NATS_URL` set, a repository-scoped search refreshes itself when the index
+looks stale — the LLM does not have to call `refresh_repo`:
+
+- before searching, the MCP reads the status KV: a `done` younger than **10 min**
+  is fresh (no task); a live `in_progress` younger than 15 min is awaited;
+  otherwise an `origin:"auto"` task is published and the search waits for the
+  correlated result;
+- the extra latency is capped at **+3 s**, and the search proceeds regardless of
+  the refresh outcome;
+- anti-DDoS budgets: one publication per repository per **5 min** plus a global
+  fixed window of **6/min** and **60/h**; publications get a 0–300 ms jitter;
+- the worker handles an `auto` task gently: the metadata phase is skipped when
+  `MetaSyncedAt` is younger than **1 h** (the background metadata lane still
+  covers it);
+- the `repo` filter accepts the full `namespace/path` **or a short form**
+  (e.g. `nats`, `secrets/runner`): the MCP resolves it against the instance
+  repository list and normalizes it into the stored payload pair
+  `(group_org=<namespace>, repo=<path>)`; 2–16 candidates become an OR. An empty
+  `NATS_URL` disables only the auto-refresh; the filter normalization keeps
+  working.
 
 Embeddings — the target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
 (`ollama pull bge-m3`) or in LM Studio (GGUF build, e.g. `lm-kit/bge-m3-gguf`;

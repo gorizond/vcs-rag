@@ -47,7 +47,7 @@ func (l *LMStudio) Embed(ctx context.Context, texts []string) ([][]float32, erro
 
 		resp, err := l.http.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("lm-studio: %w", err)
+			return nil, netError("lm-studio", err)
 		}
 		payload, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		_ = resp.Body.Close()
@@ -55,7 +55,7 @@ func (l *LMStudio) Embed(ctx context.Context, texts []string) ([][]float32, erro
 			return nil, fmt.Errorf("lm-studio: reading response: %w", readErr)
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("lm-studio: HTTP %d: %s", resp.StatusCode, truncate(payload))
+			return nil, httpError("lm-studio", resp.StatusCode, payload)
 		}
 		var parsed struct {
 			Data []struct {
