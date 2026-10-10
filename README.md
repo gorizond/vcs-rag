@@ -29,6 +29,16 @@ Self-hosted, VCS-agnostic RAG-сервис по исходному коду и �
 Смена GitLab ↔ GitHub — только env: ядро не меняется (оба провайдера за одним
 интерфейсом, проходят один контрактный набор).
 
+Эмбеддинги — целевая модель **`bge-m3`** (dim 1024, COSINE): в Ollama
+(`ollama pull bge-m3`) или в LM Studio (GGUF-билд, напр. `lm-kit/bge-m3-gguf`;
+локальный сервер включается в UI). Провайдеры взаимозаменяемы — переключение
+только env; имя коллекции Qdrant — `QDRANT_COLLECTION` (default `vcs_rag`).
+Другая модель/размерность — только по процедуре reindex
+([`docs/reindex.md`](docs/reindex.md)). Для LM Studio:
+`EMBEDDINGS_PROVIDER=lm-studio`,
+`EMBEDDINGS_BASE_URL=http://localhost:1234`,
+`EMBEDDINGS_MODEL=<identifier из LM Studio>`, `EMBEDDINGS_DIM=1024`.
+
 ## Запуск
 
 ```bash
