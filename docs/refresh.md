@@ -45,6 +45,14 @@ MCP refresh_repo ──publish──▶ JetStream stream ──▶ worker consum
 The index stays consistent under redelivery: commits are checkpointed per
 commit, so a retry indexes only the remainder (duplicates are impossible).
 
+Repository forms:
+
+- the search tools filter by the `repo` payload **as shown in search results**
+  (e.g. `nats`, `secrets/runner`) — the full `namespace/path` matches nothing
+  there;
+- `refresh_repo` accepts `namespace/path` or a unique suffix (resolved against
+  the discovery snapshot).
+
 ## Delivery semantics
 
 - Consumer `worker-refresh-<id>`: durable **pull**, `MaxAckPending=1`

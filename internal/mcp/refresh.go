@@ -253,7 +253,8 @@ func (r *natsRefresher) Refresh(ctx context.Context, repo string, timeout time.D
 		case st.State == "done" && time.Since(st.FinishedAt) < refreshDoneFresh:
 			return refreshOutcome{Status: st, Cached: true, Seen: true}, nil
 		case st.State == "in_progress" && time.Since(st.StartedAt) < refreshLiveWindow:
-			return r.poll(ctx, kv, key, timeout)
+			// an already running task: accept any terminal status it writes.
+			return r.poll(ctx, kv, key, timeout, "")
 		}
 	}
 
@@ -268,11 +269,15 @@ func (r *natsRefresher) Refresh(ctx context.Context, repo string, timeout time.D
 	if _, err := js.PublishMsg(msg); err != nil {
 		return refreshOutcome{}, fmt.Errorf("nats: publish: %w", err)
 	}
-	return r.poll(ctx, kv, key, timeout)
+	// correlate the poll with this task: a stale done/failed of an earlier run
+	// in the KV must not be returned as the result of the new request.
+	return r.poll(ctx, kv, key, timeout, task.RequestID)
 }
 
 // poll reads the KV status every 500 ms until done/failed or the timeout.
-func (r *natsRefresher) poll(ctx context.Context, kv nats.KeyValue, key string, timeout time.Duration) (refreshOutcome, error) {
+// A terminal status is accepted only when it belongs to the requested task
+// (want == "" — a run started earlier and polled without correlation).
+func (r *natsRefresher) poll(ctx context.Context, kv nats.KeyValue, key string, timeout time.Duration, want string) (refreshOutcome, error) {
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(refreshPollInterval)
 	defer ticker.Stop()
@@ -281,7 +286,10 @@ func (r *natsRefresher) poll(ctx context.Context, kv nats.KeyValue, key string, 
 		if st, ok := readKVStatus(kv, key); ok {
 			switch st.State {
 			case "done", "failed":
-				return refreshOutcome{Status: st, Seen: true}, nil
+				if want == "" || st.RequestID == want {
+					return refreshOutcome{Status: st, Seen: true}, nil
+				}
+				// a stale terminal status of an earlier request — keep polling.
 			case "in_progress":
 				seen = true
 			}

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 
@@ -234,6 +235,126 @@ func startEmbeddedNATS(t *testing.T) string {
 	}
 	t.Cleanup(ns.Shutdown)
 	return ns.ClientURL()
+}
+
+// T113/T122: registration must not panic — with and without a refresher
+// (the tool is added only when NATS_URL is set) and the jsonschema tags of all
+// tools must be valid.
+func TestRegisterRefreshTool(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+	registerTools(server, newTools(&mockEmbedder{}, &mockSearcher{}, nil))
+	registerTools(server, newTools(&mockEmbedder{}, &mockSearcher{}, &fakeRefresher{}))
+}
+
+// T122: the poll is correlated with the published request — a stale "done" of
+// an earlier run is not returned for a new task; a "done" carrying the new
+// request id is.
+func TestNATSRefresherStaleDoneCorrelation(t *testing.T) {
+	url := startEmbeddedNATS(t)
+	names := config.RefreshNames("fix")
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.AddStream(&nats.StreamConfig{
+		Name: names.Stream, Subjects: names.Subjects, Retention: nats.WorkQueuePolicy, Storage: nats.FileStorage,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.AddConsumer(names.Stream, &nats.ConsumerConfig{
+		Durable: names.Consumer, FilterSubject: names.Subject, AckPolicy: nats.AckExplicitPolicy, MaxAckPending: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: names.KVBucket, Storage: nats.FileStorage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := connectRefreshClient(url, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ref.Close()
+
+	const repo = "grp/fixture"
+	key := refreshSlug(repo)
+	putStatus := func(st refreshStatus) {
+		t.Helper()
+		data, err := json.Marshal(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := kv.Put(key, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// an earlier run left a stale "done" in the KV (older than the freshness window).
+	putStatus(refreshStatus{State: "done", RequestID: "old", FinishedAt: time.Now().UTC().Add(-5 * time.Minute),
+		CommitsIndexed: 7, DurationMS: 111})
+
+	// (b) the source answers the new task with a done carrying its request id.
+	sub, err := js.PullSubscribe(names.Subject, names.Consumer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan refreshOutcome, 1)
+	errs := make(chan error, 1)
+	go func() {
+		out, err := ref.Refresh(context.Background(), repo, 3*time.Second)
+		if err != nil {
+			errs <- err
+			return
+		}
+		results <- out
+	}()
+	msgs, err := sub.Fetch(1, nats.MaxWait(2*time.Second))
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("fetch the published task: err=%v msgs=%d", err, len(msgs))
+	}
+	var task refreshTask
+	if err := json.Unmarshal(msgs[0].Data, &task); err != nil {
+		t.Fatal(err)
+	}
+	_ = msgs[0].Ack()
+	putStatus(refreshStatus{State: "done", RequestID: task.RequestID, FinishedAt: time.Now().UTC(),
+		CommitsIndexed: 3, DurationMS: 42})
+	select {
+	case out := <-results:
+		if out.Cached || out.Status.State != "done" || out.Status.RequestID != task.RequestID ||
+			out.Status.CommitsIndexed != 3 {
+			t.Errorf("(b) out = %+v, want the done of task %s", out, task.RequestID)
+		}
+	case err := <-errs:
+		t.Fatalf("(b) refresh: %v", err)
+	case <-time.After(6 * time.Second):
+		t.Fatal("(b) refresh did not return")
+	}
+
+	// (a) a stale done and no source: the stale result must not be reported —
+	// the timeout yields in_progress, not the numbers of the previous refresh.
+	putStatus(refreshStatus{State: "done", RequestID: "old2", FinishedAt: time.Now().UTC().Add(-5 * time.Minute),
+		CommitsIndexed: 9})
+	out, err := ref.Refresh(context.Background(), repo, 400*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Cached || out.Status.State != "in_progress" || out.Status.RequestID == "old2" ||
+		out.Status.CommitsIndexed == 9 {
+		t.Errorf("(a) stale done leaked: %+v", out)
+	}
+	ci, err := js.ConsumerInfo(names.Stream, names.Consumer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ci.NumPending != 1 {
+		t.Errorf("(a) pending = %d, want 1 (the new task was published)", ci.NumPending)
+	}
 }
 
 // T119: the client publishes to the instance subject and reads the instance KV

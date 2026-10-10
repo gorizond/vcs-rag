@@ -51,7 +51,7 @@ type searchCodeInput struct {
 	Query    string `json:"query" jsonschema:"search query text"`
 	VCSType  string `json:"vcs_type,omitempty" jsonschema:"filter: gitlab | github"`
 	GroupOrg string `json:"group_org,omitempty" jsonschema:"GitLab group or GitHub organization"`
-	Repo     string `json:"repo,omitempty" jsonschema:"repository path"`
+	Repo     string `json:"repo,omitempty" jsonschema:"repository as shown in search results (e.g. 'nats', 'secrets/runner')"`
 	Branch   string `json:"branch,omitempty" jsonschema:"branch"`
 	TopK     int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
