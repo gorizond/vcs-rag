@@ -13,7 +13,6 @@ docker run -d --name vcs-rag-ollama -p 127.0.0.1:11435:11434 -v vcs-rag-ollama:/
 ## 1. E2E-тест
 
 ```bash
-QDRANT_URL=http://localhost:16334 EMBEDDINGS_BASE_URL=http://localhost:11435 \
 docker run --rm --network host -v "$PWD":/src -v vcs-rag-gomod:/go/pkg/mod -w /src \
   -e QDRANT_URL=http://localhost:16334 -e EMBEDDINGS_BASE_URL=http://localhost:11435 \
   golang:1.27 go test -tags e2e ./tests/integration -run TestE2E_US4 -v -count=1
