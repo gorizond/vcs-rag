@@ -1,0 +1,22 @@
+# Binaries
+bin/
+/vcs-rag
+*.exe
+*.test
+*.out
+
+# Working data (repo mirrors, incremental state)
+mirrors/
+*.state.json
+
+# Environment / secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.tmp
