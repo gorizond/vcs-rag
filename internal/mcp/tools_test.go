@@ -972,13 +972,13 @@ func TestGraphSchemaTool(t *testing.T) {
 		}
 	}
 
-	// The default DSL version and the no-store answer.
+	// The default DSL version (schema v3) and the no-store answer.
 	tl = &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}}
 	_, out, err = tl.graphSchema(context.Background(), nil, graphSchemaInput{})
 	if err != nil {
 		t.Fatalf("graphSchema(no graph): %v", err)
 	}
-	if r, ok := out.(graphSchemaResponse); !ok || r.QueryDSL.Version != "1" || len(r.CoveragePerRepo) != 0 {
+	if r, ok := out.(graphSchemaResponse); !ok || r.QueryDSL.Version != "3" || len(r.CoveragePerRepo) != 0 {
 		t.Errorf("no-graph schema = %T %+v", out, out)
 	}
 	if js := marshalJSON(out); !strings.Contains(js, `"coverage_per_repo":[]`) {

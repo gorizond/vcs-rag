@@ -26,7 +26,40 @@ const (
 	KindMilestone Kind = "milestone"
 	KindLabel     Kind = "label"
 	KindRunner    Kind = "runner"
+	// Orbit-parity gap catalog (schema v3): structure, review and security
+	// node families. mr_file/vuln stay as accepted aliases of
+	// merge_request_diff_file/vulnerability.
+	KindGroup                   Kind = "group"
+	KindProject                 Kind = "project"
+	KindBranch                  Kind = "branch"
+	KindDirectory               Kind = "directory"
+	KindFile                    Kind = "file"
+	KindImportedSymbol          Kind = "imported_symbol"
+	KindMergeRequest            Kind = "merge_request"
+	KindMergeRequestDiff        Kind = "merge_request_diff"
+	KindMergeRequestDiffFile    Kind = "merge_request_diff_file"
+	KindVulnerability           Kind = "vulnerability"
+	KindSecurityScan            Kind = "security_scan"
+	KindFinding                 Kind = "finding"
+	KindVulnerabilityOccurrence Kind = "vulnerability_occurrence"
+	KindVulnerabilityIdentifier Kind = "vulnerability_identifier"
+	KindVulnerabilityScanner    Kind = "vulnerability_scanner"
 )
+
+// KindAlias returns the legacy spelling of a canonical v3 node kind and
+// whether the family has one (data-model aliases, R6): mr_file ↔
+// merge_request_diff_file, vuln ↔ vulnerability. The legacy spelling keeps its
+// exact pre-v3 match (FR-022); the canonical spelling is resolved to both, so
+// traversal works before and after a reindex (FR-019).
+func KindAlias(k Kind) (Kind, bool) {
+	switch k {
+	case KindMergeRequestDiffFile:
+		return KindMrFile, true
+	case KindVulnerability:
+		return KindVuln, true
+	}
+	return "", false
+}
 
 // NodeType is the entity type carried by a graph node.
 type NodeType string
@@ -47,6 +80,22 @@ const (
 	EntityMrFile Entity = "mr_file"
 	EntityCi     Entity = "ci"
 	EntityVuln   Entity = "vuln"
+	// Orbit-parity gap entities (schema v3). merge_request_diff_file and
+	// vulnerability keep their legacy aliases mr_file and vuln.
+	EntityGroup                   Entity = "group"
+	EntityProject                 Entity = "project"
+	EntityBranch                  Entity = "branch"
+	EntityDirectory               Entity = "directory"
+	EntityImportedSymbol          Entity = "imported_symbol"
+	EntityMergeRequest            Entity = "merge_request"
+	EntityMergeRequestDiff        Entity = "merge_request_diff"
+	EntityMergeRequestDiffFile    Entity = "merge_request_diff_file"
+	EntityVulnerability           Entity = "vulnerability"
+	EntitySecurityScan            Entity = "security_scan"
+	EntityFinding                 Entity = "finding"
+	EntityVulnerabilityOccurrence Entity = "vulnerability_occurrence"
+	EntityVulnerabilityIdentifier Entity = "vulnerability_identifier"
+	EntityVulnerabilityScanner    Entity = "vulnerability_scanner"
 )
 
 // EdgeType is the relation label carried by a graph edge.
@@ -63,6 +112,26 @@ const (
 	EdgeLabelled    EdgeType = "labelled"     // work_item → label
 	EdgeInMilestone EdgeType = "in_milestone" // work_item → milestone
 	EdgeExecutedBy  EdgeType = "executed_by"  // ci → runner
+	// Orbit-parity gap relations (schema v3).
+	EdgeContains       EdgeType = "contains"         // group/group/project/branch/directory/file tree
+	EdgeOnBranch       EdgeType = "on_branch"        // directory/file → branch
+	EdgeHasDiff        EdgeType = "has_diff"         // merge_request → merge_request_diff
+	EdgeHasLatestDiff  EdgeType = "has_latest_diff"  // merge_request → merge_request_diff (tip)
+	EdgeHasFile        EdgeType = "has_file"         // merge_request_diff → merge_request_diff_file
+	EdgeMerged         EdgeType = "merged"           // user → merge_request
+	EdgeReviewer       EdgeType = "reviewer"         // user → merge_request
+	EdgeInProject      EdgeType = "in_project"       // {mr,diff,difffile,finding,occurrence,identifier,scan,scanner,vulnerability} → project
+	EdgeInPipeline     EdgeType = "in_pipeline"      // security_scan → ci (pipeline)
+	EdgeHasFinding     EdgeType = "has_finding"      // vulnerability/security_scan → occurrence/finding
+	EdgeOccurrenceOf   EdgeType = "occurrence_of"    // vulnerability_occurrence → vulnerability
+	EdgeDetectedBy     EdgeType = "detected_by"      // finding/occurrence → vulnerability_scanner
+	EdgeHasIdentifier  EdgeType = "has_identifier"   // finding/occurrence → vulnerability_identifier
+	EdgeFixes          EdgeType = "fixes"            // merge_request → vulnerability
+	EdgeScans          EdgeType = "scans"            // vulnerability_scanner → project
+	EdgeResolvedBy     EdgeType = "resolved_by"      // user → vulnerability
+	EdgeConfirmedBy    EdgeType = "confirmed_by"     // user → vulnerability
+	EdgeDismissedBy    EdgeType = "dismissed_by"     // user → vulnerability
+	EdgeMergedAtCommit EdgeType = "merged_at_commit" // merge_request → commit
 )
 
 // Direction selects the traversal direction relative to the start entity.

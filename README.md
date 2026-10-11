@@ -68,8 +68,8 @@ flowchart LR
   GC["GC: vanished repos and entities"] --> QD
   MI --> GR["graph lane: scan + generation sweep"]
   VCS -.->|SDLC listings| GR
-  GR -->|"nodes: definition, user, note, work_item, milestone, label, runner"| QDG[("Qdrant graph: vcs_rag_graph_*, payload-only, no vectors")]
-  GR -->|"edges: imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by"| QDG
+  GR -->|"nodes: definition, group, project, branch, directory, file, imported_symbol, merge_request, merge_request_diff, merge_request_diff_file, vulnerability, finding, vulnerability_occurrence, vulnerability_identifier, security_scan, vulnerability_scanner, user, note, work_item, milestone, label, runner"| QDG[("Qdrant graph: vcs_rag_graph_*, payload-only, no vectors, schema v3")]
+  GR -->|"edges: imports, defines, contains, on_branch, has_diff, has_latest_diff, has_file, merged, reviewer, in_project, in_pipeline, has_finding, occurrence_of, detected_by, has_identifier, fixes, scans, resolved_by, confirmed_by, dismissed_by, authored, commented, assigned_to, labelled, in_milestone, executed_by"| QDG
   QD --> MCP[MCP server]
   QDG --> MCP
   MCP -->|search_code, search_*| CL[LLM / IDE client]
@@ -85,18 +85,30 @@ graph lanes) keep the index fresh; the MCP server only reads Qdrant and, with
 NATS, can pull one repository on demand ([refresh flow](docs/refresh.md)) or
 refresh it automatically before a repo-scoped search (Auto freshness below).
 The graph lane writes a separate **payload-only** collection
-(`QDRANT_GRAPH_COLLECTION`, default `vcs_rag_graph`, instance-scoped) —
-definition nodes, `imports`/`defines` edges and the Orbit-parity families
-(user, note, work_item, milestone, label, runner) with their relations
+(`QDRANT_GRAPH_COLLECTION`, default `vcs_rag_graph`, instance-scoped) at
+schema version **3** (`WORKER_GRAPH_SCHEMA_VER`; a bump re-keys every graph id
+and needs a re-scan). Nodes: `definition`, the code families (`branch`,
+`directory`, `file`, `imported_symbol`), ownership (`group`, `project`), review
+(`merge_request`, `merge_request_diff`, `merge_request_diff_file`) and
+security (`vulnerability`, `finding`, `vulnerability_occurrence`,
+`vulnerability_identifier`, `vulnerability_scanner`, `security_scan`), plus
+the Orbit-parity families (user, note, work_item, milestone, label, runner) —
+the names follow GitLab Orbit's public ontology (lowercase snake). Edges:
+`imports`, `defines`, `contains`, `on_branch`, `has_diff`, `has_latest_diff`,
+`has_file`, `merged`, `reviewer`, `in_project`, `in_pipeline`, `has_finding`,
+`occurrence_of`, `detected_by`, `has_identifier`, `fixes`, `scans`,
+`resolved_by`, `confirmed_by`, `dismissed_by`, plus the SDLC relations
 (`authored`, `commented`, `assigned_to`, `labelled`, `in_milestone`,
-`executed_by`), joined by canonical `node_key`/`from_key`/`to_key` refs and
-carrying **no vectors** (zero embeddings). Stale generations are removed by a
-mark-and-sweep GC after each successful repository scan
-([graph layer](docs/graph.md)); the MCP serves both collections — the search
-tools read code/metadata, the graph tools (`search_definitions`, `get_imports`,
-`get_dependents`, `graph_schema`, `query_graph`) read the graph. Real-time CDC
-is a non-goal — freshness comes from the periodic lanes (or an on-demand
-refresh).
+`executed_by`). Points join on canonical `node_key`/`from_key`/`to_key` refs
+and carry **no vectors** (zero embeddings). Stale generations are removed by
+a mark-and-sweep GC after each successful repository scan; the sweep is gated
+— a best-effort family (structure/branch, review, ownership) is swept only
+when its listing completed in that pass, so a failed provider call cannot
+delete a live family ([graph layer](docs/graph.md)). The MCP serves
+both collections — the search tools read code/metadata, the graph tools
+(`search_definitions`, `get_imports`, `get_dependents`, `graph_schema`,
+`query_graph`) read the graph. Real-time CDC is a non-goal — freshness comes
+from the periodic lanes (or an on-demand refresh).
 
 ## Key environment variables
 
@@ -347,8 +359,12 @@ worker/NATS tools:
 | `search_definitions` | symbol definitions from the graph; `mode=auto` (default) tries name matching first, then falls back to the semantic code search; `name` matches the symbol exactly or as a full-text token (no substring/prefix) |
 | `get_imports` | direct 1-hop package imports of a file or package (`direction=outgoing` default: what the input imports) |
 | `get_dependents` | direct 1-hop importers (`direction=incoming` default). **Package-level, not symbol-level**: the dependents of file X are the importers of X's package(s), not symbol referencers |
-| `query_graph` | graph query family (`mode` = `traversal` default / `aggregation` / `path_finding` / `neighbors`, see below); traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`/`user`/`note`/`work_item`/`milestone`/`label`/`runner`) + filters, optional edge selector (`imports`/`defines`/`authored`/`commented`/`assigned_to`/`labelled`/`in_milestone`/`executed_by`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
+| `query_graph` | graph query family (`mode` = `traversal` default / `aggregation` / `path_finding` / `neighbors`, see below); traversal: start entity (`definition`/`directory`/`file`/`imported_symbol`/`branch`/`group`/`project`/`merge_request`/`merge_request_diff`/`mr_file`/`ci`/`vuln`/`finding`/`security_scan`/`vulnerability_occurrence`/`vulnerability_identifier`/`vulnerability_scanner`/`user`/`note`/`work_item`/`milestone`/`label`/`runner`; `mr_file`/`vuln` are the accepted legacy aliases) + filters, optional edge selector (`imports`/`defines`/`contains`/`on_branch`/`has_diff`/`has_latest_diff`/`has_file`/`merged`/`reviewer`/`in_project`/`in_pipeline`/`has_finding`/`occurrence_of`/`detected_by`/`has_identifier`/`fixes`/`scans`/`resolved_by`/`confirmed_by`/`dismissed_by`/`authored`/`commented`/`assigned_to`/`labelled`/`in_milestone`/`executed_by`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
 | `graph_schema` | self-describing graph schema: node/edge/entity types, query DSL version/operators, per-repo coverage markers |
+| `list_commands` | the Orbit-compatible static catalog: the graph commands (`query_graph`, `get_graph_schema`, `get_query_dsl`, `get_response_format`) with descriptions and input schemas |
+| `invoke_command` | invoke a graph command by name (Orbit-compatible): `command_name=query_graph` runs the canonical query DSL and wraps the result in the Orbit envelope (`result`, `query_type`, `raw_query_strings`, `row_count`); `command_name=get_graph_schema` returns the schema; structured errors (e.g. `non_selective_query`) pass through |
+| `get_query_dsl` | the JSON query DSL grammar/version (synced with the graph schema version, `v3`) with the modes and operators |
+| `get_response_format` | the `invoke_command` response format: envelope version (`v5`) and its static JSON schema |
 | `index_status` | worker indexing status (below) |
 | `refresh_repo` | on-demand refresh of one repository (registered only with `NATS_URL` set) |
 
@@ -377,7 +393,9 @@ coverage notice and `truncated`.
 - **neighbors** — the 1-hop peers of `node_key`: `direction` = `outgoing`
   (default) / `incoming` / `both`, optional `rel_types`. A peer without a
   stored node is a pseudo-node (`resolved: false`, no payload); a resolved
-  peer carries its node.
+  peer carries its node. The centre scan is capped by
+  `MCP_GRAPH_MAX_EDGES_PER_NODE` (default 10000); a cut is `truncated`, never
+  silently partial.
 
 ## Indexing status (`index_status`)
 

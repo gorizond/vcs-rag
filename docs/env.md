@@ -58,7 +58,7 @@ explicitly listed project/repo), deduplicated. If only the allowlist is set
 | `WORKER_GC_INTERVAL` | `15m` | Repo/entity GC pass ceiling |
 | `WORKER_GC_DRY_RUN` | `true` | GC kill-switch: `true` — observe-only (`gc would-delete` journal), `false` — real deletions |
 | `WORKER_GRAPH_INTERVAL` | `30m` | Graph lane tick (payload-only graph pass) |
-| `WORKER_GRAPH_SCHEMA_VER` | `2` | Graph schema version; part of the graph uuid5 namespace. Bumped `1`→`2` for the edge key-space feature: new node/edge kinds change the schema, so a bump re-keys every graph id and requires a full graph reindex (see [graph](graph.md) · [reindex](reindex.md)) |
+| `WORKER_GRAPH_SCHEMA_VER` | `3` | Graph schema version; part of the graph uuid5 namespace. Bumped `2`→`3` for the Orbit-parity node/edge catalog (structure, review and security families); earlier `1`→`2` for the edge key-space feature. A bump re-keys every graph id and requires a full graph reindex (see [graph](graph.md) · [reindex](reindex.md)) |
 | `WORKER_GRAPH_MAX_REPOS_PER_PASS` | `5` | Repositories processed per graph pass |
 | `WORKER_DISCOVERY_MIN_INTERVAL` | `0` | Reuse a younger discovery listing without an API call; `0` — list on every pass |
 | `WORKER_CONCURRENCY` | `2` | Ceiling for the AIMD embeddings limiter (the limiter itself scales 1…this) |
@@ -83,4 +83,5 @@ explicitly listed project/repo), deduplicated. If only the allowlist is set
 | `MCP_GRAPH_AGG_MAX_SCANNED` | `50000` | Cap on payload points scanned per aggregation request; over the cap the result is marked `truncated` (honest status), never silently partial |
 | `MCP_GRAPH_AGG_MAX_GROUPS` | `10000` | Cap on distinct groups per aggregation request; over the cap the result is marked `truncated`/refused |
 | `MCP_GRAPH_PATH_MAX_DEPTH` | `3` | Cap on path-traversal depth; values above `3` are clamped to `3` (contract bound) |
+| `MCP_GRAPH_MAX_EDGES_PER_NODE` | `10000` | Cap on edge points kept per node (the neighbours centre scan); a cut is reported as `truncated`, never silently partial |
 | `MCP_AUTHZ_ENABLED` | `false` | Reserved **no-op punt** (T041): per-user authorization is not implemented — nothing filters by this flag. The graph has no ACL and is served to a trusted loopback consumer; the boundary is instance isolation, not per-user rules (see [graph](graph.md#authz-and-freshness-scope)) |

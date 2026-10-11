@@ -20,7 +20,7 @@ const (
 // selective indexed predicate. The message carries the contractual token
 // `non_selective_query` (R5, contracts/graph-collection.md) so MCP callers can
 // surface it verbatim. Such a query would be a full-collection scan.
-var ErrNonSelective = errors.New("non_selective_query: at least one selective indexed predicate required (repo|file_path|from_file|to_package|from_package|symbol|mr_id|node_key|from_key|to_key|parent_key)")
+var ErrNonSelective = errors.New("non_selective_query: at least one selective indexed predicate required (repo|file_path|from_file|to_package|from_package|symbol|mr_id|group_id|project_id|scan_id|scanner_key|primary_identifier_key|mr_key|dir_key|node_key|from_key|to_key|parent_key)")
 
 // Orbit-parity start entities (T024/T032/T036). Their payload kind
 // discriminator IS the entity name (kind=user, note, work_item, milestone,
@@ -60,6 +60,16 @@ var selectiveFields = map[string]bool{
 	// parent_key (note → its work item/change request, data-model §2) bounds a
 	// start scan to the notes of one parent — the natural note entry point.
 	"parent_key": true,
+	// Schema-v3 identity keys (T012): group/project, security (scan, scanner,
+	// primary identifier) and review (mr_key, dir_key) keys are exact lookups
+	// like mr_id, so they bound a scan too.
+	"group_id":               true,
+	"project_id":             true,
+	"scan_id":                true,
+	"scanner_key":            true,
+	"primary_identifier_key": true,
+	"mr_key":                 true,
+	"dir_key":                true,
 }
 
 // Compiled is the executable form of a Query: exact filters plus clamped
@@ -129,7 +139,7 @@ func Compile(q Query) (Compiled, error) {
 		return Compiled{}, fmt.Errorf("graph: invalid direction %q (want outgoing|incoming)", dir)
 	}
 	if q.EdgeType != "" && q.EdgeType != "*" && !knownEdgeType(q.EdgeType) {
-		return Compiled{}, fmt.Errorf("graph: invalid edge type %q (want imports|defines|authored|commented|assigned_to|labelled|in_milestone|executed_by|*)", q.EdgeType)
+		return Compiled{}, fmt.Errorf("graph: invalid edge type %q (want imports|defines|authored|commented|assigned_to|labelled|in_milestone|executed_by|contains|on_branch|has_diff|has_latest_diff|has_file|merged|reviewer|in_project|in_pipeline|has_finding|occurrence_of|detected_by|has_identifier|fixes|scans|resolved_by|confirmed_by|dismissed_by|merged_at_commit|*)", q.EdgeType)
 	}
 	if !selective(q.Start) && !selective(q.Filter) && !keyBounded(mode, q) {
 		return Compiled{}, ErrNonSelective
@@ -198,14 +208,23 @@ func keyBounded(mode Mode, q Query) bool {
 func knownEdgeType(et EdgeType) bool {
 	switch et {
 	case EdgeImports, EdgeDefines, EdgeAuthored, EdgeCommented,
-		EdgeAssignedTo, EdgeLabelled, EdgeInMilestone, EdgeExecutedBy:
+		EdgeAssignedTo, EdgeLabelled, EdgeInMilestone, EdgeExecutedBy,
+		// Schema-v3 relations (T007).
+		EdgeContains, EdgeOnBranch, EdgeHasDiff, EdgeHasLatestDiff, EdgeHasFile,
+		EdgeMerged, EdgeReviewer, EdgeInProject, EdgeInPipeline, EdgeHasFinding,
+		EdgeOccurrenceOf, EdgeDetectedBy, EdgeHasIdentifier, EdgeFixes, EdgeScans,
+		EdgeResolvedBy, EdgeConfirmedBy, EdgeDismissedBy, EdgeMergedAtCommit:
 		return true
 	}
 	return false
 }
 
 // entityMatch is the kind discriminator of a start scanner: every entity
-// family maps to the payload kind (and node_type) its points carry.
+// family maps to the payload kind (and node_type) its points carry. Canonical
+// v3 spellings of a legacy family (mr_file/vuln) resolve to both spellings
+// (T006, data-model R6): the legacy spelling keeps its exact pre-v3 match
+// (FR-022) and the canonical one additionally finds points reindexed under the
+// v3 kind (FR-019).
 func entityMatch(e Entity) ([]*qdrant.Condition, error) {
 	switch e {
 	case EntityDefinition, EntityFile:
@@ -215,13 +234,20 @@ func entityMatch(e Entity) ([]*qdrant.Condition, error) {
 			qdrant.NewMatch("kind", string(KindNode)),
 			qdrant.NewMatch("node_type", string(NodeDefinition)),
 		}, nil
-	case EntityMrFile, EntityCi, EntityVuln:
-		return []*qdrant.Condition{qdrant.NewMatch("kind", string(e))}, nil
-	case EntityUser, EntityNote, EntityWorkItem, EntityMilestone, EntityLabel, EntityRunner:
-		// Orbit families carry their own kind discriminator; no node_type.
+	case EntityMergeRequestDiffFile, EntityVulnerability:
+		// Canonical v3 alias of a legacy family (T006).
+		legacy, _ := KindAlias(Kind(e))
+		return []*qdrant.Condition{qdrant.NewMatchKeywords("kind", string(Kind(e)), string(legacy))}, nil
+	case EntityMrFile, EntityCi, EntityVuln,
+		// Orbit + schema-v3 families carry their own kind discriminator
+		// (kind = entity name); no node_type.
+		EntityGroup, EntityProject, EntityBranch, EntityDirectory, EntityImportedSymbol,
+		EntityMergeRequest, EntityMergeRequestDiff, EntitySecurityScan, EntityFinding,
+		EntityVulnerabilityOccurrence, EntityVulnerabilityIdentifier, EntityVulnerabilityScanner,
+		EntityUser, EntityNote, EntityWorkItem, EntityMilestone, EntityLabel, EntityRunner:
 		return []*qdrant.Condition{qdrant.NewMatch("kind", string(e))}, nil
 	}
-	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln|user|note|work_item|milestone|label|runner)", e)
+	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln|user|note|work_item|milestone|label|runner|group|project|branch|directory|imported_symbol|merge_request|merge_request_diff|merge_request_diff_file|vulnerability|security_scan|finding|vulnerability_occurrence|vulnerability_identifier|vulnerability_scanner)", e)
 }
 
 // typedConditions maps the typed Filter fields to Qdrant match conditions.

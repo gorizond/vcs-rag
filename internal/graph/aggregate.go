@@ -37,6 +37,46 @@ func SetAggCaps(scanned, groups int) {
 	aggCaps.scanned, aggCaps.groups = scanned, groups
 }
 
+// Query caps (plan §7.1, FR-025/FR-026; config MCP_GRAPH_PATH_MAX_DEPTH /
+// MCP_GRAPH_MAX_EDGES_PER_NODE). Package state like aggCaps: the engine
+// signatures are fixed by the mode dispatch, so the MCP handler seeds these
+// from configuration once at startup.
+const (
+	defaultPathMaxDepth    = maxHops // 3 — the contract's server-side cap
+	defaultMaxEdgesPerNode = 10_000
+)
+
+var queryCaps = struct{ pathMaxDepth, maxEdgesPerNode int }{
+	pathMaxDepth:    defaultPathMaxDepth,
+	maxEdgesPerNode: defaultMaxEdgesPerNode,
+}
+
+// SetQueryCaps overrides the query caps from configuration; a non-positive
+// value restores that cap's default and the path depth is clamped to the
+// contract bound (≤ maxHops).
+func SetQueryCaps(pathMaxDepth, maxEdgesPerNode int) {
+	if pathMaxDepth <= 0 {
+		pathMaxDepth = defaultPathMaxDepth
+	}
+	if pathMaxDepth > maxHops {
+		pathMaxDepth = maxHops
+	}
+	if maxEdgesPerNode <= 0 {
+		maxEdgesPerNode = defaultMaxEdgesPerNode
+	}
+	queryCaps.pathMaxDepth, queryCaps.maxEdgesPerNode = pathMaxDepth, maxEdgesPerNode
+}
+
+// edgeCap truncates a per-node edge scan to the configured cap and reports the
+// cut — the caller's truncation signal (an honest partial answer, never a
+// silent drop).
+func edgeCap(pts []*qdrant.RetrievedPoint) ([]*qdrant.RetrievedPoint, bool) {
+	if len(pts) > queryCaps.maxEdgesPerNode {
+		return pts[:queryCaps.maxEdgesPerNode], true
+	}
+	return pts, false
+}
+
 // ErrAggCapExceeded is returned when an exact aggregation (a count) would have
 // to be cut by the group cap: a partial exact count would be a lie, so the
 // query is refused instead. Fold aggregates (sum/avg/min/max, including counts

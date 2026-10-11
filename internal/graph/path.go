@@ -49,6 +49,9 @@ type PathResult struct {
 //   - the smaller frontier is expanded each step and the intersection of the
 //     two visited sets is checked after every expansion — the first meeting
 //     yields the minimum number of hops;
+//   - the effective depth is the compiled depth clamped to the configured
+//     MCP_GRAPH_PATH_MAX_DEPTH (FR-026; the contract bound 3 stays the hard
+//     ceiling), so the operator setting really bounds the search;
 //   - a frontier/edge cap, or a Truncated coverage for the repo, makes a
 //     missing path inconclusive, never not_found.
 //
@@ -73,6 +76,13 @@ func ShortestPath(ctx context.Context, sc Scroller, q Query, coverage Coverage) 
 	}
 	if c.MatchNone || sc == nil {
 		return res, nil
+	}
+	// FR-026: the effective search depth is the compiled depth clamped to the
+	// configured MCP_GRAPH_PATH_MAX_DEPTH (itself ≤ the contract bound), not
+	// the fixed contract maximum.
+	maxDepth := c.Hops
+	if maxDepth > queryCaps.pathMaxDepth {
+		maxDepth = queryCaps.pathMaxDepth
 	}
 	if q.FromKey == q.ToKey {
 		res.Status, res.Nodes = PathFound, []string{q.FromKey}
@@ -123,7 +133,7 @@ func ShortestPath(ctx context.Context, sc Scroller, q Query, coverage Coverage) 
 				peer = pathPeerKey(m, dir)
 			}
 			d, ok := self[parent]
-			if !ok || peer == "" || d+1 > c.Hops {
+			if !ok || peer == "" || d+1 > maxDepth {
 				continue
 			}
 			if _, seen := self[peer]; seen {
@@ -144,7 +154,7 @@ func ShortestPath(ctx context.Context, sc Scroller, q Query, coverage Coverage) 
 		return next, cut, nil
 	}
 
-	for df, db := 0, 0; df+db < c.Hops && len(frontF) > 0 && len(frontB) > 0 && meet == ""; {
+	for df, db := 0, 0; df+db < maxDepth && len(frontF) > 0 && len(frontB) > 0 && meet == ""; {
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
@@ -188,7 +198,7 @@ func ShortestPath(ctx context.Context, sc Scroller, q Query, coverage Coverage) 
 	}
 	reverseStrings(fchain)
 	nodes := append([]string{}, fchain...)
-	edges := make([]PathEdge, 0, c.Hops)
+	edges := make([]PathEdge, 0, maxDepth)
 	for i := 1; i < len(fchain); i++ {
 		edges = append(edges, PathEdge{FromKey: fchain[i-1], ToKey: fchain[i], EdgeType: kindF[fchain[i]]})
 	}

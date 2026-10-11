@@ -89,6 +89,24 @@ func RefMilestone(repo, id string) string           { return repo + "|ms#" + id 
 func RefLabel(scope, name string) string            { return "lab:" + scope + "|" + name }
 func RefRunner(host, id string) string              { return "runner:" + host + "#" + id }
 
+// Canonical payload keys of the Orbit-parity gap catalog (data-model §New
+// nodes, schema v3). Same contract as above: pure, deterministic string forms
+// with no generation — a node's node_key and an edge endpoint key are the same
+// string by construction.
+func RefGroup(fullPath string) string                           { return "group:" + fullPath }
+func RefProject(repo string) string                             { return repo }
+func RefBranch(repo, name string) string                        { return repo + "|branch:" + name }
+func RefDirectory(repo, path string) string                     { return repo + "|dir:" + path }
+func RefImportedSymbol(repo, file, name string) string          { return repo + "|imsym:" + file + "|" + name }
+func RefMergeRequest(repo, iid string) string                   { return repo + "|mr:" + iid }
+func RefMergeRequestDiff(repo, iid, rev string) string          { return repo + "|mr:" + iid + "|diff:" + rev }
+func RefVulnerability(repo, id string) string                   { return repo + "|vuln:" + id }
+func RefVulnerabilityIdentifier(host, externalID string) string { return host + "|vid:" + externalID }
+func RefVulnerabilityScanner(host, id string) string            { return host + "|scanner:" + id }
+func RefFinding(repo, uuid string) string                       { return repo + "|finding:" + uuid }
+func RefSecurityScan(repo, id string) string                    { return repo + "|scan:" + id }
+func RefVulnerabilityOccurrence(repo, uuid string) string       { return repo + "|occurrence:" + uuid }
+
 // KeyCoverage is the canonical key of the per-repo coverage marker (T057).
 func KeyCoverage(repo string) string { return key("coverage", repo) }
 

@@ -19,9 +19,10 @@ var ErrNotImplemented = errors.New("not implemented")
 var ErrVulnerabilitiesUnavailable = errors.New("vulnerabilities unavailable")
 
 // ErrDomainUnavailable marks an optionally-gated domain (notes, users, work
-// items, milestones, labels, runners) as unavailable on this provider/instance
-// (T005): a 403/404 or a token missing the required scope is a capability
-// signal — the caller skips the domain instead of failing the pass.
+// items, milestones, labels, runners; schema v3: group/tree, merge-request
+// nodes, security findings) as unavailable on this provider/instance (T005):
+// a 403/404 or a token missing the required scope is a capability signal — the
+// caller skips the domain instead of failing the pass.
 var ErrDomainUnavailable = errors.New("domain unavailable")
 
 // TailLines returns the last n lines of the text (n<=0 — no truncation).
@@ -127,6 +128,11 @@ type ChangeRequest struct {
 	Reviewers []string
 	Labels    []string
 	Milestone string
+	// Merge-review fields (additive; schema v3, data-model §new nodes): the
+	// merge state/commit the merge_request node declares. Zero values keep the
+	// pre-parity record unchanged.
+	Merged         bool
+	MergeCommitSHA string
 }
 
 // Pipeline is a CI pipeline with jobs.
@@ -201,6 +207,30 @@ type VulnerabilityFinding struct {
 	Scanner      string
 	State        string
 	LocationFile string
+	// Schema-v3 security family fields (additive; data-model §new nodes): the
+	// scanner/identifier/scan context the vulnerability, finding, occurrence,
+	// identifier and scanner nodes are derived from. Zero values keep the
+	// pre-parity record unchanged.
+	UUID                 string
+	VulnerabilityID      string
+	LocationPath         string
+	ScannerKey           string
+	ScannerID            string
+	ScannerVendor        string
+	PrimaryIdentifierKey string
+	ScanID               string
+	ScanType             string
+	ScanStatus           string
+	ScanPipelineID       string
+	Identifiers          []VulnerabilityIdentifier
+}
+
+// VulnerabilityIdentifier is one identifier of a security finding (schema-v3
+// vulnerability_identifier node).
+type VulnerabilityIdentifier struct {
+	ExternalType string
+	Name         string
+	URL          string
 }
 
 // Optional capability interfaces (R12). Implementations may satisfy any
@@ -315,4 +345,91 @@ type LabelsProvider interface {
 // RunnersProvider lists CI runners available to a repository.
 type RunnersProvider interface {
 	ListRunners(ctx context.Context, repo Repo) ([]Runner, error)
+}
+
+// Schema-v3 optional domain interfaces (T009; data-model §new nodes). Like the
+// capability interfaces above, implementations may satisfy any subset; callers
+// type-assert to detect support, and an implementation returns
+// ErrDomainUnavailable when the provider/instance lacks the capability
+// (403/404 or a token missing the required scope) — a skipped domain, never a
+// failed pass.
+
+// TreeEntry is one repository tree entry (structure family); Type is
+// "blob" | "tree".
+type TreeEntry struct {
+	Path string
+	Name string
+	Type string
+}
+
+// Branch is a normalized repository branch (schema-v3 branch node).
+type Branch struct {
+	Name      string
+	Default   bool
+	Protected bool
+}
+
+// TreeReader lists the repository tree and branches (structure family: the
+// directory/file and branch nodes). The tree may be paginated by the provider;
+// every entry must be returned.
+type TreeReader interface {
+	ListTree(ctx context.Context, repo Repo) ([]TreeEntry, error)
+	ListBranches(ctx context.Context, repo Repo) ([]Branch, error)
+}
+
+// MergeRequestDiffRef is one diff version of a merge request (schema-v3
+// merge_request_diff node: the provider's diff_refs / versions triple).
+type MergeRequestDiffRef struct {
+	Version  string
+	BaseSHA  string
+	StartSHA string
+	HeadSHA  string
+	State    string
+}
+
+// MergeRequestNodeReader lists change requests with their merge metadata
+// (ChangeRequest.Merged/MergeCommitSHA) and the diff versions of one request
+// (review family: the merge_request / merge_request_diff nodes). Listing the
+// diff refs is per-request — providers fetch versions only on demand.
+type MergeRequestNodeReader interface {
+	ListMergeRequestNodes(ctx context.Context, repo Repo) ([]ChangeRequest, error)
+	ListMergeRequestDiffRefs(ctx context.Context, repo Repo, mrID int) ([]MergeRequestDiffRef, error)
+}
+
+// Group is a normalized namespace group (schema-v3 group node).
+type Group struct {
+	ID       string
+	FullPath string
+	Path     string
+	Name     string
+	ParentID string
+}
+
+// Project is a normalized project record (schema-v3 project node) with the
+// namespace context the node declares (NamespaceKind, CreatorID).
+type Project struct {
+	ID            string
+	FullPath      string
+	Path          string
+	Name          string
+	NamespaceKind string
+	CreatorID     string
+}
+
+// GroupReader lists the groups and the projects of one group (core family: the
+// group/project nodes). Projects are listed per group so their namespace
+// (full_path/namespace_kind) context stays complete.
+type GroupReader interface {
+	ListGroups(ctx context.Context) ([]Group, error)
+	ListGroupProjects(ctx context.Context, groupPath string) ([]Project, error)
+}
+
+// SecurityVulnReader lists security findings with the scanner, identifier and
+// scan context their nodes need (security family: vulnerability, finding,
+// occurrence, identifier, scanner, scan). One findings listing carries the
+// whole sub-family. A provider without security support returns
+// ErrVulnerabilitiesUnavailable (or ErrDomainUnavailable) — the caller skips
+// the domain.
+type SecurityVulnReader interface {
+	ListSecurityFindings(ctx context.Context, repo Repo) ([]VulnerabilityFinding, error)
 }
