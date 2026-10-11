@@ -14,25 +14,84 @@ One binary — two modes:
 | `-mode=worker` | repository mirroring, chunking, embeddings, writes to Qdrant |
 | `-mode=mcp` | MCP server for search over code/PRs/issues/CI failures |
 
+## Quickstart (5 minutes)
+
+Prerequisites: Docker with Compose v2 and ~2 GB of disk for the `bge-m3` model.
+
+The demo is fully containerized — Qdrant, NATS, Ollama (with a one-shot
+`bge-m3` pull), the worker and the MCP server — and needs no host networking.
+Its default source is the public GitHub organization from
+[`.env.example`](.env.example) (`GITHUB_ORG=gorizond`, no token).
+
+```bash
+# 1. create the environment (the example is demo-ready as-is)
+cp .env.example .env
+
+# 2. start the stack; the first run pulls the model (~1-2 min)
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+```
+
+```bash
+# 3. verify: NATS JetStream is up …
+curl -s http://127.0.0.1:8222/jsz | head -c 120     # → {"server_id":…}
+
+# … and the MCP server answers the indexing-status tool:
+SID=$(curl -sSD - -o /dev/null -X POST http://127.0.0.1:8080/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
+  | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')
+curl -sS -X POST http://127.0.0.1:8080/mcp -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -H "Mcp-Session-Id: $SID" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+curl -sS -X POST http://127.0.0.1:8080/mcp -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -H "Mcp-Session-Id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_status","arguments":{}}}'
+# → data: {…"structuredContent":{"available":true,"repos_total":…}}
+```
+
+The status appears after the first discovery listing and the first status tick
+(at most 60 s after startup) — until then `available:false` simply means the
+worker has not published yet ([Indexing status](#indexing-status-index_status)).
+Then point an MCP client at `http://127.0.0.1:8080/mcp`
+([MCP integrations](#mcp-integrations)).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  VCS[(GitLab / GitHub)] -->|list + fetch| D[discovery]
+  D --> MI[mirror]
+  MI --> CH[chunk + embed]
+  CH --> QD[(Qdrant)]
+  MET["metadata: issues / MR / CI"] --> QD
+  GC["GC: vanished repos and entities"] --> QD
+  QD --> MCP[MCP server]
+  MCP -->|search_code, search_*| CL[LLM / IDE client]
+  MCP -->|index_status| KV[(status KV)]
+  MCP -.->|refresh_repo, auto-refresh| NATS[NATS JetStream]
+  NATS -.-> MET
+  NATS -.-> KV
+```
+
+The background lanes (discovery → mirror → index → metadata, plus the GC lane)
+keep the index fresh; the MCP server only reads Qdrant and, with NATS, can pull
+one repository on demand ([refresh flow](docs/refresh.md)) or refresh it
+automatically before a repo-scoped search (Auto freshness below).
+
 ## Key environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `GITLAB_GROUP_ID` / `GITLAB_TOKEN` | GitLab group (comma-separated list) and access token |
-| `GITHUB_ORG` / `GITHUB_TOKEN` | GitHub organization (list) and access token |
-| `GITLAB_BASE_URL` / `GITHUB_BASE_URL` | self-hosted/GHES endpoint (optional) |
-| `EMBEDDINGS_PROVIDER` | `ollama` or `lm-studio` |
-| `EMBEDDINGS_BASE_URL` / `EMBEDDINGS_MODEL` | embeddings endpoint and model |
-| `EMBEDDINGS_DIM` | vector dimension (default 1024) |
+| `GITHUB_ORG` / `GITHUB_TOKEN` | GitHub organization (list); the token is optional for public orgs |
+| `EMBEDDINGS_PROVIDER` / `EMBEDDINGS_MODEL` / `EMBEDDINGS_DIM` | `ollama` or `lm-studio`, model (default `bge-m3`), dimension (default `1024`) |
 | `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant gRPC address and collection name |
 | `MCP_TRANSPORT` / `MCP_ADDR` | `stdio` (default) or `sse`; address for sse |
-| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | discovery/index pass tick (a ceiling, see Adaptive tuning) and the embeddings limiter ceiling (default 2) |
-| `WORKER_META_INTERVAL` / `WORKER_MIRROR_INTERVAL` | metadata / mirror pass tick (default — `WORKER_INTERVAL`) |
-| `WORKER_GC_INTERVAL` / `WORKER_GC_DRY_RUN` | repo/entity GC pass (default 15m) and the dry-run kill-switch (default true — nothing is deleted) |
-| `WORKER_DISCOVERY_MIN_INTERVAL` | reuse a younger discovery listing without an API call (default `0` — refresh on every pass) |
-| `MIRRORS_DIR` | bare mirror directory (default `./mirrors`) |
-| `NATS_URL` | local JetStream for on-demand refresh (`refresh_repo`); empty — the feature is off |
-| `NATS_INSTANCE_ID` | instance id scoping consumers/subjects/KV on a shared NATS (default `default`) |
+| `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | lane tick ceiling and the embeddings limiter ceiling (default 2) |
+| `NATS_URL` / `NATS_INSTANCE_ID` | local JetStream (refresh/auto-freshness/status) and the instance scope |
+
+The complete reference — all 30 variables with defaults and secrets — is in
+[`docs/env.md`](docs/env.md).
 
 Switching GitLab ↔ GitHub is env-only: the core does not change (both providers
 share one interface and pass one contract suite).
@@ -126,7 +185,9 @@ formats — [`docs/gc.md`](docs/gc.md).
   summary reports `gc_dry_run`, `gc_anomaly`, `gc_deleted_repos/points` and the
   suppression counters.
 
-Embeddings — the target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
+## Embeddings
+
+The target model is **`bge-m3`** (dim 1024, COSINE): in Ollama
 (`ollama pull bge-m3`) or in LM Studio (GGUF build, e.g. `lm-kit/bge-m3-gguf`;
 the local server is enabled in the UI). The providers are interchangeable —
 switching is env-only; the Qdrant collection name is `QDRANT_COLLECTION`
@@ -138,27 +199,39 @@ switching is env-only; the Qdrant collection name is `QDRANT_COLLECTION`
 
 ## Running
 
+The supported deployment path is Compose. Copy [`.env.example`](.env.example)
+to `.env`, keep exactly one VCS flavor active, then:
+
+```bash
+docker compose up -d          # "Deploy example": host Ollama/LM Studio
+# or the fully containerized demo (see Quickstart):
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+```
+
+Both stacks publish everything on `127.0.0.1` only. Building the image locally
+(or using the published `ghcr.io/gorizond/vcs-rag`):
+
 ```bash
 docker build -t vcs-rag:dev .
-docker run --rm vcs-rag:dev            # → vcs-rag dev
 docker run --rm vcs-rag:dev -version   # → vcs-rag <version>
 ```
 
-Worker (requires reachable Qdrant and Ollama/LM Studio; tokens via env only):
+For a one-off container the worker needs reachable Qdrant and embeddings
+endpoints; with Docker on Linux the host is reached via
+`host.docker.internal` (no host networking needed):
 
 ```bash
-# GitLab: group or list of groups (subgroups included, dedup by ID)
-docker run --rm --network host \
-  -e GITLAB_GROUP_ID=<group-or-list> -e GITLAB_TOKEN=<read_api-token> \
-  -e EMBEDDINGS_PROVIDER=ollama -e QDRANT_URL=http://localhost:6334 \
-  -v "$PWD/mirrors":/mirrors vcs-rag:dev -mode=worker
-
-# GitHub: organization or list
-docker run --rm --network host \
-  -e GITHUB_ORG=<org-or-list> -e GITHUB_TOKEN=<repo-read-token> \
-  -e EMBEDDINGS_PROVIDER=ollama -e QDRANT_URL=http://localhost:6334 \
-  -v "$PWD/mirrors":/mirrors vcs-rag:dev -mode=worker
+docker run --rm \
+  -e GITHUB_ORG=<org> -e EMBEDDINGS_PROVIDER=ollama \
+  -e EMBEDDINGS_BASE_URL=http://host.docker.internal:11434 \
+  -e QDRANT_URL=http://host.docker.internal:6334 \
+  -v "$PWD/mirrors":/mirrors \
+  --add-host=host.docker.internal:host-gateway \
+  vcs-rag:dev -mode=worker
 ```
+
+`--network host` is only a production nuance when the embeddings service must
+be reached on the host's loopback — the compose stacks avoid it entirely.
 
 Private repositories: the token is passed to git processes through the
 environment (`http.extraHeader`, Basic: GitLab `oauth2:<token>`, GitHub
@@ -171,40 +244,152 @@ environment (`http.extraHeader`, Basic: GitLab `oauth2:<token>`, GitHub
 search, Qdrant and a local NATS JetStream:
 
 ```bash
-GITLAB_GROUP_ID=<your-group-id> GITLAB_TOKEN=<your-read-api-token> docker compose up -d
-# or put the same variables into a local .env (never commit real values)
+cp .env.example .env    # then edit: one provider flavor, host Ollama/LM Studio
+docker compose up -d
 ```
 
 - The embeddings endpoint points at your Ollama/LM Studio
   (`EMBEDDINGS_BASE_URL`, default `http://host.docker.internal:11434`; on Linux
   the compose file adds `host.docker.internal:host-gateway`).
 - MCP is exposed on `http://127.0.0.1:8080/mcp` (`MCP_TRANSPORT=sse`).
-- `NATS_URL` enables `refresh_repo`; `NATS_INSTANCE_ID` allows several
-  deployments on one NATS server.
+- `NATS_URL` enables `refresh_repo`, auto-freshness and `index_status`;
+  `NATS_INSTANCE_ID` allows several deployments on one NATS server.
 - All values in the compose file are `${ENV}` placeholders or example values —
   no real tokens, groups or private endpoints belong in the repository.
 
-## MCP: Cursor / Claude
+## MCP integrations
 
-stdio (into the client config, `mcpServers`):
+The server speaks stdio (`-mode=mcp`) and streamable HTTP
+(`MCP_TRANSPORT=sse MCP_ADDR=:8080` → `http://127.0.0.1:8080/mcp`); the
+compose stacks publish the HTTP endpoint on loopback. All clients below assume
+that URL; for remote access put a reverse proxy with TLS/auth in front
+([Security](#security)).
+
+**opencode** (`mcp.servers` in the config):
 
 ```json
-{"mcpServers": {"vcs-rag": {"command": "docker", "args": [
-  "run", "-i", "--rm", "--network", "host",
-  "-e", "GITLAB_GROUP_ID=1", "-e", "GITLAB_TOKEN=dummy",
-  "-e", "EMBEDDINGS_PROVIDER=ollama", "-e", "QDRANT_URL=http://localhost:6334",
-  "vcs-rag:dev", "-mode=mcp"]}}}
+{"mcp":{"servers":{"vcs-rag":{"type":"remote","url":"http://127.0.0.1:8080/mcp","enabled":true}}}}
+```
+
+**Cursor** (`~/.cursor/mcp.json` or `.cursor/mcp.json`):
+
+```json
+{"mcpServers":{"vcs-rag":{"url":"http://127.0.0.1:8080/mcp"}}}
+```
+
+Add `headers` (e.g. `{"Authorization":"Bearer <token>"}`) when the endpoint is
+proxied with auth.
+
+**Claude Desktop** (`claude_desktop_config.json`) — run the stdio mode locally:
+
+```json
+{"mcpServers":{"vcs-rag":{"command":"docker","args":[
+  "run","-i","--rm",
+  "-e","GITLAB_GROUP_ID=1","-e","GITLAB_TOKEN=dummy",
+  "-e","EMBEDDINGS_PROVIDER=ollama",
+  "-e","EMBEDDINGS_BASE_URL=http://host.docker.internal:11434",
+  "-e","QDRANT_URL=http://host.docker.internal:6334",
+  "--add-host=host.docker.internal:host-gateway",
+  "ghcr.io/gorizond/vcs-rag:latest","-mode=mcp"]}}}
 ```
 
 Search needs no VCS access: provider envs are required only for config
-validation (dummy is fine). Network mode: `MCP_TRANSPORT=sse MCP_ADDR=:8080` →
-endpoint `http://localhost:8080/mcp`.
+validation (dummy is fine). For the HTTP endpoint use **Settings →
+Connectors** (Remote MCP) — Claude Desktop does not take remote servers from
+the JSON file.
 
-Tools: `search_code`, `search_pull_requests`, `search_issues`,
-`search_ci_failures`, `index_status` (the worker indexing progress read from
-the instance status KV; `available=false` until the worker publishes) and, with
-`NATS_URL` set, `refresh_repo`; backend errors are returned in a structured form
-(`{"error": {...}}`), the server does not crash.
+**VS Code** (`.vscode/mcp.json` or the user `mcp` settings):
+
+```json
+{"servers":{"vcs-rag":{"type":"http","url":"http://127.0.0.1:8080/mcp"}}}
+```
+
+**Gotcha:** clients cache the tool list at connect time — after upgrading the
+server image (a new version adds tools), **restart the client**; a plain
+reconnect may keep the old list. Every client should show the tools
+`search_code`, `search_pull_requests`, `search_issues`, `search_ci_failures`,
+`index_status` (and `refresh_repo` with `NATS_URL` set); calling `index_status`
+is the quickest connectivity check.
+
+## Indexing status (`index_status`)
+
+The tool answers with an object built from the `worker_status_<id>` KV snapshot
+the worker publishes at most once per minute (only with `NATS_URL` set):
+
+- `available` — `true` when a snapshot is present; otherwise `reason` explains
+  it (`NATS is not configured`, `no worker status published yet` — the first
+  tick has not happened, `worker status is unreadable`);
+- `repos_total` / `repos_indexed` / `repos_pending` — discovery size vs
+  repositories with at least one indexed commit in their state sidecar;
+- `pending_sample` — up to 10 sorted names of the pending repositories;
+- `points` — the exact Qdrant point count (omitted when the count failed);
+- `last_pass` — the counters of the last **completed** index pass
+  (`repos`, `ok`, `errors`, `indexed_commits`, `resumed`, `skipped`, `pruned`,
+  `duration_ms`); the field is omitted until the first pass completes, so a
+  long backfill still reports fresh totals without it;
+- `updated_at` — when the snapshot was built.
+
+The published value lives in `worker_status_<instance id>` (key `status`, TTL
+24 h); the refresh contract in `refresh_status_<id>` is untouched.
+
+## Troubleshooting
+
+1. **`connection refused` from the worker to the embeddings endpoint** — the
+   stack uses the *host* Ollama/LM Studio (`EMBEDDINGS_BASE_URL`, default
+   `http://host.docker.internal:11434`). On Linux the compose file adds
+   `host.docker.internal:host-gateway`; without a host Ollama use the
+   self-contained demo (`docker-compose.demo.yml`). Check the model is pulled:
+   `ollama pull bge-m3`.
+2. **`dimension … expected …`** — the collection was built with another
+   `EMBEDDINGS_DIM`/model; follow [`docs/reindex.md`](docs/reindex.md).
+3. **`index_status` → `available:false`** — with `NATS_URL` empty the tool
+   always reports `NATS is not configured`; otherwise the worker publishes at
+   most once per minute, so wait a tick. `no worker status published yet` for
+   minutes means the worker is not running or its discovery snapshot is still
+   empty (nothing is published until the first listing arrives).
+4. **HTTP `429` / `Retry-After`** — the provider's rate limit (anonymous GitHub:
+   60 requests/hour per IP). The lanes back off by themselves (Adaptive
+   tuning); for less pressure use a provider token and/or
+   `WORKER_DISCOVERY_MIN_INTERVAL=10m`.
+5. **Tools missing in the client after an upgrade** — clients cache the list;
+   restart the client (see the integrations gotcha).
+
+## Security
+
+- **Loopback by default**: the compose stacks publish Qdrant, NATS and MCP on
+  `127.0.0.1`; the MCP server has no built-in authentication.
+- For remote clients expose only the MCP endpoint through a reverse proxy with
+  **TLS and auth** (e.g. an ingress with basic auth / an OIDC proxy); keep
+  Qdrant and NATS private.
+- `QDRANT_API_KEY` for Qdrant Cloud or any reachable-remotely Qdrant instance.
+- Secrets (VCS tokens, `QDRANT_API_KEY`) live in `.env`/the orchestrator's
+  secret store; the repository contains placeholders only. Git tokens travel in
+  the process environment and never reach clone URLs or mirror configs.
+- GC runs with `WORKER_GC_DRY_RUN=true` until you deliberately disable it —
+  deletions are journalled ([`docs/gc.md`](docs/gc.md)).
+
+## Scaling and multiple instances
+
+One deployment is defined by the triple `QDRANT_COLLECTION` +
+`NATS_INSTANCE_ID` + `MIRRORS_DIR` — keep it unique per instance. Several
+instances can share one NATS server (the stream is common; consumer, subjects
+and the `refresh_status_<id>`/`worker_status_<id>` buckets are scoped by the
+instance id), and every MCP server answers for the instance it is configured
+with. `index_status`, refresh and auto-freshness are per-instance.
+
+## Backup and restore
+
+- **Qdrant** — the index of record. Use Qdrant snapshots
+  (`POST /collections/<name>/snapshots`, plus the volume `qdrant-data`); restore
+  by creating the collection and uploading the snapshot (or copying the volume
+  while stopped).
+- **`mirrors/` volume** — bare mirrors, `*.state.json` sidecars and
+  `.gc_registry.json`. Optional: everything can be re-cloned and re-indexed
+  from the provider, but the sidecars avoid re-embedding unchanged code and
+  keep the incremental caches.
+- **NATS `nats-data`** — ephemeral: the status/refresh KV entries have a 24 h
+  TTL and the topology is re-provisioned at worker startup. No backup needed.
+- Keep `.env` in your secret backup (it holds the tokens, not the index).
 
 ## Release
 
@@ -220,9 +405,16 @@ docker run --rm ghcr.io/gorizond/vcs-rag:0.0.1 -version   # → vcs-rag v0.0.1
 
 ## Maintenance
 
-- Changing the embeddings model/dimension — reindex procedure: [`docs/reindex.md`](docs/reindex.md).
+- All environment variables — [`docs/env.md`](docs/env.md).
+- Refresh semantics — [`docs/refresh.md`](docs/refresh.md); garbage collection —
+  [`docs/gc.md`](docs/gc.md); changing the embeddings model/dimension —
+  [`docs/reindex.md`](docs/reindex.md).
 - Validation SC-001…SC-009 and the performance baseline — `tests/integration/final-validation.md`,
   `tests/integration/perf-baseline.md`.
 
 Full contracts (CLI, MCP tools, Qdrant schema) live in the project spec-kit
 (0_WORK repository), see `contracts/cli.md` in the specification.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

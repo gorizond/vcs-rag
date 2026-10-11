@@ -12,6 +12,8 @@ mirrors/
 # Environment / secrets
 .env
 .env.*
+# …but the placeholder example is part of the repository
+!.env.example
 
 # OS / editor
 .DS_Store
