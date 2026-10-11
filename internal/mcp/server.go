@@ -41,6 +41,10 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	// subject/KV names come from the instance id; search itself keeps working
 	// regardless of the NATS availability.
 	tl := newTools(emb, st, nil)
+	// T017–T019: the graph tools read the payload-only graph collection; the
+	// graph store shares the vector store's gRPC client (no second connection).
+	tl.graph = store.NewGraphStore(st, cfg.Qdrant.GraphCollection)
+	tl.graphSchemaVer = cfg.Worker.GraphSchemaVer
 	// T132: the repository list index resolves short-form repo filters without
 	// extra API calls; the provider constructor makes no network calls, and a
 	// failure only degrades to the raw path (the search keeps working).

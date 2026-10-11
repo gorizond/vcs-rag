@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorizond/vcs-rag/internal/gitengine"
 	"github.com/gorizond/vcs-rag/internal/provider"
+	"github.com/gorizond/vcs-rag/internal/store"
 )
 
 // refreshStatus is the refresh_status KV value (T109/T112 wire contract; the
@@ -86,6 +87,14 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 		if after, err := LoadState(statePath); err == nil {
 			res.CommitsIndexed = indexedDelta(before.Branches, after.Branches)
 		}
+		// phase 2b (T020): graph extraction for the refreshed repository — the
+		// same entry point as the graph lane, on the freshly fetched mirror.
+		// Best-effort like the other phases: a failure is collected, not fatal.
+		if gs := refreshGraphStore(deps); gs != nil {
+			if _, err := processGraphRepo(ctx, deps.Cfg, deps, gs, repo, int(time.Now().Unix())); err != nil {
+				res.Errors = append(res.Errors, "graph: "+err.Error())
+			}
+		}
 		// phase 3: metadata (best-effort). T135: an "auto" refresh skips it when
 		// the repository was metadata-synced recently — the background metadata
 		// lane covers it; an explicit request always refreshes metadata.
@@ -108,6 +117,17 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 	})
 	res.Duration = time.Since(start)
 	return res
+}
+
+// refreshGraphStore derives the graph store from the worker store the refresh
+// already holds (T020): one client, the config-named payload-only collection.
+// Nil — the graph phase is skipped — without a worker store (narrow unit tests
+// use fake index/meta stores) or without a config.
+func refreshGraphStore(deps RepoDeps) *store.GraphStore {
+	if deps.Store == nil || deps.Cfg == nil {
+		return nil
+	}
+	return store.NewGraphStore(deps.Store, deps.Cfg.Qdrant.GraphCollection)
 }
 
 // indexedDelta counts the commits that appeared in the branch state since the

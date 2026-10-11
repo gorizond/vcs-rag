@@ -91,3 +91,71 @@ type RateLimit struct {
 	Reset      time.Time
 	RetryAfter time.Duration
 }
+
+// ChangeRequestFile is a single file diff of a change request (R12).
+type ChangeRequestFile struct {
+	OldPath   string
+	NewPath   string
+	Status    string // added | modified | deleted | renamed
+	Patch     string
+	Truncated bool
+	MRID      int
+}
+
+// CIPipelineDetail is one job of a CI pipeline with its stage context (R12).
+type CIPipelineDetail struct {
+	PipelineID int
+	Stage      string
+	JobName    string
+	Status     string
+	Ref        string
+	CommitSHA  string
+	Env        string
+	DurationMS int64
+}
+
+// DeploymentInfo is a normalized deployment record (R12).
+type DeploymentInfo struct {
+	ID          int
+	Environment string
+	Status      string
+	Ref         string
+	CommitSHA   string
+}
+
+// EnvironmentInfo is a normalized CI/CD environment (R12).
+type EnvironmentInfo struct {
+	Name        string
+	State       string
+	Tier        string
+	ExternalURL string
+}
+
+// VulnerabilityFinding is a normalized security finding (R12).
+type VulnerabilityFinding struct {
+	ID           string
+	Severity     string
+	Scanner      string
+	State        string
+	LocationFile string
+}
+
+// Optional capability interfaces (R12). Implementations may satisfy any
+// subset; callers type-assert to detect support.
+
+// ChangeRequestDiffProvider lists file diffs of a change request.
+type ChangeRequestDiffProvider interface {
+	ListChangeRequestDiffs(ctx context.Context, repo Repo, mrID int) ([]ChangeRequestFile, error)
+}
+
+// CIPipelineDetailProvider exposes pipeline jobs, deployments and environments.
+type CIPipelineDetailProvider interface {
+	ListPipelineJobs(ctx context.Context, repo Repo, pipelineID int) ([]CIPipelineDetail, error)
+	ListDeployments(ctx context.Context, repo Repo) ([]DeploymentInfo, error)
+	ListEnvironments(ctx context.Context, repo Repo) ([]EnvironmentInfo, error)
+}
+
+// VulnerabilityProvider lists security findings of a repository.
+type VulnerabilityProvider interface {
+	ListVulnerabilities(ctx context.Context, repo Repo) ([]VulnerabilityFinding, error)
+}

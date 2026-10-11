@@ -54,6 +54,10 @@ type Qdrant struct {
 	URL        string
 	APIKey     string // secret, optional
 	Collection string
+	// GraphCollection is the payload-only graph collection; it is part of the
+	// instance identity (unique per deployment): several contours may share
+	// one Qdrant, so it must differ from Collection (FR-021/SC-007).
+	GraphCollection string
 }
 
 // Worker holds background loop parameters (FR-005/006/018).
@@ -63,6 +67,12 @@ type Worker struct {
 	MirrorInterval time.Duration // mirror pass tick (WORKER_MIRROR_INTERVAL, default Interval)
 	GCInterval     time.Duration // repo-GC pass tick (WORKER_GC_INTERVAL, default 15m)
 	GCDryRun       bool          // WORKER_GC_DRY_RUN (default true — the kill-switch)
+	GraphInterval  time.Duration // graph lane tick (WORKER_GRAPH_INTERVAL, default 30m)
+	// GraphSchemaVer is part of the graph uuid5 namespace (WORKER_GRAPH_SCHEMA_VER, default "1").
+	GraphSchemaVer string
+	// GraphMaxReposPerPass caps repositories processed per graph pass
+	// (WORKER_GRAPH_MAX_REPOS_PER_PASS, default 5).
+	GraphMaxReposPerPass int
 	// DiscoveryMinInterval reuses a younger discovery snapshot without an API
 	// call (T143); 0 (default) refreshes on every pass as before.
 	DiscoveryMinInterval time.Duration
@@ -178,6 +188,12 @@ func Load() (*Config, error) {
 		URL:        envDefault("QDRANT_URL", "http://localhost:6334"),
 		APIKey:     os.Getenv("QDRANT_API_KEY"),
 		Collection: envDefault("QDRANT_COLLECTION", "vcs_rag"),
+		// FR-021/SC-007: the graph collection is instance-scoped (unique per
+		// deployment) because several contours may share one Qdrant.
+		GraphCollection: envDefault("QDRANT_GRAPH_COLLECTION", "vcs_rag_graph"),
+	}
+	if cfg.Qdrant.GraphCollection == cfg.Qdrant.Collection {
+		return nil, &ConfigError{Problem: "QDRANT_GRAPH_COLLECTION must differ from QDRANT_COLLECTION (instance isolation)"}
 	}
 
 	// --- Worker ---
@@ -228,12 +244,24 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// T001/FR-021: the graph lane cadence and per-pass cap.
+	graphInterval, err := envDuration("WORKER_GRAPH_INTERVAL", 30*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	graphMaxRepos, err := envInt("WORKER_GRAPH_MAX_REPOS_PER_PASS", 5)
+	if err != nil {
+		return nil, err
+	}
 	cfg.Worker = Worker{
 		Interval:             interval,
 		MetaInterval:         metaInterval,
 		MirrorInterval:       mirrorInterval,
 		GCInterval:           gcInterval,
 		GCDryRun:             gcDryRun,
+		GraphInterval:        graphInterval,
+		GraphSchemaVer:       envDefault("WORKER_GRAPH_SCHEMA_VER", "1"),
+		GraphMaxReposPerPass: graphMaxRepos,
 		DiscoveryMinInterval: discoveryMin,
 		Concurrency:          concurrency,
 		MirrorsDir:           envDefault("MIRRORS_DIR", "./mirrors"),

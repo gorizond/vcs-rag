@@ -3,12 +3,16 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/qdrant/go-client/qdrant"
 
+	"github.com/gorizond/vcs-rag/internal/graph"
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
@@ -16,6 +20,15 @@ import (
 type Searcher interface {
 	Search(ctx context.Context, vector []float32, f store.Filter, topK int) ([]store.ScoredPoint, error)
 }
+
+// GraphReader — a narrow read surface of the payload-only graph collection
+// (T017–T019); *store.GraphStore satisfies it. The graph writer is the worker.
+type GraphReader interface {
+	ScrollAll(ctx context.Context, f *qdrant.Filter, limit uint32) ([]*qdrant.RetrievedPoint, error)
+}
+
+// errGraphStore — the graph store was not wired into the MCP server.
+var errGraphStore = errors.New("graph store is not configured")
 
 // Embedder — a narrow embeddings interface for the tools (mock in tests).
 type Embedder interface {
@@ -27,7 +40,13 @@ const (
 	defaultTopK = 5
 	maxTopK     = 20 // cap from contracts/mcp-tools.md
 	maxSnippet  = 400
+
+	defaultDefinitionsTopK = 10          // search_definitions default (contract)
+	graphPageSize          = uint32(256) // graph scroll page size
 )
+
+// codeInvalidInput — argument validation errors of the graph tools (T017–T019).
+const codeInvalidInput = "invalid_input"
 
 // tools — MCP tool implementations on top of narrow interfaces.
 type tools struct {
@@ -38,6 +57,9 @@ type tools struct {
 	repos     *repoIndex   // nil — the repo filter is passed through as before (T132)
 	auto      *autoClient  // nil when NATS_URL is empty — auto-refresh is off (T134)
 	status    statusReader // nil when NATS_URL is empty — index_status reports unavailable (T151)
+
+	graph          GraphReader // nil — graph tools report qdrant_unavailable (T017–T019)
+	graphSchemaVer string      // WORKER_GRAPH_SCHEMA_VER, reported by graph_schema
 }
 
 // statusReader reads the worker indexing status from the instance KV (T151).
@@ -78,6 +100,29 @@ type ciFailuresInput struct {
 	Repo   string `json:"repo,omitempty" jsonschema:"repository path, or a unique short form (e.g. \"nats\", \"secrets/runner\")"`
 	Branch string `json:"branch,omitempty" jsonschema:"branch"`
 	TopK   int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
+}
+
+// searchDefinitionsInput — T017.
+type searchDefinitionsInput struct {
+	Query      string `json:"query" jsonschema:"symbol name (name mode) or natural-language description (semantic mode)"`
+	Repo       string `json:"repo,omitempty" jsonschema:"repository path, or a unique short form (e.g. \"nats\", \"secrets/runner\")"`
+	FilePath   string `json:"file_path,omitempty" jsonschema:"filter: path of the file that defines the symbol"`
+	SymbolKind string `json:"symbol_kind,omitempty" jsonschema:"filter: definition kind, e.g. func | method | type"`
+	Mode       string `json:"mode,omitempty" jsonschema:"search mode: auto | name | semantic (default auto)"`
+	TopK       int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 10, maximum 20)"`
+}
+
+// graphEdgesInput — T018 (get_imports / get_dependents).
+type graphEdgesInput struct {
+	Repo      string `json:"repo" jsonschema:"repository required: import edges are namespaced by repository (full namespace/path or a unique short form)"`
+	FilePath  string `json:"file_path,omitempty" jsonschema:"file path; give exactly one of file_path, package"`
+	Package   string `json:"package,omitempty" jsonschema:"package path; give exactly one of file_path, package"`
+	Direction string `json:"direction,omitempty" jsonschema:"traversal direction: outgoing | incoming (each tool has its own default)"`
+}
+
+// graphSchemaInput — T019 (no required arguments).
+type graphSchemaInput struct {
+	Repo string `json:"repo,omitempty" jsonschema:"optional repo scope for coverage_per_repo"`
 }
 
 // resultsResponse is the structured payload of every search tool (T148):
@@ -131,6 +176,87 @@ type ciHit struct {
 	JobName    string  `json:"job_name"`
 	Score      float32 `json:"score"`
 	Snippet    string  `json:"snippet"`
+}
+
+// --- graph response items (T017–T019, contracts/mcp-tools.md) ---
+
+// coverage — the per-repo graph coverage notice of every graph response
+// (data-model §9, minimal form). Best-effort: indexed_commit stays empty until
+// graph coverage points are written, truncated reports a shortened walk.
+type coverage struct {
+	Repo          string `json:"repo"`
+	IndexedCommit string `json:"indexed_commit"`
+	Truncated     bool   `json:"truncated"`
+}
+
+// definitionHit — one definition node; commit_sha is always carried (honesty).
+type definitionHit struct {
+	Repo       string  `json:"repo"`
+	FilePath   string  `json:"file_path"`
+	Symbol     string  `json:"symbol"`
+	SymbolKind string  `json:"symbol_kind,omitempty"`
+	Package    string  `json:"package,omitempty"`
+	Signature  string  `json:"signature,omitempty"`
+	CommitSHA  string  `json:"commit_sha"`
+	Score      float32 `json:"score,omitempty"`
+}
+
+type definitionsResponse struct {
+	Results  []definitionHit `json:"results"`
+	Coverage []coverage      `json:"coverage"`
+}
+
+// importEdge — one edge_type=imports point.
+type importEdge struct {
+	FromFile    string `json:"from_file"`
+	FromPackage string `json:"from_package"`
+	ToPackage   string `json:"to_package"`
+	External    bool   `json:"external"`
+}
+
+type importsResponse struct {
+	Results  []importEdge `json:"results"`
+	Coverage []coverage   `json:"coverage"`
+}
+
+// graphSchemaResponse — the self-description of the graph collection (T019).
+type graphSchemaResponse struct {
+	NodeTypes       []nodeTypeSpec   `json:"node_types"`
+	EdgeTypes       []edgeTypeSpec   `json:"edge_types"`
+	EntityTypes     []entityTypeSpec `json:"entity_types"`
+	QueryDSL        queryDSL         `json:"query_dsl"`
+	CoveragePerRepo []schemaCoverage `json:"coverage_per_repo"`
+}
+
+type nodeTypeSpec struct {
+	Name       string   `json:"name"`
+	Properties []string `json:"properties"`
+	Indexed    []string `json:"indexed"`
+}
+
+type edgeTypeSpec struct {
+	Name string `json:"name"`
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type entityTypeSpec struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type queryDSL struct {
+	Version   string   `json:"version"`
+	Operators []string `json:"operators"`
+}
+
+// schemaCoverage — the full per-repo coverage of graph_schema (data-model §9).
+type schemaCoverage struct {
+	Repo                   string   `json:"repo"`
+	IndexedCommit          string   `json:"indexed_commit"`
+	Generation             int      `json:"generation"`
+	IndexedAt              string   `json:"indexed_at"`
+	LanguagesWithResolvers []string `json:"languages_with_resolvers"`
 }
 
 // --- worker indexing status (T151) ---
@@ -192,6 +318,39 @@ func registerTools(server *mcp.Server, t *tools) {
 		Name:        "search_ci_failures",
 		Description: "Semantic search over failed CI job logs. The result object is {\"results\": [hits]}.",
 	}, t.searchCIFailures)
+	// T017–T019: graph tools; they report qdrant_unavailable when no graph
+	// store is wired (the production server always wires one).
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "search_definitions",
+		Description: "Search symbol definitions in the repository graph. mode=auto (default) tries name matching first and falls back " +
+			"to the semantic code search when name finds nothing; mode=name matches the symbol exactly or as a full-text token — " +
+			"there is NO substring or prefix operator (Qdrant match semantics). mode=semantic runs the vector code search and joins " +
+			"the hits to definition nodes by (repo, file_path), keeping the max chunk score per file. Each result carries commit_sha; " +
+			"coverage (repo, indexed_commit, truncated) is best-effort — indexed_commit is empty until the repository's first " +
+			"completed graph scan. " +
+			"The result object is {\"results\": [hits], \"coverage\": [...]}.",
+	}, t.searchDefinitions)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_imports",
+		Description: "Direct (1-hop) package imports of a file or package, from the graph edges (edge_type=imports). Package-level, " +
+			"not symbol-level: one edge per imported package. direction=outgoing (default) lists what the input imports; " +
+			"direction=incoming lists who imports the input package (a file input is resolved to its package(s) first). " +
+			"The result object is {\"results\": [{from_file, from_package, to_package, external}], \"coverage\": [...]}.",
+	}, t.getImports)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_dependents",
+		Description: "Direct (1-hop) dependents of a file or package from the graph edges: the importers. HONESTY: dependents of " +
+			"file X are the importers of X's package(s), NOT symbol referencers of X — symbol-level references are not indexed " +
+			"(package-level edges only). direction=incoming (default) lists importers of the input; direction=outgoing lists the " +
+			"input's imports. The result object is {\"results\": [{from_file, from_package, to_package, external}], \"coverage\": [...]}.",
+	}, t.getDependents)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "graph_schema",
+		Description: "Self-describing graph schema: node types (definition) with indexed properties, edge types (imports, defines), " +
+			"declared entity types (mr_file, ci, vuln), the query DSL version/operators, and coverage_per_repo " +
+			"(repo, indexed_commit, generation, indexed_at, languages_with_resolvers) from the per-repo coverage markers — " +
+			"best-effort, empty when no scan has completed yet.",
+	}, t.graphSchema)
 	// T151: registered unconditionally; without NATS it reports available=false.
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "index_status",
@@ -331,6 +490,517 @@ func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in
 	return nil, resultsResponse[ciHit]{Results: hits}, nil
 }
 
+// --- graph tools (T017–T019) ---
+
+// searchDefinitions — symbol-definition search (T017). Name mode is a Qdrant
+// filter (exact `symbol` OR full-text token `symbol_text`); semantic mode is a
+// fallback vector code search joined to definitions on (repo, file_path).
+func (t *tools) searchDefinitions(ctx context.Context, _ *mcp.CallToolRequest, in searchDefinitionsInput) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
+	defer cancel()
+	if t.graph == nil {
+		return nil, errorResult(ctx, codeSearchFailed, errGraphStore), nil
+	}
+	if strings.TrimSpace(in.Query) == "" {
+		return nil, toolError{Code: codeInvalidInput, Message: "query is required"}, nil
+	}
+	mode := in.Mode
+	if mode == "" {
+		mode = "auto"
+	}
+	if mode != "auto" && mode != "name" && mode != "semantic" {
+		return nil, toolError{Code: codeInvalidInput, Message: `mode must be "auto", "name" or "semantic"`}, nil
+	}
+	topK := clampTopKDefault(in.TopK, defaultDefinitionsTopK)
+	repos := t.graphRepos(ctx, in.Repo)
+
+	if mode != "semantic" {
+		hits, err := t.definitionNameHits(ctx, in, repos, topK)
+		if err != nil {
+			return nil, errorResult(ctx, codeSearchFailed, err), nil
+		}
+		if mode == "name" || len(hits) > 0 {
+			return t.definitionsResult(ctx, repos, hits)
+		}
+	}
+	vec, err := t.queryVector(ctx, in.Query)
+	if err != nil {
+		return nil, errorResult(ctx, codeEmbedFailed, err), nil
+	}
+	hits, err := t.definitionSemanticHits(ctx, vec, in, topK)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	return t.definitionsResult(ctx, repos, hits)
+}
+
+// definitionsResult attaches the best-effort coverage notice (T057 markers);
+// a repo without a marker keeps indexed_commit empty (unknown).
+func (t *tools) definitionsResult(ctx context.Context, repos []string, hits []definitionHit) (*mcp.CallToolResult, any, error) {
+	cov, err := t.coverageNotice(ctx, repos, hits)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	return nil, definitionsResponse{Results: hits, Coverage: cov}, nil
+}
+
+// getImports — direct 1-hop imports of a file/package (T018): what the input
+// imports (outgoing edges by default).
+func (t *tools) getImports(ctx context.Context, _ *mcp.CallToolRequest, in graphEdgesInput) (*mcp.CallToolResult, any, error) {
+	return t.graphEdges(ctx, in, string(graph.Outgoing))
+}
+
+// getDependents — direct dependents of a file/package (T018): who imports it.
+// R2 honesty: for a file the answer is the importers of the file's package(s),
+// never the symbol referencers (only package-level edges exist).
+func (t *tools) getDependents(ctx context.Context, _ *mcp.CallToolRequest, in graphEdgesInput) (*mcp.CallToolResult, any, error) {
+	return t.graphEdges(ctx, in, string(graph.Incoming))
+}
+
+// graphEdges — the shared 1-hop import-edge query. Outgoing filters by
+// from_file/from_package; incoming filters by to_package (a file input is
+// first resolved to the packages of its definition nodes).
+func (t *tools) graphEdges(ctx context.Context, in graphEdgesInput, defaultDir string) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
+	defer cancel()
+	if t.graph == nil {
+		return nil, errorResult(ctx, codeSearchFailed, errGraphStore), nil
+	}
+	repo := strings.Trim(strings.TrimSpace(in.Repo), "/")
+	if repo == "" {
+		return nil, toolError{Code: codeInvalidInput, Message: "repo is required: import edges are namespaced by repository"}, nil
+	}
+	if (in.FilePath == "") == (in.Package == "") {
+		return nil, toolError{Code: codeInvalidInput, Message: "give exactly one of file_path, package"}, nil
+	}
+	dir := in.Direction
+	if dir == "" {
+		dir = defaultDir
+	}
+	if dir != string(graph.Outgoing) && dir != string(graph.Incoming) {
+		return nil, toolError{Code: codeInvalidInput, Message: `direction must be "outgoing" or "incoming"`}, nil
+	}
+	repos := t.graphRepos(ctx, repo)
+	f := importEdgesFilter(repos)
+	switch dir {
+	case string(graph.Outgoing):
+		if in.FilePath != "" {
+			f.Must = append(f.Must, qdrant.NewMatch("from_file", in.FilePath))
+		} else {
+			f.Must = append(f.Must, qdrant.NewMatchKeywords("from_package", packageKeys(repos, in.Package)...))
+		}
+	default: // incoming
+		keys := packageKeys(repos, in.Package)
+		if in.Package == "" {
+			pkgs, err := t.filePackages(ctx, repos, in.FilePath)
+			if err != nil {
+				return nil, errorResult(ctx, codeSearchFailed, err), nil
+			}
+			keys = packageKeysAll(repos, pkgs)
+		}
+		if len(keys) == 0 {
+			// No indexed definitions for the file → no package to look up:
+			// nothing can match to_package (honest empty result, R2).
+			cov, err := t.coverageNotice(ctx, repos, nil)
+			if err != nil {
+				return nil, errorResult(ctx, codeSearchFailed, err), nil
+			}
+			return nil, importsResponse{Results: []importEdge{}, Coverage: cov}, nil
+		}
+		f.Must = append(f.Must, qdrant.NewMatchKeywords("to_package", keys...))
+	}
+	edges, err := t.scrollEdges(ctx, f)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	cov, err := t.coverageNotice(ctx, repos, nil)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	return nil, importsResponse{Results: edges, Coverage: cov}, nil
+}
+
+// graphSchema — the self-describing graph schema (T019). coverage_per_repo is
+// filled from the per-repo coverage markers (T057); best-effort — empty when
+// no scan has completed yet.
+func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in graphSchemaInput) (*mcp.CallToolResult, any, error) {
+	ver := t.graphSchemaVer
+	if ver == "" {
+		ver = "1" // default WORKER_GRAPH_SCHEMA_VER
+	}
+	cov := []schemaCoverage{}
+	if t.graph != nil {
+		marks, err := t.fetchCoverage(ctx, t.graphRepos(ctx, in.Repo))
+		if err != nil {
+			return nil, errorResult(ctx, codeSearchFailed, err), nil
+		}
+		cov = marks
+	}
+	return nil, graphSchemaResponse{
+		NodeTypes: []nodeTypeSpec{{
+			Name:       string(graph.NodeDefinition),
+			Properties: []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path", "signature", "commit_sha"},
+			Indexed:    []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path"},
+		}},
+		EdgeTypes: []edgeTypeSpec{
+			{Name: string(graph.EdgeImports), From: "file", To: "package"},
+			{Name: string(graph.EdgeDefines), From: "file", To: "symbol"},
+		},
+		EntityTypes: []entityTypeSpec{
+			{Name: string(graph.KindMrFile), Description: "declared — extraction not implemented yet"},
+			{Name: string(graph.KindCi), Description: "declared — extraction not implemented yet"},
+			{Name: string(graph.KindVuln), Description: "declared — extraction not implemented yet"},
+		},
+		QueryDSL: queryDSL{
+			Version:   ver,
+			Operators: []string{"match", "match_text", "in", "range", "is_null"},
+		},
+		CoveragePerRepo: cov,
+	}, nil
+}
+
+// fetchCoverage reads the per-repo coverage markers (kind=coverage, T057); a
+// non-empty repos list narrows the scan. Repos without a marker are absent
+// from the result — callers keep indexed_commit empty for them (unknown).
+func (t *tools) fetchCoverage(ctx context.Context, repos []string) ([]schemaCoverage, error) {
+	f := &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatch("kind", string(graph.KindCoverage)),
+	}}
+	if len(repos) > 0 {
+		f.Must = append(f.Must, repoKeyword(repos))
+	}
+	pts, err := t.graph.ScrollAll(ctx, f, graphPageSize)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]schemaCoverage, 0, len(pts))
+	for _, p := range pts {
+		m := payloadMap(p)
+		out = append(out, schemaCoverage{
+			Repo:                   payloadString(m, "repo"),
+			IndexedCommit:          payloadString(m, "indexed_commit"),
+			Generation:             int(payloadInt64(m, "generation")),
+			IndexedAt:              payloadString(m, "indexed_at"),
+			LanguagesWithResolvers: payloadStringList(m, "languages_with_resolvers"),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Repo < out[j].Repo })
+	return out, nil
+}
+
+// coverageNotice builds the minimal coverage notice of one response: the
+// requested repos when known, otherwise the repos of the hits; indexed_commit
+// and truncated come from the repo's marker (a missing marker → empty
+// indexed_commit; the marker carries no truncation flag yet → false).
+func (t *tools) coverageNotice(ctx context.Context, repos []string, hits []definitionHit) ([]coverage, error) {
+	if len(repos) == 0 {
+		seen := map[string]bool{}
+		for _, h := range hits {
+			if h.Repo != "" && !seen[h.Repo] {
+				seen[h.Repo] = true
+				repos = append(repos, h.Repo)
+			}
+		}
+		sort.Strings(repos)
+	}
+	if len(repos) == 0 {
+		return []coverage{}, nil
+	}
+	marks, err := t.fetchCoverage(ctx, repos)
+	if err != nil {
+		return nil, err
+	}
+	byRepo := make(map[string]schemaCoverage, len(marks))
+	for _, m := range marks {
+		byRepo[m.Repo] = m
+	}
+	out := make([]coverage, 0, len(repos))
+	for _, r := range repos {
+		m, ok := byRepo[r]
+		c := coverage{Repo: r}
+		if ok {
+			c.IndexedCommit = m.IndexedCommit
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// graphRepos resolves the raw repo input to the canonical full names used by
+// the graph payload (repo = "namespace/path" there, unlike the vector payload
+// pair); a value that does not resolve passes through as-is.
+func (t *tools) graphRepos(ctx context.Context, raw string) []string {
+	raw = strings.Trim(strings.TrimSpace(raw), "/")
+	if raw == "" {
+		return nil
+	}
+	if t.repos != nil {
+		if cs, err := t.repos.resolve(ctx, raw); err == nil && len(cs) > 0 {
+			return clampCandidates(cs)
+		}
+	}
+	return []string{raw}
+}
+
+// repoKeyword — the repo condition of a graph filter: exact for one resolved
+// name, MatchAny for an ambiguous resolution. Callers pass a non-empty list.
+func repoKeyword(repos []string) *qdrant.Condition {
+	if len(repos) == 1 {
+		return qdrant.NewMatch("repo", repos[0])
+	}
+	return qdrant.NewMatchKeywords("repo", repos...)
+}
+
+// definitionFilter — the definition-node filter: kind=node, node_type=definition,
+// plus the optional repo scope, file_path and symbol_kind.
+func definitionFilter(repos []string, filePath, symbolKind string) *qdrant.Filter {
+	must := []*qdrant.Condition{
+		qdrant.NewMatch("kind", string(graph.KindNode)),
+		qdrant.NewMatch("node_type", string(graph.NodeDefinition)),
+	}
+	if len(repos) > 0 {
+		must = append(must, repoKeyword(repos))
+	}
+	if filePath != "" {
+		must = append(must, qdrant.NewMatch("file_path", filePath))
+	}
+	if symbolKind != "" {
+		must = append(must, qdrant.NewMatch("symbol_kind", symbolKind))
+	}
+	return &qdrant.Filter{Must: must}
+}
+
+// importEdgesFilter — the import-edge filter: edge_type=imports plus the repo scope.
+func importEdgesFilter(repos []string) *qdrant.Filter {
+	return &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatch("edge_type", string(graph.EdgeImports)),
+		repoKeyword(repos),
+	}}
+}
+
+// payloadMap — the payload of a retrieved graph point.
+func payloadMap(p *qdrant.RetrievedPoint) map[string]any {
+	return qdrant.ValueMapToMap(p.GetPayload())
+}
+
+// hitFromDefinition maps a definition node payload to the response hit.
+func hitFromDefinition(m map[string]any) definitionHit {
+	return definitionHit{
+		Repo:       payloadString(m, "repo"),
+		FilePath:   payloadString(m, "file_path"),
+		Symbol:     payloadString(m, "symbol"),
+		SymbolKind: payloadString(m, "symbol_kind"),
+		Package:    payloadString(m, "package"),
+		Signature:  payloadString(m, "signature"),
+		CommitSHA:  payloadString(m, "commit_sha"),
+	}
+}
+
+// definitionNameHits — name mode: exact `symbol` match OR `symbol_text`
+// full-text token match (no substring/prefix operator exists). ScrollAll reads
+// the whole match set (there is no first-N scroll); the set is cut to topK.
+func (t *tools) definitionNameHits(ctx context.Context, in searchDefinitionsInput, repos []string, topK int) ([]definitionHit, error) {
+	f := definitionFilter(repos, in.FilePath, in.SymbolKind)
+	should := []*qdrant.Condition{
+		qdrant.NewMatch("symbol", in.Query),
+		qdrant.NewMatchText("symbol_text", in.Query),
+	}
+	f.Should = should
+	f.MinShould = &qdrant.MinShould{Conditions: should, MinCount: 1}
+	pts, err := t.graph.ScrollAll(ctx, f, graphPageSize)
+	if err != nil {
+		return nil, err
+	}
+	hits := make([]definitionHit, 0, min(len(pts), topK))
+	for _, p := range pts {
+		hits = append(hits, hitFromDefinition(payloadMap(p)))
+	}
+	// Exact symbol matches first; the scroll order (point ID) is not a
+	// user-facing relevance order.
+	sort.SliceStable(hits, func(i, j int) bool {
+		ei, ej := hits[i].Symbol == in.Query, hits[j].Symbol == in.Query
+		if ei != ej {
+			return ei
+		}
+		if hits[i].Symbol != hits[j].Symbol {
+			return hits[i].Symbol < hits[j].Symbol
+		}
+		return hits[i].FilePath < hits[j].FilePath
+	})
+	return hits[:min(len(hits), topK)], nil
+}
+
+// fileRef — the semantic join key: canonical graph repo + file path.
+type fileRef struct {
+	repo string
+	file string
+}
+
+// fullRepo recomposes the graph's canonical repo ("namespace/path") from the
+// vector payload pair (group_org + repo).
+func fullRepo(groupOrg, repo string) string {
+	if groupOrg == "" {
+		return repo
+	}
+	return groupOrg + "/" + repo
+}
+
+// splitRefs deduplicates the join refs into repo and file lists (order kept).
+func splitRefs(refs []fileRef) (repos, files []string) {
+	seenR := make(map[string]bool, len(refs))
+	seenF := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		if !seenR[r.repo] {
+			seenR[r.repo] = true
+			repos = append(repos, r.repo)
+		}
+		if !seenF[r.file] {
+			seenF[r.file] = true
+			files = append(files, r.file)
+		}
+	}
+	return repos, files
+}
+
+// definitionSemanticHits — semantic mode: vector code search, chunks mapped to
+// files with the max score per file, then joined to definition nodes on
+// (repo, file_path).
+func (t *tools) definitionSemanticHits(ctx context.Context, vec []float32, in searchDefinitionsInput, topK int) ([]definitionHit, error) {
+	f := store.Filter{Type: "code"}
+	t.applyRepoFilter(ctx, &f, in.Repo, "")
+	// Oversample: several chunks of one file may occupy the top slots.
+	pull := max(2*topK, 2*defaultDefinitionsTopK)
+	points, err := t.searcher.Search(ctx, vec, f, pull)
+	if err != nil {
+		return nil, err
+	}
+	scores := make(map[fileRef]float32)
+	var files []fileRef
+	for _, p := range points {
+		file := payloadString(p.Payload, "file_path")
+		if file == "" || (in.FilePath != "" && file != in.FilePath) {
+			continue
+		}
+		ref := fileRef{repo: fullRepo(payloadString(p.Payload, "group_org"), payloadString(p.Payload, "repo")), file: file}
+		if s, ok := scores[ref]; !ok {
+			files = append(files, ref)
+			scores[ref] = p.Score
+		} else if p.Score > s {
+			scores[ref] = p.Score
+		}
+	}
+	if len(files) == 0 {
+		return []definitionHit{}, nil
+	}
+	repos, paths := splitRefs(files)
+	fNodes := &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatch("kind", string(graph.KindNode)),
+		qdrant.NewMatch("node_type", string(graph.NodeDefinition)),
+		repoKeyword(repos),
+		qdrant.NewMatchKeywords("file_path", paths...),
+	}}
+	pts, err := t.graph.ScrollAll(ctx, fNodes, graphPageSize)
+	if err != nil {
+		return nil, err
+	}
+	hits := make([]definitionHit, 0, topK)
+	for _, p := range pts {
+		m := payloadMap(p)
+		ref := fileRef{repo: payloadString(m, "repo"), file: payloadString(m, "file_path")}
+		score, ok := scores[ref]
+		if !ok || (in.SymbolKind != "" && payloadString(m, "symbol_kind") != in.SymbolKind) {
+			continue
+		}
+		h := hitFromDefinition(m)
+		h.Score = score
+		hits = append(hits, h)
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].Score != hits[j].Score {
+			return hits[i].Score > hits[j].Score
+		}
+		if hits[i].Repo != hits[j].Repo {
+			return hits[i].Repo < hits[j].Repo
+		}
+		if hits[i].FilePath != hits[j].FilePath {
+			return hits[i].FilePath < hits[j].FilePath
+		}
+		return hits[i].Symbol < hits[j].Symbol
+	})
+	if len(hits) > topK {
+		hits = hits[:topK]
+	}
+	return hits, nil
+}
+
+// filePackages returns the distinct packages of a file's definition nodes;
+// incoming callers namespace them to the repo-scoped to_package keys.
+func (t *tools) filePackages(ctx context.Context, repos []string, filePath string) ([]string, error) {
+	pts, err := t.graph.ScrollAll(ctx, definitionFilter(repos, filePath, ""), graphPageSize)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var pkgs []string
+	for _, p := range pts {
+		pkg := payloadString(payloadMap(p), "package")
+		if pkg != "" && !seen[pkg] {
+			seen[pkg] = true
+			pkgs = append(pkgs, pkg)
+		}
+	}
+	sort.Strings(pkgs)
+	return pkgs, nil
+}
+
+// packageKeys namespaces one input package with every resolved repo (PkgKey is
+// the repo-scoped canonical key of the edge endpoints).
+func packageKeys(repos []string, pkg string) []string {
+	if pkg == "" {
+		return nil
+	}
+	keys := make([]string, 0, len(repos))
+	for _, r := range repos {
+		keys = append(keys, graph.PkgKey(r, pkg))
+	}
+	return keys
+}
+
+func packageKeysAll(repos, pkgs []string) []string {
+	keys := make([]string, 0, len(repos)*len(pkgs))
+	for _, r := range repos {
+		for _, pkg := range pkgs {
+			keys = append(keys, graph.PkgKey(r, pkg))
+		}
+	}
+	return keys
+}
+
+// scrollEdges reads all matching import edges into the response shape.
+func (t *tools) scrollEdges(ctx context.Context, f *qdrant.Filter) ([]importEdge, error) {
+	pts, err := t.graph.ScrollAll(ctx, f, graphPageSize)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]importEdge, 0, len(pts))
+	for _, p := range pts {
+		m := payloadMap(p)
+		out = append(out, importEdge{
+			FromFile:    payloadString(m, "from_file"),
+			FromPackage: payloadString(m, "from_package"),
+			ToPackage:   payloadString(m, "to_package"),
+			External:    payloadBool(m, "external"),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].FromFile != out[j].FromFile {
+			return out[i].FromFile < out[j].FromFile
+		}
+		return out[i].ToPackage < out[j].ToPackage
+	})
+	return out, nil
+}
+
 // indexStatus — the indexing progress of this instance (T151): reads the
 // worker_status_<id> KV; the tool is always registered and reports
 // available=false when NATS is off or the worker has not published yet.
@@ -421,10 +1091,13 @@ func (t *tools) queryVector(ctx context.Context, query string) ([]float32, error
 }
 
 // clampTopK applies the default of 5 and the cap of 20 (contracts/mcp-tools.md).
-func clampTopK(k int) int {
+func clampTopK(k int) int { return clampTopKDefault(k, defaultTopK) }
+
+// clampTopKDefault applies a tool-specific default and the cap of 20.
+func clampTopKDefault(k, def int) int {
 	switch {
 	case k <= 0:
-		return defaultTopK
+		return def
 	case k > maxTopK:
 		return maxTopK
 	default:
@@ -461,6 +1134,25 @@ func payloadInt64(p map[string]any, key string) int64 {
 	default:
 		return 0
 	}
+}
+
+// payloadBool reads a boolean payload field.
+func payloadBool(p map[string]any, key string) bool {
+	b, _ := p[key].(bool)
+	return b
+}
+
+// payloadStringList reads a string-list payload field (Qdrant list values
+// decode to []any).
+func payloadStringList(p map[string]any, key string) []string {
+	raw, _ := p[key].([]any)
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // marshalJSON — a test helper: deterministic JSON of a value.
