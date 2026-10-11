@@ -482,12 +482,28 @@ func registerTools(server *mcp.Server, t *tools) {
 	}, t.queryGraph)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "graph_schema",
-		Description: "Self-describing graph schema: node types (definition, user, note, work_item, milestone, label, runner) with indexed properties, " +
-			"edge types (imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by), " +
-			"entity types (mr_file; ci and vuln implemented, vuln gated on provider API/role), the query DSL version/operators, and coverage_per_repo " +
-			"(repo, indexed_commit, generation, indexed_at, languages_with_resolvers) from the per-repo coverage markers — " +
-			"best-effort, empty when no scan has completed yet.",
+		Description: "Self-describing graph schema: node types (definition, user, note, work_item, milestone, label, runner and the schema-v3 " +
+			"group, project, branch, directory, file, imported_symbol, merge_request, merge_request_diff, merge_request_diff_file, vulnerability, " +
+			"security_scan, finding, vulnerability_occurrence, vulnerability_identifier, vulnerability_scanner families) with indexed properties, " +
+			"edge types (imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by and the schema-v3 contains, " +
+			"on_branch, has_diff, has_latest_diff, has_file, merged, reviewer, in_project, in_pipeline, has_finding, occurrence_of, detected_by, " +
+			"has_identifier, fixes, scans, resolved_by, confirmed_by, dismissed_by, merged_at_commit), " +
+			"entity types (mr_file, ci and vuln stay accepted as legacy aliases of merge_request_diff_file/the flattened CI family/vulnerability), " +
+			"the query DSL version (v3)/modes/operators, and coverage_per_repo (repo, indexed_commit, generation, indexed_at, languages_with_resolvers) " +
+			"from the per-repo coverage markers — best-effort, empty when no scan has completed yet. " +
+			"Semantic deltas vs the GitLab Orbit ontology (FR-027): (a) the ci family flattens Orbit's Pipeline/Stage/Job/Deployment/Environment " +
+			"entities into one kind discriminated by ci_level (job|deployment|environment) — there is no separate pipeline/stage node; " +
+			"(b) the vulnerability family is DERIVED from vulnerability_findings (the finding's vulnerability_id, else its id, keys the node): " +
+			"that link is INFERRED, not an authoritative Orbit object; (c) legacy spellings stay accepted: mr_file↔merge_request_diff_file and " +
+			"vuln↔vulnerability (the canonical spelling resolves to both, the legacy one keeps its exact pre-v3 match), and ci is always accepted " +
+			"as the flattened family's name (Orbit has no ci entity).",
 	}, t.graphSchema)
+	// T040–T042: the Orbit-compatible adapter — thin proxies over query_graph/
+	// graph_schema (contracts/orbit-compat-mcp.md).
+	mcp.AddTool(server, &mcp.Tool{Name: "list_commands", Description: toolDescListCommands}, t.listCommands)
+	mcp.AddTool(server, &mcp.Tool{Name: "invoke_command", Description: toolDescInvokeCommand}, t.invokeCommand)
+	mcp.AddTool(server, &mcp.Tool{Name: "get_query_dsl", Description: toolDescGetQueryDSL}, t.getQueryDSL)
+	mcp.AddTool(server, &mcp.Tool{Name: "get_response_format", Description: toolDescGetResponseFormat}, t.getResponseFormat)
 	// T151: registered unconditionally; without NATS it reports available=false.
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "index_status",
@@ -1324,7 +1340,7 @@ func queryPointID(id *qdrant.PointId) string {
 func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in graphSchemaInput) (*mcp.CallToolResult, any, error) {
 	ver := t.graphSchemaVer
 	if ver == "" {
-		ver = "1" // default WORKER_GRAPH_SCHEMA_VER
+		ver = "3" // default WORKER_GRAPH_SCHEMA_VER (schema v3, FR-022/FR-026)
 	}
 	cov := []schemaCoverage{}
 	if t.graph != nil {
@@ -1375,6 +1391,84 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 				Properties: []string{"node_key", "runner_id", "vcs_host", "description", "state", "runner_type", "tags", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
 				Indexed:    []string{"node_key", "runner_id", "runner_type", "tags", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
 			},
+			// Schema-v3 families (T011, contracts/graph-schema-additions.md):
+			// structure, review and security nodes. mr_file/vuln remain accepted
+			// as legacy aliases of merge_request_diff_file/vulnerability.
+			{
+				Name:       string(graph.KindGroup),
+				Properties: []string{"node_key", "group_id", "full_path", "path", "name", "parent_key", "vcs_type", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "group_id", "full_path", "name", "parent_key", "vcs_type", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindProject),
+				Properties: []string{"node_key", "project_id", "full_path", "path", "name", "namespace_kind", "creator_key", "repo", "group_org", "vcs_type", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "project_id", "full_path", "name", "namespace_kind", "repo", "group_org", "vcs_type", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindBranch),
+				Properties: []string{"node_key", "name", "default", "protected", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "name", "default", "protected", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindDirectory),
+				Properties: []string{"node_key", "dir_key", "path", "name", "root", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "dir_key", "name", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindFile),
+				Properties: []string{"node_key", "file_path", "name", "dir_key", "language", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "file_path", "name", "dir_key", "language", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindImportedSymbol),
+				Properties: []string{"node_key", "name", "file_path", "resolved", "target_definition_key", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "name", "file_path", "resolved", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindMergeRequest),
+				Properties: []string{"node_key", "mr_key", "iid", "title", "state", "author_key", "source_branch", "target_branch", "merged", "merge_commit_sha", "updated_at", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "mr_key", "state", "author_key", "source_branch", "target_branch", "updated_at", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindMergeRequestDiff),
+				Properties: []string{"node_key", "mr_key", "version", "base_sha", "start_sha", "head_sha", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "mr_key", "version", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindMergeRequestDiffFile),
+				Properties: []string{"node_key", "mr_key", "mr_id", "file_path", "status", "patch", "patch_truncated", "author", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "mr_key", "mr_id", "file_path", "status", "author", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindVulnerability),
+				Properties: []string{"node_key", "severity", "state", "scan_id", "scanner_key", "primary_identifier_key", "location_path", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "severity", "state", "scan_id", "scanner_key", "primary_identifier_key", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindSecurityScan),
+				Properties: []string{"node_key", "scan_type", "status", "pipeline_id", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "scan_type", "status", "pipeline_id", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindFinding),
+				Properties: []string{"node_key", "severity", "scan_id", "scanner_key", "primary_identifier_key", "location_path", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "severity", "scan_id", "scanner_key", "primary_identifier_key", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindVulnerabilityOccurrence),
+				Properties: []string{"node_key", "uuid", "vulnerability_id", "scan_id", "scanner_key", "primary_identifier_key", "location_path", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "uuid", "vulnerability_id", "scan_id", "scanner_key", "primary_identifier_key", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindVulnerabilityIdentifier),
+				Properties: []string{"node_key", "identifier_key", "external_type", "name", "url", "vcs_type", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "identifier_key", "external_type", "name", "vcs_type", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindVulnerabilityScanner),
+				Properties: []string{"node_key", "scanner_id", "external_id", "name", "vendor", "vcs_type", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "scanner_id", "external_id", "name", "vendor", "vcs_type", "schema_ver"},
+			},
 		},
 		EdgeTypes: []edgeTypeSpec{
 			{Name: string(graph.EdgeImports), From: "file", To: "package"},
@@ -1385,11 +1479,47 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 			{Name: string(graph.EdgeLabelled), From: "work_item", To: "label"},
 			{Name: string(graph.EdgeInMilestone), From: "work_item", To: "milestone"},
 			{Name: string(graph.EdgeExecutedBy), From: "ci", To: "runner"},
+			// Schema-v3 relations (T011): structure, review and security edges.
+			{Name: string(graph.EdgeContains), From: "group/project/branch/directory", To: "group/project/branch/directory/file"},
+			{Name: string(graph.EdgeOnBranch), From: "directory/file", To: "branch"},
+			{Name: string(graph.EdgeHasDiff), From: "merge_request", To: "merge_request_diff"},
+			{Name: string(graph.EdgeHasLatestDiff), From: "merge_request", To: "merge_request_diff"},
+			{Name: string(graph.EdgeHasFile), From: "merge_request_diff", To: "merge_request_diff_file"},
+			{Name: string(graph.EdgeMerged), From: "user", To: "merge_request"},
+			{Name: string(graph.EdgeReviewer), From: "user", To: "merge_request"},
+			{Name: string(graph.EdgeInProject), From: "merge_request/merge_request_diff/merge_request_diff_file/finding/vulnerability_occurrence/vulnerability_identifier/security_scan/vulnerability_scanner/vulnerability", To: "project"},
+			{Name: string(graph.EdgeInPipeline), From: "security_scan", To: "ci"},
+			{Name: string(graph.EdgeHasFinding), From: "vulnerability/security_scan", To: "vulnerability_occurrence/finding"},
+			{Name: string(graph.EdgeOccurrenceOf), From: "vulnerability_occurrence", To: "vulnerability"},
+			{Name: string(graph.EdgeDetectedBy), From: "finding/vulnerability_occurrence", To: "vulnerability_scanner"},
+			{Name: string(graph.EdgeHasIdentifier), From: "finding/vulnerability_occurrence", To: "vulnerability_identifier"},
+			{Name: string(graph.EdgeFixes), From: "merge_request", To: "vulnerability"},
+			{Name: string(graph.EdgeScans), From: "vulnerability_scanner", To: "project"},
+			{Name: string(graph.EdgeResolvedBy), From: "user", To: "vulnerability"},
+			{Name: string(graph.EdgeConfirmedBy), From: "user", To: "vulnerability"},
+			{Name: string(graph.EdgeDismissedBy), From: "user", To: "vulnerability"},
+			{Name: string(graph.EdgeMergedAtCommit), From: "merge_request", To: "commit"},
 		},
 		EntityTypes: []entityTypeSpec{
-			{Name: string(graph.KindMrFile), Description: "per-file MR/PR diffs (search_pull_requests file_path)"},
+			{Name: string(graph.KindMrFile), Description: "per-file MR/PR diffs (search_pull_requests file_path; legacy alias of merge_request_diff_file)"},
 			{Name: string(graph.KindCi), Description: "CI failure points (pipeline/job) — implemented"},
-			{Name: string(graph.KindVuln), Description: "vulnerabilities — implemented, gated on provider API/role"},
+			{Name: string(graph.KindVuln), Description: "vulnerabilities — implemented, gated on provider API/role (legacy alias of vulnerability)"},
+			// Schema-v3 start entities (T011): the canonical families the DSL
+			// accepts in start.entity. merge_request_diff_file and vulnerability
+			// stay covered by their mr_file/vuln aliases above.
+			{Name: string(graph.EntityGroup), Description: "group nodes (contains group/project)"},
+			{Name: string(graph.EntityProject), Description: "project nodes (contains branch; in_project edges)"},
+			{Name: string(graph.EntityBranch), Description: "branch nodes (contains directory; on_branch edges)"},
+			{Name: string(graph.EntityDirectory), Description: "directory nodes (contains directory/file)"},
+			{Name: string(graph.EntityFile), Description: "file nodes (its definition nodes; contains/on_branch/imports)"},
+			{Name: string(graph.EntityImportedSymbol), Description: "imported-symbol nodes (imports; resolved=false pseudo targets)"},
+			{Name: string(graph.EntityMergeRequest), Description: "merge request nodes (has_diff/has_latest_diff, merged/reviewer)"},
+			{Name: string(graph.EntityMergeRequestDiff), Description: "merge request diff versions (has_file)"},
+			{Name: string(graph.EntityFinding), Description: "security findings (has_finding from vulnerability/security_scan)"},
+			{Name: string(graph.EntitySecurityScan), Description: "security scans (in_pipeline → ci)"},
+			{Name: string(graph.EntityVulnerabilityOccurrence), Description: "vulnerability occurrences (occurrence_of → vulnerability)"},
+			{Name: string(graph.EntityVulnerabilityIdentifier), Description: "vulnerability identifiers (has_identifier)"},
+			{Name: string(graph.EntityVulnerabilityScanner), Description: "vulnerability scanners (detected_by; scans → project)"},
 		},
 		QueryDSL: queryDSL{
 			Version: ver,

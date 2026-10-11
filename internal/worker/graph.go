@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -135,14 +136,15 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 // (T015): mirror → branch snapshot → tree → blob → chunk.Extract → writer. A
 // completed scan writes the coverage marker (T057) and only then sweeps the
 // stale generations of that repo+branch (T016) — a failed or canceled pass
-// never sweeps. The orbit phases (US2/US3) run after the code graph: the
-// change-request list feeds both the mr_file diffs and the change-request
-// notes, then the planning nodes (work items, milestones, labels) and the
-// users/notes. The runner nodes (US4) come behind their lane-wide gate last.
-// Every orbit domain is best-effort: a failed or unavailable listing withholds
-// only that domain's sweep (SweepTargets) and never the pass. CPU-only: no
-// embeddings, no commit budget (R13). Lock-free by design: the lane and the
-// refresh composition hold the per-repo lock.
+// never sweeps. The tree/branch structure (US3) and the group/project
+// ownership chain (US4) follow the code graph; then the change-request list
+// feeds both the mr_file diffs and the change-request notes, and the orbit
+// phases (US2/US3) add the planning nodes (work items, milestones, labels) and
+// the users/notes. The runner nodes (US4) come behind their lane-wide gate
+// last. Every orbit and schema-v3 domain is best-effort: a failed or
+// unavailable listing withholds only that domain's sweep (SweepTargets) and
+// never the pass. CPU-only: no embeddings, no commit budget (R13). Lock-free
+// by design: the lane and the refresh composition hold the per-repo lock.
 func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, vuln *vulnGate, runners *runnerGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
@@ -193,6 +195,39 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 	if err != nil {
 		return 0, fmt.Errorf("graph write: %w", err)
 	}
+	// The sweep gates of this pass: a family's flag is set only by a completed
+	// listing, so a failed or unavailable domain keeps its stale points
+	// instead of deleting them blindly (FR-019/FR-020).
+	var targets graph.SweepTargets
+	// US3/T034: the branch nodes and the tree relations of the pass tree. One
+	// best-effort provider listing (TreeReader) yields a branch node per branch
+	// and the project→branch contains edge; the default branch also gets the
+	// branch→root-directory contains and the on_branch edges of every scanned
+	// file and directory (the pass-branch half is already written by the
+	// code-graph step; deterministic IDs keep the overlap idempotent). A failed
+	// or unavailable listing is logged and withholds only the branch sweep
+	// (targets.Structure), never the pass (FR-024).
+	structurePts, structureOK := structurePoints(ctx, deps, repo, meta, scanned, lg)
+	if len(structurePts) > 0 {
+		if err := gs.Upsert(ctx, structurePts); err != nil {
+			return written, fmt.Errorf("structure write: %w", err)
+		}
+		written += len(structurePts)
+	}
+	targets.Structure = structureOK
+	host := vcsHost(cfg, deps.VCSType)
+	// US4/T039: the group/project ownership chain. The group listing and the
+	// per-group project listings are best-effort: a failed one is logged and
+	// withholds the ownership sweep (targets.Ownership), never the pass
+	// (FR-024).
+	ownershipPts, ownershipOK := ownershipPoints(ctx, deps, meta, host, lg)
+	if len(ownershipPts) > 0 {
+		if err := gs.Upsert(ctx, ownershipPts); err != nil {
+			return written, fmt.Errorf("ownership write: %w", err)
+		}
+		written += len(ownershipPts)
+	}
+	targets.Ownership = ownershipOK
 	// US2/T025: file diffs of the repository's change requests. A provider
 	// failure fails the repository pass before its coverage marker and sweep
 	// (T016: a failed pass never sweeps); processSafely isolates it (FR-014).
@@ -211,31 +246,58 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 		}
 	}
 	written += len(diffPoints)
+	// US2/T025: the review-family nodes, right after their file diffs. One
+	// listing of requests and their diff versions yields the merge_request /
+	// merge_request_diff nodes and the in_project/has_diff/has_latest_diff
+	// relations; the has_file and merged/reviewer joins are written only
+	// against endpoints that resolve (skipped, logged, otherwise). Best-effort
+	// by design: a failed listing is logged and the pass continues — the
+	// points the earlier phases already wrote are never rolled back (FR-024).
+	// Only a completed request listing (and every per-request diff listing)
+	// sets targets.Review, so a withheld listing keeps its stale points. A
+	// store write error, unlike a provider one, fails the pass.
+	mrPts, reviewOK := reviewPoints(ctx, deps, repo, meta, diffPoints, lg)
+	if len(mrPts) > 0 {
+		if err := gs.Upsert(ctx, mrPts); err != nil {
+			return written, fmt.Errorf("merge request write: %w", err)
+		}
+		written += len(mrPts)
+	}
+	targets.Review = reviewOK
 	// US4/T044: ci points of the recent pipelines (success and failure),
 	// deployments and environments. Provider failures are best-effort inside
-	// ciPoints — they never fail the pass; only a store write error does.
-	ciPts := ciPoints(ctx, deps, repo, meta, lg)
+	// ciPoints — they never fail the pass; only a store write error does. Only
+	// a completed pipeline listing (and every per-pipeline job, deployment and
+	// environment listing) sets targets.CI, so a withheld listing keeps the
+	// stale ci points instead of deleting them blindly.
+	ciPts, ciOK := ciPoints(ctx, deps, repo, meta, lg)
 	if len(ciPts) > 0 {
 		if err := gs.Upsert(ctx, ciPts); err != nil {
 			return written, fmt.Errorf("ci write: %w", err)
 		}
 		written += len(ciPts)
 	}
+	targets.CI = ciOK
 	// US6/T048: security findings behind the lane-wide availability gate; an
-	// unavailable domain is skipped (logged once), never failing the pass.
-	vulnPts := vuln.ingest(ctx, deps, repo, meta, lg)
+	// unavailable domain is skipped (logged once), never failing the pass. Only
+	// a completed listing sets targets.Vuln, so the legacy vuln points of a
+	// latched-off or failed domain are kept instead of swept blindly.
+	vulnPts, vulnOK := vuln.ingest(ctx, deps, repo, meta, lg)
 	if len(vulnPts) > 0 {
 		if err := gs.Upsert(ctx, vulnPts); err != nil {
 			return written, fmt.Errorf("vuln write: %w", err)
 		}
 		written += len(vulnPts)
 	}
+	targets.Vuln = vulnOK
 	// US3/T031 + US2/T023: the orbit nodes — work items, milestones, labels,
 	// then the users and their notes/comments. Each domain is best-effort and
 	// idempotent (deterministic IDs); the targets tell Sweep which kinds saw a
 	// complete listing and may be generation-swept.
-	host := vcsHost(cfg, deps.VCSType)
-	planning, items, targets := workItemPoints(ctx, deps, repo, meta, host, lg)
+	planning, items, orbitTargets := workItemPoints(ctx, deps, repo, meta, host, lg)
+	targets.WorkItems = orbitTargets.WorkItems
+	targets.Milestones = orbitTargets.Milestones
+	targets.Labels = orbitTargets.Labels
 	people, userSweep := userNotePoints(ctx, deps, repo, meta, host, items, crs, targets.WorkItems, lg)
 	targets.Users = userSweep
 	if orbitPts := append(planning, people...); len(orbitPts) > 0 {
@@ -244,6 +306,22 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 		}
 		written += len(orbitPts)
 	}
+	// US1/T018: the schema-v3 security sub-family, after the orbit block. One
+	// runtime-gated findings listing carries the vulnerability, finding,
+	// occurrence, security_scan, vulnerability_scanner and identifier nodes
+	// plus the relations between them. A provider without the SecurityVulnReader
+	// seam or a typed unavailable (403/404, missing tier/scope) is skipped —
+	// logged, never a pass failure, never a GAP (FR-024). Only a completed
+	// listing sets targets.Security, so a withheld domain keeps its stale
+	// points instead of deleting them blindly.
+	secPts, securityOK := securityPoints(ctx, deps, repo, meta, host, ciPipelineKeys(ciPts), lg)
+	if len(secPts) > 0 {
+		if err := gs.Upsert(ctx, secPts); err != nil {
+			return written, fmt.Errorf("security write: %w", err)
+		}
+		written += len(secPts)
+	}
+	targets.Security = securityOK
 	// US4/T037: the runner nodes behind the lane-wide availability gate. The
 	// domain is conditional by design (GitLab needs Maintainer+; GitHub needs
 	// Actions read) — an unavailable provider is skipped, logged once, and
@@ -302,6 +380,147 @@ func mrFilePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta g
 		lg.Info("graph: mr_file diffs fetched", "mrs", len(crs), "files", len(points))
 	}
 	return points, nil
+}
+
+// mergeRequestPoints is reviewPoints without the listing-completeness flag —
+// the builder seam the unit tests exercise directly.
+func mergeRequestPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, diffPoints []*qdrant.PointStruct, lg *slog.Logger) []*qdrant.PointStruct {
+	points, _ := reviewPoints(ctx, deps, repo, meta, diffPoints, lg)
+	return points
+}
+
+// reviewPoints builds the review-family nodes of one repository (US2/T025):
+// the merge_request node of every change request and the merge_request_diff
+// node of each of its diff versions, plus their in_project, has_diff and
+// has_latest_diff relations. The has_file and merged/reviewer joins are
+// written only against an endpoint that resolves to a canonical node_key; the
+// legacy mr_file points and the username-only people fields do not resolve, so
+// those edges are skipped (counted for the debug line) rather than left
+// dangling. Best-effort by design (FR-024): a provider without the
+// MergeRequestNodeReader seam or a failed listing of one request is logged and
+// skipped — the rest of the pass, and the points it already wrote, stay
+// intact; only a store write error fails the pass. The returned flag reports
+// whether every listing of the family completed (the request listing and each
+// request's diff-version listing): only then may Sweep generation-sweep the
+// review kinds (targets.Review), so a failed listing keeps its stale points.
+// Deterministic IDs make the re-upsert each pass idempotent and keep the
+// points of the current generation alive for the sweep.
+// ponytail: the diff versions of every request are re-fetched each pass; add
+// an updated_at sidecar if the provider API cost of unchanged MRs matters.
+func reviewPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, diffPoints []*qdrant.PointStruct, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
+	reader, ok := deps.VCS.(provider.MergeRequestNodeReader)
+	if !ok {
+		return nil, false
+	}
+	reqs, err := reader.ListMergeRequestNodes(ctx, repo)
+	if err != nil {
+		orbitFail(ctx, lg, "merge request nodes", err)
+		return nil, false
+	}
+	complete := true
+	fileKeys, resolvedFiles := mrFileKeyIndex(diffPoints)
+	projectKey := graph.RefProject(meta.Repo)
+	var (
+		points        []*qdrant.PointStruct
+		skippedPeople int
+	)
+	for _, cr := range reqs {
+		if ctx.Err() != nil {
+			break
+		}
+		iid := strconv.FormatInt(cr.ID, 10)
+		mrKey := graph.RefMergeRequest(meta.Repo, iid)
+		// The author_key stays empty, review.go's unresolved case: the request
+		// carries a username, not the provider id RefUser keys on.
+		points = append(points, graph.MergeRequestPoint(meta, cr, ""))
+		points = append(points, graph.InProjectEdge(meta, mrKey, "merge_request", projectKey))
+		// merged/reviewer are user joins and need a canonical RefUser
+		// endpoint: the request carries reviewer/author usernames while user
+		// nodes key on the numeric provider id, no username→id lookup exists
+		// in the pass, and the merger identity is not surfaced at all — the
+		// joins are skipped (counted) instead of left dangling. Merge them
+		// once a resolved-user seam lands on the request. ponytail: the debug
+		// counter is the signal; drop it with the seam.
+		skippedPeople += len(cr.Reviewers)
+		if cr.Merged {
+			skippedPeople++
+		}
+		refs, err := reader.ListMergeRequestDiffRefs(ctx, repo, int(cr.ID))
+		if err != nil {
+			orbitFail(ctx, lg, "merge request diff refs", err)
+			complete = false
+			continue
+		}
+		tip := latestDiffIndex(refs, cr.MergeCommitSHA)
+		for i, d := range refs {
+			dp := graph.MergeRequestDiffPoint(meta, int(cr.ID), d)
+			// The canonical key of a diff point is its own node_key; the
+			// edge targets are read from the built point so the fallback of
+			// RefMergeRequestDiff (head_sha, else version) stays single-sourced.
+			diffKey := dp.GetPayload()["node_key"].GetStringValue()
+			points = append(points, dp)
+			points = append(points, graph.HasDiffEdge(meta, mrKey, diffKey))
+			points = append(points, graph.InProjectEdge(meta, diffKey, "merge_request_diff", projectKey))
+			if i != tip {
+				continue
+			}
+			points = append(points, graph.HasLatestDiffEdge(meta, mrKey, diffKey))
+			// has_file may only target a diff-file point that exposes its own
+			// canonical node_key: the legacy mr_file points carry none yet, so
+			// the edge is skipped rather than fabricated.
+			for _, fileKey := range fileKeys[iid] {
+				points = append(points, graph.HasFileEdge(meta, diffKey, fileKey))
+			}
+		}
+	}
+	if len(points) > 0 {
+		lg.Info("graph: merge request nodes fetched", "requests", len(reqs), "points", len(points))
+	}
+	if skipped := len(diffPoints) - resolvedFiles; skipped > 0 {
+		lg.Debug("graph: has_file skipped, diff-file points carry no node_key", "files", skipped)
+	}
+	if skippedPeople > 0 {
+		lg.Debug("graph: merged/reviewer edges skipped, usernames have no user id", "joins", skippedPeople)
+	}
+	return points, complete
+}
+
+// latestDiffIndex picks the tip version of one request's diff list (US2/T025):
+// the version whose head_sha equals the request's merge commit — a fast-forward
+// merge leaves the merge commit on that head — else the first entry. The
+// normalized ChangeRequest carries no dedicated diff head, so the merge commit
+// is the only head-like anchor; the fallback relies on the provider listing
+// versions newest-first.
+func latestDiffIndex(refs []provider.MergeRequestDiffRef, mergeSHA string) int {
+	if mergeSHA != "" {
+		for i, r := range refs {
+			if r.HeadSHA == mergeSHA {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+// mrFileKeyIndex indexes the canonical node_keys of the diff-file points of one
+// pass by request iid. has_file may only target a file point that exposes its
+// own node_key — the legacy mr_file points carry none yet — so the index stays
+// empty today and the edge is skipped rather than fabricated; resolved is the
+// caller's debug signal (the number of indexed, resolvable points).
+func mrFileKeyIndex(diffPoints []*qdrant.PointStruct) (map[string][]string, int) {
+	keys := make(map[string][]string, len(diffPoints))
+	resolved := 0
+	for _, p := range diffPoints {
+		payload := p.GetPayload()
+		key := payload["node_key"].GetStringValue()
+		if key == "" {
+			continue
+		}
+		iid := strconv.FormatInt(payload["mr_id"].GetIntegerValue(), 10)
+		keys[iid] = append(keys[iid], key)
+		resolved++
+	}
+	return keys, resolved
 }
 
 // vcsHost is the provider instance host stamped on the user node keys (RefUser)
@@ -531,28 +750,32 @@ func changeRequestParent(repo, vcsType string, id int) string {
 // ciPoints builds the ci points of one repository (US4/T044): the jobs of the
 // recent pipelines — successful and failed alike — plus deployments and
 // environments, read through the optional CIPipelineDetailProvider seam. A
-// provider without CI-detail support yields nil. Best-effort by design: a
-// provider error is logged and the rest of the pass continues (the metadata
-// lane's failed-jobs vector path is untouched). Deterministic IDs make the
-// re-upsert each pass idempotent and keep the points of the current generation
-// alive for the sweep.
+// provider without CI-detail support yields nil,false. Best-effort by design:
+// a provider error is logged and the rest of the pass continues (the metadata
+// lane's failed-jobs vector path is untouched). ok reports whether every
+// listing of the family completed — only then may Sweep generation-sweep ci
+// points (targets.CI); a failed listing keeps its stale points. Deterministic
+// IDs make the re-upsert each pass idempotent and keep the points of the
+// current generation alive for the sweep.
 // ponytail: pipelines/jobs are re-fetched every pass; add an updated_at
 // sidecar if the provider API cost of unchanged pipelines matters.
-func ciPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) []*qdrant.PointStruct {
+func ciPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
 	detail, ok := deps.VCS.(provider.CIPipelineDetailProvider)
 	if !ok {
-		return nil
+		return nil, false
 	}
+	complete := true
 	var points []*qdrant.PointStruct
 	pipelines, err := deps.VCS.ListPipelines(ctx, repo)
 	if err != nil {
+		complete = false
 		if ctx.Err() == nil {
 			lg.Warn("graph: pipeline list failed, ci jobs skipped", "err", err)
 		}
 	} else {
 		for _, p := range pipelines {
 			if ctx.Err() != nil {
-				return points
+				return points, false
 			}
 			pid, err := strconv.Atoi(p.ID)
 			if err != nil {
@@ -560,6 +783,7 @@ func ciPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph
 			}
 			jobs, err := detail.ListPipelineJobs(ctx, repo, pid)
 			if err != nil {
+				complete = false
 				lg.Warn("graph: pipeline jobs failed, pipeline skipped", "pipeline", p.ID, "err", err)
 				continue
 			}
@@ -571,6 +795,7 @@ func ciPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph
 	}
 	deployments, err := detail.ListDeployments(ctx, repo)
 	if err != nil {
+		complete = false
 		if ctx.Err() == nil {
 			lg.Warn("graph: deployments failed, skipped", "err", err)
 		}
@@ -582,6 +807,7 @@ func ciPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph
 	}
 	envs, err := detail.ListEnvironments(ctx, repo)
 	if err != nil {
+		complete = false
 		if ctx.Err() == nil {
 			lg.Warn("graph: environments failed, skipped", "err", err)
 		}
@@ -591,7 +817,7 @@ func ciPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph
 				"", e.State, 0, "", e.Name, ""))
 		}
 	}
-	return points
+	return points, complete
 }
 
 // vulnGate latches the availability of the security domain for one graph lane
@@ -606,18 +832,21 @@ type vulnGate struct {
 }
 
 // ingest reads the vulnerabilities of one repository and returns their points.
-// It returns nil when the provider has no security support, the domain is off,
-// the call failed or there are no findings — never an error.
-func (g *vulnGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) []*qdrant.PointStruct {
+// It returns nil,false when the provider has no security support, the domain is
+// off or the call failed — never an error. ok reports whether the listing of
+// this repo completed: only then may Sweep generation-sweep the legacy vuln
+// points (targets.Vuln); a latched-off or failed domain keeps them instead of
+// deleting them blindly.
+func (g *vulnGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
 	vp, ok := deps.VCS.(provider.VulnerabilityProvider)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	g.mu.Lock()
 	off := g.off
 	g.mu.Unlock()
 	if off {
-		return nil
+		return nil, false
 	}
 	findings, err := vp.ListVulnerabilities(ctx, repo)
 	if err != nil {
@@ -626,12 +855,12 @@ func (g *vulnGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Repo
 			g.off = true
 			g.mu.Unlock()
 			lg.Info("graph: security domain unavailable, vuln ingest off", "err", err)
-			return nil
+			return nil, false
 		}
 		if ctx.Err() == nil {
 			lg.Warn("graph: vulnerabilities fetch failed, repo skipped", "err", err)
 		}
-		return nil
+		return nil, false
 	}
 	points := make([]*qdrant.PointStruct, 0, len(findings))
 	for _, f := range findings {
@@ -640,7 +869,7 @@ func (g *vulnGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Repo
 	if len(points) > 0 {
 		lg.Info("graph: vuln findings fetched", "findings", len(points))
 	}
-	return points
+	return points, true
 }
 
 // runnerGate latches the availability of the runner domain for one graph lane
@@ -691,6 +920,127 @@ func (g *runnerGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Re
 		lg.Info("graph: runners fetched", "runners", len(points))
 	}
 	return points, true
+}
+
+// securityPoints builds the schema-v3 security sub-family points of one
+// repository (T018/US1): the findings listing carries its own vulnerability,
+// finding, occurrence, security_scan, vulnerability_scanner and identifier
+// nodes plus the relations between them (in_project, has_finding,
+// occurrence_of, detected_by, has_identifier, in_pipeline). The domain is
+// runtime-gated: a provider without the SecurityVulnReader seam or a typed
+// unavailable (403/404, missing Ultimate tier or Security Dashboard, missing
+// scope) is skipped — logged, never a pass failure and never a GAP (FR-024).
+// ok reports whether the listing completed: only then may Sweep
+// generation-sweep the security kinds, so an unavailable domain keeps its
+// stale points. The sub-objects one listing repeats across findings
+// (vulnerability, scan, scanner, identifier) are deduped by their
+// deterministic point ID; deterministic IDs make the re-upsert each pass
+// idempotent.
+func securityPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, host string, pipelineKeys map[string]string, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
+	reader, ok := deps.VCS.(provider.SecurityVulnReader)
+	if !ok {
+		return nil, false
+	}
+	findings, err := reader.ListSecurityFindings(ctx, repo)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		if errors.Is(err, provider.ErrVulnerabilitiesUnavailable) || errors.Is(err, provider.ErrDomainUnavailable) {
+			lg.Info("graph: security domain unavailable, skipped", "err", err)
+			return nil, false
+		}
+		lg.Warn("graph: security findings fetch failed, skipped", "err", err)
+		return nil, false
+	}
+	projectKey := graph.RefProject(meta.Repo)
+	points := make([]*qdrant.PointStruct, 0, len(findings)*8)
+	seen := make(map[string]bool, len(findings)*8)
+	// add appends a point once: the deterministic IDs dedupe the sub-objects
+	// and relations a listing repeats across findings (vulnerability, scan,
+	// scanner, identifier; their in_project/has_identifier edges).
+	add := func(p *qdrant.PointStruct) {
+		id := p.GetId().GetUuid()
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		points = append(points, p)
+	}
+	for _, f := range findings {
+		if ctx.Err() != nil {
+			break
+		}
+		vulnKey := securityVulnKey(meta.Repo, f)
+		findingKey := graph.RefFinding(meta.Repo, f.UUID)
+		occurrenceKey := graph.RefVulnerabilityOccurrence(meta.Repo, f.UUID)
+		scanKey := graph.RefSecurityScan(meta.Repo, f.ScanID)
+		scannerKey := graph.RefVulnerabilityScanner(host, f.ScannerID)
+
+		add(graph.FindingPoint(meta, f))
+		add(graph.VulnerabilityOccurrencePoint(meta, f))
+		add(graph.VulnerabilityPoint(meta, f))
+		add(graph.SecurityScanPoint(meta, f))
+		add(graph.VulnerabilityScannerPoint(meta, host, f))
+		add(graph.InProjectEdge(meta, findingKey, "finding", projectKey))
+		add(graph.InProjectEdge(meta, occurrenceKey, "vulnerability_occurrence", projectKey))
+		add(graph.InProjectEdge(meta, vulnKey, "vulnerability", projectKey))
+		add(graph.InProjectEdge(meta, scanKey, "security_scan", projectKey))
+		add(graph.InProjectEdge(meta, scannerKey, "vulnerability_scanner", projectKey))
+		add(graph.HasFindingEdge(meta, scanKey, "security_scan", findingKey, "finding"))
+		add(graph.HasFindingEdge(meta, vulnKey, "vulnerability", occurrenceKey, "vulnerability_occurrence"))
+		add(graph.OccurrenceOfEdge(meta, occurrenceKey, vulnKey))
+		add(graph.DetectedByEdge(meta, findingKey, "finding", scannerKey))
+		add(graph.DetectedByEdge(meta, occurrenceKey, "vulnerability_occurrence", scannerKey))
+		for _, ident := range f.Identifiers {
+			identKey := graph.RefVulnerabilityIdentifier(host, ident.Name)
+			add(graph.VulnerabilityIdentifierPoint(meta, host, ident))
+			add(graph.InProjectEdge(meta, identKey, "vulnerability_identifier", projectKey))
+			add(graph.HasIdentifierEdge(meta, findingKey, "finding", identKey))
+			add(graph.HasIdentifierEdge(meta, occurrenceKey, "vulnerability_occurrence", identKey))
+		}
+		// in_pipeline: only when the pipeline's ci point carries a canonical
+		// node_key; today's ci points carry none, so the edge is skipped
+		// rather than left dangling.
+		if f.ScanPipelineID != "" {
+			if ciKey := pipelineKeys[f.ScanPipelineID]; ciKey != "" {
+				add(graph.InPipelineEdge(meta, scanKey, ciKey))
+			}
+		}
+	}
+	if len(points) > 0 {
+		lg.Info("graph: security findings fetched", "findings", len(findings), "points", len(points))
+	}
+	return points, true
+}
+
+// securityVulnKey mirrors security.go's vulnerabilityKey: a GitLab finding
+// carries vulnerability_id; a provider without one falls back to the finding
+// id, so the vulnerability node, the occurrence's vulnerability_id link and
+// the has_finding edge agree.
+func securityVulnKey(repo string, f provider.VulnerabilityFinding) string {
+	id := f.VulnerabilityID
+	if id == "" {
+		id = f.ID
+	}
+	return graph.RefVulnerability(repo, id)
+}
+
+// ciPipelineKeys indexes the canonical ci node_keys of one pass by pipeline
+// id: in_pipeline may only join a scan whose pipeline has a ci point carrying
+// a node_key. Today's ci points carry none (ci.go), so the map is empty and
+// the edge is skipped — never a dangling endpoint.
+func ciPipelineKeys(ciPts []*qdrant.PointStruct) map[string]string {
+	keys := make(map[string]string, len(ciPts))
+	for _, p := range ciPts {
+		m := p.GetPayload()
+		pid := m["pipeline_id"].GetStringValue()
+		key := m["node_key"].GetStringValue()
+		if pid != "" && key != "" {
+			keys[pid] = key
+		}
+	}
+	return keys
 }
 
 // repoModulePath reads the root go.mod module path of the scanned tree ("" —
@@ -752,4 +1102,147 @@ func scanGoFiles(ctx context.Context, files []gitengine.TreeFile, reader *giteng
 		out = append(out, graph.FileGraph{Path: f.Path, Package: pkg, Defs: defs, Imports: imports})
 	}
 	return out, nil
+}
+
+// structurePoints builds the tree/branch step of one repository (US3/T034):
+// one branch node per branch of the provider's listing, the project→branch
+// contains edge for every branch, and — for the default branch — the
+// branch→root-directory contains plus the on_branch edges of every scanned
+// file and directory. The pass-branch on_branch edges of the scanned tree are
+// already written by the code-graph step (graph.WriteGraph); the deterministic
+// edge IDs keep the overlap idempotent. Best-effort by design (FR-024): a
+// provider without the TreeReader seam or a failed listing is logged and the
+// pass continues; the returned flag reports whether the listing completed —
+// only then may Sweep generation-sweep branch nodes (targets.Structure).
+// Deterministic IDs make the re-upsert each pass idempotent.
+func structurePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, scanned []graph.FileGraph, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
+	tr, ok := deps.VCS.(provider.TreeReader)
+	if !ok {
+		return nil, false
+	}
+	branches, err := tr.ListBranches(ctx, repo)
+	if err != nil {
+		orbitFail(ctx, lg, "branches", err)
+		return nil, false
+	}
+	projectKey := graph.RefProject(meta.Repo)
+	rootDir := graph.RefDirectory(meta.Repo, "")
+	paths, dirs := treePaths(scanned)
+	var points []*qdrant.PointStruct
+	for _, b := range branches {
+		branchKey := graph.RefBranch(meta.Repo, b.Name)
+		points = append(points, graph.BranchPoint(meta, b))
+		points = append(points, graph.ContainsEdge(meta, projectKey, "project", branchKey, "branch"))
+		// The default branch carries the tree; an empty scan has no
+		// file/directory nodes, so its edges are skipped rather than left
+		// dangling.
+		if !b.Default || len(paths) == 0 {
+			continue
+		}
+		points = append(points, graph.ContainsEdge(meta, branchKey, "branch", rootDir, "directory"))
+		for _, d := range dirs {
+			points = append(points, graph.OnBranchEdge(meta, graph.RefDirectory(meta.Repo, d), "directory", branchKey))
+		}
+		for _, p := range paths {
+			points = append(points, graph.OnBranchEdge(meta, graph.RefFile(meta.Repo, p), "file", branchKey))
+		}
+	}
+	if len(points) > 0 {
+		lg.Info("graph: branch nodes fetched", "branches", len(branches), "points", len(points))
+	}
+	return points, true
+}
+
+// treePaths derives the sorted file and directory paths of one scan the
+// structure step attaches to the default branch: the union of the FileGraph
+// paths and the definition file_paths, with the repository root spelled ""
+// (mirrors graph.StructurePoints, which owns the equivalent derivation for the
+// file/directory points themselves).
+func treePaths(scanned []graph.FileGraph) (files, dirs []string) {
+	fileSet := make(map[string]bool)
+	for _, f := range scanned {
+		if f.Path != "" {
+			fileSet[f.Path] = true
+		}
+		for _, d := range f.Defs {
+			if d.FilePath != "" {
+				fileSet[d.FilePath] = true
+			}
+		}
+	}
+	dirSet := make(map[string]bool)
+	for p := range fileSet {
+		for d := path.Dir(p); ; d = path.Dir(d) {
+			if d == "." {
+				d = ""
+			}
+			if dirSet[d] {
+				break
+			}
+			dirSet[d] = true
+			if d == "" {
+				break
+			}
+		}
+	}
+	files = make([]string, 0, len(fileSet))
+	for p := range fileSet {
+		files = append(files, p)
+	}
+	dirs = make([]string, 0, len(dirSet))
+	for d := range dirSet {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(files)
+	sort.Strings(dirs)
+	return files, dirs
+}
+
+// ownershipPoints builds the ownership step of one repository (US4/T039): one
+// group node per group of the provider's listing, the parent→child contains
+// edge where the namespace hierarchy names a parent, and per group the project
+// nodes with their group→project contains edge. Projects are listed per group
+// so each carries its namespace context. Best-effort by design (FR-024): a
+// provider without the GroupReader seam or a failed listing is logged and the
+// pass continues; the returned flag reports whether every listing of the step
+// completed — only then may Sweep generation-sweep the group/project kinds
+// (targets.Ownership), so a withheld listing keeps its stale points.
+// Deterministic IDs make the re-upsert each pass idempotent.
+func ownershipPoints(ctx context.Context, deps RepoDeps, meta graph.Meta, host string, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
+	gr, ok := deps.VCS.(provider.GroupReader)
+	if !ok {
+		return nil, false
+	}
+	groups, err := gr.ListGroups(ctx)
+	if err != nil {
+		orbitFail(ctx, lg, "groups", err)
+		return nil, false
+	}
+	complete := true
+	var points []*qdrant.PointStruct
+	for _, g := range groups {
+		if ctx.Err() != nil {
+			return points, false
+		}
+		gp := graph.GroupPoint(meta, g)
+		groupKey := gp.GetPayload()["node_key"].GetStringValue()
+		points = append(points, gp)
+		if parentKey := gp.GetPayload()["parent_key"].GetStringValue(); parentKey != "" {
+			points = append(points, graph.GroupContainsGroupEdge(meta, parentKey, groupKey))
+		}
+		projects, err := gr.ListGroupProjects(ctx, g.FullPath)
+		if err != nil {
+			complete = false
+			orbitFail(ctx, lg, "group projects", err)
+			continue
+		}
+		for _, p := range projects {
+			points = append(points, graph.ProjectPoint(meta, host, p))
+			points = append(points, graph.GroupContainsProjectEdge(meta, groupKey, graph.RefProject(p.FullPath)))
+		}
+	}
+	if complete && len(points) > 0 {
+		lg.Info("graph: ownership nodes fetched", "groups", len(groups), "points", len(points))
+	}
+	return points, complete
 }

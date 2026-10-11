@@ -237,7 +237,11 @@ func CoveragePoint(meta Meta, indexedCommit string) *qdrant.PointStruct {
 
 // WriteGraph builds every node and edge of one repo+branch scan pass and
 // upserts them through gs (batched inside GraphStore.Upsert). It returns the
-// number of points written.
+// number of points written. The definition/defines/imports(file→package) core
+// output (FR-022) is unchanged; the structure (file/directory/contains/
+// on_branch) and imported_symbol families derive from the same scan on top of
+// it (T033/US3). Branch nodes are not emitted here — they come from the
+// provider tree ingest (T034).
 func WriteGraph(ctx context.Context, gs GraphWriter, files []FileGraph, meta Meta, isExternal func(string) bool) (int, error) {
 	var points []*qdrant.PointStruct
 	for _, f := range files {
@@ -245,6 +249,8 @@ func WriteGraph(ctx context.Context, gs GraphWriter, files []FileGraph, meta Met
 		points = append(points, DefinePoints(meta, f.Defs)...)
 		points = append(points, ImportPoints(meta, f, isExternal)...)
 	}
+	points = append(points, StructurePoints(meta, files)...)
+	points = append(points, ImportedSymbolPoints(meta, files, isExternal)...)
 	if err := gs.Upsert(ctx, points); err != nil {
 		return 0, err
 	}

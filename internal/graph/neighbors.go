@@ -94,9 +94,10 @@ func Neighbors(ctx context.Context, sc Scroller, q Query) (NeighborResult, error
 		if err != nil {
 			return NeighborResult{}, fmt.Errorf("graph: neighbors %s scan: %w", d, err)
 		}
-		if len(pts) > maxEdgesPerHop {
-			pts, truncated = pts[:maxEdgesPerHop], true
-		}
+		// The centre is one node: its edge scan is the per-node edge cap
+		// (FR-025, MCP_GRAPH_MAX_EDGES_PER_NODE); a cut is an honest truncation.
+		pts, cut := edgeCap(pts)
+		truncated = truncated || cut
 		for _, p := range pts {
 			edges[pointIDKey(p.GetId())] = p
 		}
@@ -163,8 +164,17 @@ func Neighbors(ctx context.Context, sc Scroller, q Query) (NeighborResult, error
 		}
 		for _, n := range nodes {
 			nk := payloadString(n.GetPayload(), "node_key")
-			if _, ok := resolved[nk]; !ok {
-				resolved[nk] = n // a file's first definition node represents the file
+			cur, ok := resolved[nk]
+			if !ok {
+				resolved[nk] = n
+				continue
+			}
+			// A file ref is carried by both the code-graph definition nodes
+			// and the schema-v3 file node: prefer the definition — a
+			// deterministic pick that mirrors the pre-v3 shape where a file
+			// was only its definition nodes (the scan order is not stable).
+			if isDefinition(n) && !isDefinition(cur) {
+				resolved[nk] = n
 			}
 		}
 	}
@@ -184,6 +194,15 @@ func Neighbors(ctx context.Context, sc Scroller, q Query) (NeighborResult, error
 	}
 	res.Neighbors, res.Truncated = out, truncated
 	return res, nil
+}
+
+// isDefinition reports whether a resolved point is a code-graph definition
+// node (kind=node, node_type=definition) — the preferred representative of a
+// file ref when both it and a schema-v3 file node carry the same node_key.
+func isDefinition(p *qdrant.RetrievedPoint) bool {
+	m := p.GetPayload()
+	return payloadString(m, "kind") == string(KindNode) &&
+		payloadString(m, "node_type") == string(NodeDefinition)
 }
 
 // neighborEdgeFilter is the 1-hop edge filter of one direction: the Compile

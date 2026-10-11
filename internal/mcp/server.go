@@ -48,6 +48,9 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	// T016: the aggregation fold caps come from configuration
 	// (MCP_GRAPH_AGG_MAX_SCANNED / MCP_GRAPH_AGG_MAX_GROUPS).
 	graph.SetAggCaps(cfg.MCP.GraphAggMaxScanned, cfg.MCP.GraphAggMaxGroups)
+	// T010/FR-025/FR-026: the query caps — path depth and the per-node edge
+	// ceiling of the new families — come from configuration too.
+	graph.SetQueryCaps(cfg.MCP.GraphPathMaxDepth, cfg.MCP.GraphMaxEdgesPerNode)
 	tl.graphSchemaVer = cfg.Worker.GraphSchemaVer
 	// T132: the repository list index resolves short-form repo filters without
 	// extra API calls; the provider constructor makes no network calls, and a

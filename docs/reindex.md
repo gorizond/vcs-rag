@@ -56,7 +56,9 @@ case (**0 mixed vectors**).
 The graph schema version is folded into the uuid5 ID namespace of the
 payload-only graph collection ([graph](graph.md)): bumping it — e.g. the `1`→`2`
 canonical key-space migration (edges moved to `from_key`/`to_key` endpoint
-refs) — **re-keys every graph point id**. The same revision indexed under the
+refs), or the `2`→`3` Orbit-parity node/edge catalog (structure, review and
+security families, `docs/graph.md`) — **re-keys every graph point id**. The
+same revision indexed under the
 new version gets fresh ids; the old ids stay behind as stale points, and the
 query tools do not filter by `schema_ver`, so both sets would surface until the
 old space is purged. A bump therefore requires a one-time **full graph

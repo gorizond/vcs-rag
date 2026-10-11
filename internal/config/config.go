@@ -75,10 +75,11 @@ type Worker struct {
 	GCDryRun       bool          // WORKER_GC_DRY_RUN (default true — the kill-switch)
 	GraphInterval  time.Duration // graph lane tick (WORKER_GRAPH_INTERVAL, default 30m)
 	// GraphSchemaVer is part of the graph uuid5 namespace
-	// (WORKER_GRAPH_SCHEMA_VER, default "2"). Bumped 1→2 for the edge
-	// key-space feature: adding/re-keying node and edge kinds changes the
+	// (WORKER_GRAPH_SCHEMA_VER, default "3"). Bumped 1→2 for the edge
+	// key-space feature and 2→3 for the Orbit-parity gap catalog (structure,
+	// review, security families): adding node and edge kinds changes the
 	// graph schema, and fresh deterministic ids must not collide with the
-	// v0.0.18 namespace. A bump re-keys every graph id and therefore
+	// previous namespace. A bump re-keys every graph id and therefore
 	// requires a full graph reindex (re-scan) — see docs/reindex.md.
 	GraphSchemaVer string
 	// GraphMaxReposPerPass caps repositories processed per graph pass
@@ -107,6 +108,10 @@ type MCP struct {
 	// GraphPathMaxDepth caps path traversal depth
 	// (MCP_GRAPH_PATH_MAX_DEPTH, default 3, clamped to ≤3).
 	GraphPathMaxDepth int
+	// GraphMaxEdgesPerNode caps the edge points kept per node in a graph scan
+	// (MCP_GRAPH_MAX_EDGES_PER_NODE, default 10000 — FR-025). A cut marks the
+	// response truncated, never silently partial.
+	GraphMaxEdgesPerNode int
 	// AuthzEnabled is an explicit no-op punt (T041): per-user authorization
 	// is NOT implemented — the graph has no ACL and nothing reads this flag.
 	// It exists so the reserved name parses and the punt stays visible; the
@@ -299,7 +304,7 @@ func Load() (*Config, error) {
 		GCInterval:           gcInterval,
 		GCDryRun:             gcDryRun,
 		GraphInterval:        graphInterval,
-		GraphSchemaVer:       envDefault("WORKER_GRAPH_SCHEMA_VER", "2"),
+		GraphSchemaVer:       envDefault("WORKER_GRAPH_SCHEMA_VER", "3"),
 		GraphMaxReposPerPass: graphMaxRepos,
 		DiscoveryMinInterval: discoveryMin,
 		Concurrency:          concurrency,
@@ -345,6 +350,11 @@ func Load() (*Config, error) {
 	if pathMaxDepth > 3 {
 		pathMaxDepth = 3
 	}
+	// T010/FR-025: the per-node edge ceiling of the new families.
+	maxEdgesPerNode, err := envInt("MCP_GRAPH_MAX_EDGES_PER_NODE", 10000)
+	if err != nil {
+		return nil, err
+	}
 	// T041: explicit no-op punt — parsed so the reserved name is visible in
 	// config errors, but no filtering is implemented behind it.
 	authzEnabled, err := envBool("MCP_AUTHZ_ENABLED", false)
@@ -352,12 +362,13 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.MCP = MCP{
-		Transport:          transport,
-		Addr:               envDefault("MCP_ADDR", ":8080"),
-		GraphAggMaxScanned: aggMaxScanned,
-		GraphAggMaxGroups:  aggMaxGroups,
-		GraphPathMaxDepth:  pathMaxDepth,
-		AuthzEnabled:       authzEnabled,
+		Transport:            transport,
+		Addr:                 envDefault("MCP_ADDR", ":8080"),
+		GraphAggMaxScanned:   aggMaxScanned,
+		GraphAggMaxGroups:    aggMaxGroups,
+		GraphPathMaxDepth:    pathMaxDepth,
+		GraphMaxEdgesPerNode: maxEdgesPerNode,
+		AuthzEnabled:         authzEnabled,
 	}
 
 	return cfg, nil
