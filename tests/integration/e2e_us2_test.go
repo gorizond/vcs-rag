@@ -142,13 +142,31 @@ func TestE2E_US2(t *testing.T) {
 	}
 	t.Logf("read-back: count after repeated pass = %d (did not grow)", count2)
 
-	// 3) prune: delete feature.txt in the feature branch + commit
-	runGit(t, src, "checkout", "feature")
-	runGit(t, src, "rm", "feature.txt")
-	runGit(t, src, "commit", "-m", "c5: delete feature.txt")
-	runGit(t, src, "checkout", "main")
+	// 3) prune on the DEFAULT branch (T160: the index manages the default
+	// branch only; feature branches are left untouched): an extra file appears
+	// and then disappears.
+	if err := os.WriteFile(filepath.Join(src, "extra.txt"), []byte("extra\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "add", ".")
+	runGit(t, src, "commit", "-m", "c5: add extra.txt")
 	// the mirror lane fetches new commits (WORKER_MIRROR_INTERVAL); the index
 	// lane reads the local mirror only (T083).
+	if _, err := deps.Engine.EnsureMirror(ctx, "gitlab", repo); err != nil {
+		t.Fatalf("EnsureMirror (mirror lane): %v", err)
+	}
+	if err := worker.ProcessRepoOnce(ctx, deps, repo); err != nil {
+		t.Fatalf("ProcessRepoOnce (extra): %v", err)
+	}
+	countExtra, err := st.Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countExtra <= count2 {
+		t.Fatalf("the extra default-branch file was not indexed: %d → %d", count2, countExtra)
+	}
+	runGit(t, src, "rm", "extra.txt")
+	runGit(t, src, "commit", "-m", "c6: remove extra.txt")
 	if _, err := deps.Engine.EnsureMirror(ctx, "gitlab", repo); err != nil {
 		t.Fatalf("EnsureMirror (mirror lane): %v", err)
 	}
@@ -160,15 +178,15 @@ func TestE2E_US2(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("read-back: count after file deletion = %d", count3)
-	if count3 >= count2 {
-		t.Errorf("prune did not work: count %d → %d", count2, count3)
+	if count3 >= countExtra {
+		t.Errorf("prune did not work: count %d → %d", countExtra, count3)
 	}
 	payloads, err = st.ScrollPayloads(ctx, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range payloads {
-		if p["file_path"] == "feature.txt" {
+		if p["file_path"] == "extra.txt" {
 			t.Errorf("points of the deleted file remain: %v", p)
 		}
 	}

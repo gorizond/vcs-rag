@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -27,6 +28,18 @@ type RepoDeps struct {
 	Logger  *slog.Logger
 	stats   *summary // optional pass counters (T060)
 }
+
+// indexMaxCommitsPerPass caps the commits indexed by one pass: the backfill of
+// a huge repository is spread over passes so the embeddings backend and the
+// machine keep breathing; the per-commit checkpoints resume the rest (T160).
+// It is a fixed operational constant (var only so the unit tests can lower it).
+var indexMaxCommitsPerPass = 100
+
+// indexBudgetPause is the minimum pace after an exhausted pass (T160).
+const indexBudgetPause = time.Minute
+
+// errIndexBudget is the sentinel of the exhausted commit budget (T160).
+var errIndexBudget = errors.New("index commit budget exhausted")
 
 // indexStore is the store surface of the index lane: a narrow interface so
 // unit tests can inject failures/counters without Qdrant (T088).
@@ -62,6 +75,9 @@ func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 		}
 		lastRepos = len(snap.get())
 		delay := p.next(busy, rl, retry)
+		if sum != nil && sum.budgetExhausted.Load() && delay < indexBudgetPause {
+			delay = indexBudgetPause // T160: let the embeddings backend breathe
+		}
 		if sum != nil {
 			sum.withPace(delay, p.reason)
 			if l, ok := deps.Embed.(*limiter); ok {
@@ -97,6 +113,11 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
 	for _, repo := range repos {
+		// T160: nothing new is dispatched once the pass budget is exhausted
+		// (running repositories stop at their next commit reservation).
+		if sum.budgetExhausted.Load() {
+			break
+		}
 		wg.Add(1)
 		go func(repo provider.Repo) {
 			defer wg.Done()
@@ -147,27 +168,46 @@ func processRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo, st 
 	if err != nil {
 		return fmt.Errorf("branch snapshot: %w", err)
 	}
+	// T160: only the default branch is managed. Indexing every refs/heads of a
+	// long-lived repository (hundreds of branches, millions of commits in the
+	// window) never finishes a pass; feature branches already indexed before
+	// are deliberately kept — they are not managed, so they are never pruned.
+	defaultBranch := repo.DefaultBranch
+	if defaultBranch == "" {
+		defaultBranch = deps.Engine.HeadBranch(ctx, mirror)
+	}
 	reader, err := deps.Engine.NewBlobReader(ctx, mirror)
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
 
-	finals := make(map[string]BranchState, len(refs))
-	for branch, tip := range refs {
-		bst, err := processBranch(ctx, deps, st, repo, mirror, branch, tip, state.Branches[branch], reader, lg, statePath)
-		if err != nil {
-			return fmt.Errorf("branch %s: %w", branch, err)
+	finals := make(map[string]BranchState, 1)
+	if defaultBranch != "" {
+		if tip, ok := refs[defaultBranch]; ok {
+			bst, err := processBranch(ctx, deps, st, repo, mirror, defaultBranch, tip, state.Branches[defaultBranch], reader, lg, statePath)
+			switch {
+			case errors.Is(err, errIndexBudget):
+				// T160: the per-pass commit budget is exhausted — the per-commit
+				// checkpoints are already persisted; the next pass resumes there.
+				lg.Info("index budget exhausted", "branch", defaultBranch)
+				return nil
+			case err != nil:
+				return fmt.Errorf("branch %s: %w", defaultBranch, err)
+			}
+			finals[defaultBranch] = bst
 		}
-		finals[branch] = bst
 	}
 
-	// Vanished branches → delete their points (data-model §2). The points go
-	// first: if the deletion fails, the keys stay in the state for a retry.
+	// A vanished DEFAULT branch → delete its points (data-model §2). The points
+	// go first: if the deletion fails, the key stays in the state for a retry.
+	// Non-default branches are unmanaged and their state is preserved (T160).
 	var vanished []string
-	for branch := range state.Branches {
-		if _, ok := refs[branch]; !ok {
-			vanished = append(vanished, branch)
+	if defaultBranch != "" {
+		if _, ok := refs[defaultBranch]; !ok {
+			if _, indexed := state.Branches[defaultBranch]; indexed {
+				vanished = append(vanished, defaultBranch)
+			}
 		}
 	}
 	for _, branch := range vanished {
@@ -206,6 +246,11 @@ func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provi
 	toIndex := newCommits(window, prev.IndexedCommits)
 	done := make([]string, 0, len(toIndex))
 	for _, sha := range toIndex { // oldest → newest
+		// T160: the per-pass commit budget — a huge backfill must not occupy
+		// the embeddings backend for hours; the checkpoints keep the progress.
+		if deps.stats != nil && !deps.stats.reserveCommit() {
+			return BranchState{}, errIndexBudget
+		}
 		if err := processCommit(ctx, deps, st, repo, mirror, branch, sha, reader, lg); err != nil {
 			return BranchState{}, err
 		}

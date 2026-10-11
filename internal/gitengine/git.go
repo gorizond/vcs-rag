@@ -113,6 +113,17 @@ func (e *Engine) EnsureLocalMirror(ctx context.Context, vcsType string, repo pro
 	return path, nil
 }
 
+// HeadBranch returns the short name of the mirror HEAD ("" when unavailable):
+// the index lane indexes the default branch only (T160); a mirror clone sets
+// HEAD to the remote default branch.
+func (e *Engine) HeadBranch(ctx context.Context, mirror string) string {
+	out, err := e.run(ctx, mirror, "symbolic-ref", "--short", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // Snapshot returns an atomic branch snapshot (single for-each-ref call):
 // short branch name → SHA. Format: %(refname:short)%00%(objectname).
 func (e *Engine) Snapshot(ctx context.Context, mirror string) (map[string]string, error) {

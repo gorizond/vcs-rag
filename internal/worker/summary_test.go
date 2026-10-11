@@ -43,3 +43,19 @@ func TestSummaryMetaDeleteBudget(t *testing.T) {
 		t.Error("the pass budget was exceeded")
 	}
 }
+
+// T160: the per-pass commit budget of the index lane.
+func TestSummaryCommitBudget(t *testing.T) {
+	s := newSummary("index")
+	for i := 0; i < indexMaxCommitsPerPass; i++ {
+		if !s.reserveCommit() {
+			t.Fatalf("reserve %d failed before the budget", i)
+		}
+	}
+	if s.reserveCommit() {
+		t.Fatal("the commit budget was exceeded")
+	}
+	if !s.budgetExhausted.Load() {
+		t.Error("the exhaustion flag was not set")
+	}
+}

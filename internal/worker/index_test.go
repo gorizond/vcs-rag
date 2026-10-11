@@ -72,10 +72,12 @@ func newIndexDeps(t *testing.T, repo provider.Repo) (RepoDeps, *countingEmbed) {
 // K-th upsert (T088 fault injection) and fires a one-shot hook on the first
 // operation (T089: simulating a concurrent lane writing to the sidecar).
 type faultStore struct {
-	upserts int
-	points  int
-	failAt  int // fail exactly the failAt-th upsert (0 — never)
-	firstOp func()
+	upserts         int
+	points          int
+	failAt          int // fail exactly the failAt-th upsert (0 — never)
+	firstOp         func()
+	byBranch        map[string]int // payload branch → points (T160)
+	deletedBranches []string       // DeleteBranch calls (T160)
 }
 
 func (f *faultStore) tick() {
@@ -91,7 +93,8 @@ func (f *faultStore) DeleteCodeFile(context.Context, string, string, string) err
 	return nil
 }
 
-func (f *faultStore) DeleteBranch(context.Context, string, string) error {
+func (f *faultStore) DeleteBranch(_ context.Context, _ string, branch string) error {
+	f.deletedBranches = append(f.deletedBranches, branch)
 	f.tick()
 	return nil
 }
@@ -106,6 +109,14 @@ func (f *faultStore) Upsert(_ context.Context, points []store.Point) error {
 	f.upserts++
 	if f.upserts == f.failAt { // one-shot: the K-th upsert fails, the retry succeeds
 		return errors.New("injected upsert failure")
+	}
+	if f.byBranch == nil {
+		f.byBranch = map[string]int{}
+	}
+	for _, p := range points {
+		if b, ok := p.Payload["branch"].(string); ok {
+			f.byBranch[b]++
+		}
 	}
 	f.points += len(points)
 	return nil
@@ -259,5 +270,171 @@ func TestIndexPassPreservesConcurrentLanes(t *testing.T) {
 	if saved.Meta["issue:1"] != 42 || !saved.LastFetchAt.Equal(fetchAt) {
 		t.Errorf("no-change pass clobbered the other lanes: meta=%v last_fetch_at=%v",
 			saved.Meta, saved.LastFetchAt)
+	}
+}
+
+// --- T160: default-branch-only indexing, kept feature branches, pass budget ---
+
+// indexTwoBranchFixture builds a source repo with main (1 commit) and dev
+// (1 commit) and returns the source path, the main and dev tips.
+func indexTwoBranchFixture(t *testing.T) (string, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	runGitT(t, dir, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "main.txt"), []byte("main content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, dir, "add", ".")
+	runGitT(t, dir, "commit", "-m", "c1: main")
+	mainSha := runGitT(t, dir, "rev-parse", "main")
+	runGitT(t, dir, "checkout", "-b", "dev")
+	if err := os.WriteFile(filepath.Join(dir, "dev.txt"), []byte("dev content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, dir, "add", ".")
+	runGitT(t, dir, "commit", "-m", "c2: dev")
+	devSha := runGitT(t, dir, "rev-parse", "dev")
+	runGitT(t, dir, "checkout", "main")
+	return dir, mainSha, devSha
+}
+
+// T160: only the default branch is processed; a previously indexed non-default
+// branch (dev) keeps its state and is never pruned.
+func TestIndexDefaultBranchOnly(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not found: %v", err)
+	}
+	ctx := context.Background()
+	src, mainSha, devSha := indexTwoBranchFixture(t)
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "file://" + src, DefaultBranch: "main"}
+	deps, _ := newIndexDeps(t, repo)
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	// a feature branch indexed by an older version: its state must survive.
+	if err := updateState(statePath, func(st *MirrorState) {
+		st.Branches["dev"] = BranchState{Tip: devSha, IndexedCommits: []string{devSha}}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	st := &faultStore{}
+	if err := processRepoOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("processRepoOnce: %v", err)
+	}
+	if st.points == 0 || st.byBranch["main"] == 0 || st.byBranch["dev"] != 0 {
+		t.Errorf("points by branch = %v (total %d), want main only", st.byBranch, st.points)
+	}
+	if len(st.deletedBranches) != 0 {
+		t.Errorf("deleted branches = %v, want none", st.deletedBranches)
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := saved.Branches["dev"]; !ok {
+		t.Error("the dev branch state was dropped")
+	}
+	if got := saved.Branches["main"].Tip; got != mainSha {
+		t.Errorf("main tip = %q, want %q", got, mainSha)
+	}
+	if got := saved.Branches["main"].IndexedCommits; len(got) != 1 || got[0] != mainSha {
+		t.Errorf("main indexed commits = %v, want [%s]", got, mainSha)
+	}
+}
+
+// T160: a vanished default branch is pruned; the unmanaged dev branch is kept.
+func TestIndexVanishedDefaultBranchOnly(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not found: %v", err)
+	}
+	ctx := context.Background()
+	src, _, devSha := indexTwoBranchFixture(t)
+	// the provider's default branch no longer exists in the mirror.
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "file://" + src, DefaultBranch: "gone"}
+	deps, _ := newIndexDeps(t, repo)
+	mirror := deps.Engine.MirrorPath(deps.VCSType, repo)
+	if _, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo); err != nil {
+		t.Fatal(err)
+	}
+	statePath := gitengine.StatePath(mirror)
+	if err := updateState(statePath, func(st *MirrorState) {
+		st.Branches["gone"] = BranchState{Tip: "deadbeef", IndexedCommits: []string{"deadbeef"}}
+		st.Branches["dev"] = BranchState{Tip: devSha, IndexedCommits: []string{devSha}}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	st := &faultStore{}
+	if err := processRepoOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("processRepoOnce: %v", err)
+	}
+	if len(st.deletedBranches) != 1 || st.deletedBranches[0] != "gone" {
+		t.Fatalf("deleted branches = %v, want only [gone]", st.deletedBranches)
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := saved.Branches["gone"]; ok {
+		t.Error("the vanished default branch state remained")
+	}
+	if _, ok := saved.Branches["dev"]; !ok {
+		t.Error("the unmanaged dev branch state was removed")
+	}
+}
+
+// T160: the per-pass commit budget stops a partial pass (checkpoints kept) and
+// the next pass resumes the remainder; the summary flags the exhaustion.
+func TestIndexCommitBudgetPartialResume(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not found: %v", err)
+	}
+	old := indexMaxCommitsPerPass
+	indexMaxCommitsPerPass = 2
+	t.Cleanup(func() { indexMaxCommitsPerPass = old })
+
+	ctx := context.Background()
+	src, shas := indexFixture(t, 4) // 4 commits on main
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "file://" + src, DefaultBranch: "main"}
+	deps, _ := newIndexDeps(t, repo)
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+
+	// pass 1: exactly two commits, then the budget stops the pass cleanly.
+	stats := newSummary("index")
+	deps.stats = stats
+	st := &faultStore{}
+	if err := processRepoOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("partial pass: %v", err)
+	}
+	if !stats.budgetExhausted.Load() {
+		t.Error("budget_exhausted was not flagged")
+	}
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := saved.Branches["main"].IndexedCommits; len(got) != 2 {
+		t.Fatalf("checkpointed commits = %d (%v), want 2", len(got), got)
+	}
+	if st.points == 0 {
+		t.Fatal("no points were written by the partial pass")
+	}
+
+	// pass 2 (a fresh budget, the resumed deps copy carries no stats): the
+	// remainder is indexed and the branch is complete.
+	deps.stats = nil
+	st2 := &faultStore{}
+	if err := processRepoOnce(ctx, deps, repo, st2); err != nil {
+		t.Fatalf("resume pass: %v", err)
+	}
+	saved, err = LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := saved.Branches["main"].IndexedCommits; len(got) != len(shas) {
+		t.Errorf("resumed commits = %d, want %d", len(got), len(shas))
 	}
 }

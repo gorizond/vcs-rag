@@ -27,6 +27,10 @@ type summary struct {
 	rateLimit  atomic.Bool
 	retryAfter atomic.Int64 // nanoseconds
 
+	// T160: the per-pass commit budget of the index lane.
+	commitBudget    atomic.Int64
+	budgetExhausted atomic.Bool
+
 	// repo-GC counters (T140).
 	gcKnown           atomic.Int64
 	gcVanished        atomic.Int64
@@ -58,7 +62,23 @@ const metaDeletePerPass = 128
 func newSummary(phase string) *summary {
 	s := &summary{phase: phase, start: time.Now()}
 	s.metaDeleteBudget.Store(metaDeletePerPass)
+	s.commitBudget.Store(int64(indexMaxCommitsPerPass))
 	return s
+}
+
+// reserveCommit consumes one slot of the index pass commit budget (T160) and
+// reports whether it is available; exhaustion is flagged once for the pass log.
+func (s *summary) reserveCommit() bool {
+	for {
+		n := s.commitBudget.Load()
+		if n <= 0 {
+			s.budgetExhausted.Store(true)
+			return false
+		}
+		if s.commitBudget.CompareAndSwap(n, n-1) {
+			return true
+		}
+	}
 }
 
 // reserveMetaDelete consumes one deletion slot of the pass budget (T140).
@@ -156,6 +176,9 @@ func (s *summary) log(logger *slog.Logger) {
 			"deleted_entities", s.deletedEntities.Load(),
 			"suppressed_cap", s.metaSuppressedCap.Load(),
 		)
+	}
+	if s.phase == "index" {
+		attrs = append(attrs, "budget_exhausted", s.budgetExhausted.Load())
 	}
 	if s.embed != nil {
 		attrs = append(attrs,
