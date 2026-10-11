@@ -62,11 +62,17 @@ flowchart LR
   VCS[(GitLab / GitHub)] -->|list + fetch| D[discovery]
   D --> MI[mirror]
   MI --> CH[chunk + embed]
-  CH --> QD[(Qdrant)]
+  CH --> QD[("Qdrant: code + metadata (vcs_rag)")]
   MET["metadata: issues / MR / CI"] --> QD
   GC["GC: vanished repos and entities"] --> QD
+  MI --> GR["graph lane: scan + generation sweep"]
+  VCS -.->|SDLC listings| GR
+  GR -->|"nodes: definition, user, note, work_item, milestone, label, runner"| QDG[("Qdrant graph: vcs_rag_graph_*, payload-only, no vectors")]
+  GR -->|"edges: imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by"| QDG
   QD --> MCP[MCP server]
+  QDG --> MCP
   MCP -->|search_code, search_*| CL[LLM / IDE client]
+  MCP -->|"search_definitions, get_imports, get_dependents, graph_schema, query_graph (traversal / aggregation / path_finding / neighbors)"| CL
   MCP -->|index_status| KV[(status KV)]
   MCP -.->|refresh_repo, auto-refresh| NATS[NATS JetStream]
   NATS -.-> MET
@@ -77,11 +83,19 @@ The background lanes (discovery → mirror → index → metadata, plus the GC a
 graph lanes) keep the index fresh; the MCP server only reads Qdrant and, with
 NATS, can pull one repository on demand ([refresh flow](docs/refresh.md)) or
 refresh it automatically before a repo-scoped search (Auto freshness below).
-The graph lane writes a separate payload-only collection — definition nodes,
-import/defines edges and the SDLC node families (user, note, work_item,
-milestone, label, runner) with their relations, no vectors
-([graph layer](docs/graph.md)). Real-time CDC is a non-goal — freshness comes
-from the periodic lanes (or an on-demand refresh).
+The graph lane writes a separate **payload-only** collection
+(`QDRANT_GRAPH_COLLECTION`, default `vcs_rag_graph`, instance-scoped) —
+definition nodes, `imports`/`defines` edges and the Orbit-parity families
+(user, note, work_item, milestone, label, runner) with their relations
+(`authored`, `commented`, `assigned_to`, `labelled`, `in_milestone`,
+`executed_by`), joined by canonical `node_key`/`from_key`/`to_key` refs and
+carrying **no vectors** (zero embeddings). Stale generations are removed by a
+mark-and-sweep GC after each successful repository scan
+([graph layer](docs/graph.md)); the MCP serves both collections — the search
+tools read code/metadata, the graph tools (`search_definitions`, `get_imports`,
+`get_dependents`, `graph_schema`, `query_graph`) read the graph. Real-time CDC
+is a non-goal — freshness comes from the periodic lanes (or an on-demand
+refresh).
 
 ## Key environment variables
 
