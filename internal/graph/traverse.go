@@ -36,10 +36,10 @@ type Result struct {
 // Traverse runs the iterative N-hop walk of a Query over sc (T038):
 //
 //   - start scan: Compiled.Start; the frontier keys are derived from the start
-//     points (file paths, repo-scoped package keys, symbols — see expandKeys);
+//     points (file paths, bare package names, symbols — see frontierKeys);
 //   - each hop scans edges matching the frontier on the direction-relevant
-//     endpoints, collects them, and derives the next frontier from the far
-//     endpoints, alternating files and packages/symbols;
+//     endpoint fields, collects them, and derives the next frontier from the
+//     scanned points;
 //   - caps: frontier ≤10000 keys/hop, edges ≤20000 scanned/hop, results ≤
 //     Limit — any cut sets Truncated. Points are deduplicated by ID across all
 //     scans.
@@ -77,18 +77,21 @@ func Traverse(ctx context.Context, sc Scroller, q Query, coverage Coverage) (Res
 		return res, fmt.Errorf("graph: start scan: %w", err)
 	}
 	collect(start)
-	frontier := frontierKeys(start, c.Direction)
 
-	for hop := 1; hop <= c.Hops && len(frontier) > 0; hop++ {
+	fr := frontierKeys(start, c.Direction)
+	for hop := 1; hop <= c.Hops && !fr.empty(); hop++ {
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		keys := frontier
-		if len(keys) > maxFrontier {
-			keys = keys[:maxFrontier]
+		var cut bool
+		if fr, cut = fr.clamp(maxFrontier); cut {
 			res.Truncated = true
 		}
-		edges, err := sc.ScrollAll(ctx, hopFilter(c, keys), graphPageSize)
+		flt := hopFilter(c, fr)
+		if flt == nil {
+			break // no endpoint of this direction: the walk is complete
+		}
+		edges, err := sc.ScrollAll(ctx, flt, graphPageSize)
 		if err != nil {
 			return res, fmt.Errorf("graph: hop %d scan: %w", hop, err)
 		}
@@ -97,104 +100,148 @@ func Traverse(ctx context.Context, sc Scroller, q Query, coverage Coverage) (Res
 			res.Truncated = true
 		}
 		collect(edges)
-		frontier = frontierKeys(edges, c.Direction)
+		fr = frontierKeys(edges, c.Direction)
 	}
 	return res, nil
 }
 
-// hopFilter narrows Compiled.Edge to one hop's frontier: outgoing edges leave
-// from the frontier (from_file/from_package), incoming edges arrive at it
-// (to_package/to_symbol). The two endpoint fields are an OR expressed as a
-// nested should condition; the store expands oversized MatchAny lists inside
-// it per chunk.
-func hopFilter(c Compiled, keys []string) *qdrant.Filter {
+// frontier is the typed expansion state of one traversal step. File paths and
+// the two package key forms are kept apart so each hop matches only its own
+// endpoint fields: a mixed key list on both fields lets the package key derived
+// from one file pull in every edge of the whole package (US5: 616 edges instead
+// of that file's 14).
+type frontier struct {
+	files    []string // file paths (file_path, location_file, from_file)
+	pkgKeys  []string // repo-namespaced package keys (PkgKey, edge to_package)
+	pkgNames []string // bare package names (definition `package` ↔ to_package_name)
+	syms     []string // symbols (symbol, to_symbol)
+}
+
+// empty reports whether the frontier can no longer continue the traversal.
+func (fr frontier) empty() bool {
+	return len(fr.files) == 0 && len(fr.pkgKeys) == 0 && len(fr.pkgNames) == 0 && len(fr.syms) == 0
+}
+
+// clamp bounds every key set to max keys; true means a cut happened.
+func (fr frontier) clamp(max int) (frontier, bool) {
+	cut := false
+	if len(fr.files) > max {
+		fr.files, cut = fr.files[:max], true
+	}
+	if len(fr.pkgKeys) > max {
+		fr.pkgKeys, cut = fr.pkgKeys[:max], true
+	}
+	if len(fr.pkgNames) > max {
+		fr.pkgNames, cut = fr.pkgNames[:max], true
+	}
+	if len(fr.syms) > max {
+		fr.syms, cut = fr.syms[:max], true
+	}
+	return fr, cut
+}
+
+// endpointKeys is one (field, keys) OR-branch of a hop filter.
+type endpointKeys struct {
+	field string
+	keys  []string
+}
+
+// hopFilter narrows Compiled.Edge to one hop's frontier. Each direction matches
+// only the endpoint fields it traverses: outgoing expansions leave from the
+// frontier files (from_file); incoming expansions arrive at the frontier
+// packages and symbols — to_package for edge-derived full keys, to_package_name
+// for bare package names, to_symbol for defines edges. A file's package key is
+// never matched on the outgoing side: it would widen the scan to the whole
+// package (US5). nil means the frontier has no endpoint of this direction.
+func hopFilter(c Compiled, fr frontier) *qdrant.Filter {
 	f := &qdrant.Filter{}
 	f.Must = append(f.Must, c.Edge.GetMust()...)
+	var cond *qdrant.Condition
 	if c.Direction == Incoming {
-		f.Must = append(f.Must, endpointAny(keys, "to_package", "to_symbol"))
+		cond = endpointOr(
+			endpointKeys{"to_package", fr.pkgKeys},
+			endpointKeys{"to_package_name", fr.pkgNames},
+			endpointKeys{"to_symbol", fr.syms},
+		)
 	} else {
-		f.Must = append(f.Must, endpointAny(keys, "from_file", "from_package"))
+		cond = endpointOr(endpointKeys{"from_file", fr.files})
 	}
+	if cond == nil {
+		return nil
+	}
+	f.Must = append(f.Must, cond)
 	return f
 }
 
-// endpointAny matches any of the given keys on any of the endpoint fields.
-func endpointAny(keys []string, fields ...string) *qdrant.Condition {
-	conds := make([]*qdrant.Condition, 0, len(fields))
-	for _, field := range fields {
-		conds = append(conds, qdrant.NewMatchKeywords(field, keys...))
+// endpointOr ORs one MatchAny condition per non-empty (field, keys) pair; nil
+// when every pair is empty.
+func endpointOr(pairs ...endpointKeys) *qdrant.Condition {
+	conds := make([]*qdrant.Condition, 0, len(pairs))
+	for _, p := range pairs {
+		if len(p.keys) == 0 {
+			continue
+		}
+		conds = append(conds, qdrant.NewMatchKeywords(p.field, p.keys...))
+	}
+	if len(conds) == 0 {
+		return nil
 	}
 	return qdrant.NewFilterAsCondition(&qdrant.Filter{Should: conds})
 }
 
-// frontierKeys derives the expansion keys of a scanned point set, deduplicated
-// and sorted: every hop filter is deterministic regardless of scan order.
-func frontierKeys(pts []*qdrant.RetrievedPoint, dir Direction) []string {
-	seen := make(map[string]bool)
-	var out []string
-	for _, p := range pts {
-		for _, k := range expandKeys(p, dir) {
-			if k == "" || seen[k] {
-				continue
-			}
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-// expandKeys maps one scanned point to the canonical endpoint values that
-// continue the traversal:
+// frontierKeys derives the typed expansion keys of a scanned point set,
+// deduplicated and sorted (deterministic filters regardless of scan order):
 //
-//   - edges carry canonical endpoints directly — outgoing from_file/
-//     from_package, incoming to_package/to_symbol;
-//   - node-like entities (definition, mr_file, ci, vuln) carry file paths
-//     (file_path, location_file) and, once a repo is known, their repo-scoped
-//     package key (PkgKey — the spelling edges use for packages) plus their
-//     symbol for incoming defines edges.
-func expandKeys(p *qdrant.RetrievedPoint, dir Direction) []string {
-	m := p.GetPayload()
-	if payloadString(m, "kind") == string(KindEdge) {
-		if dir == Incoming {
-			return compact(payloadString(m, "to_package"), payloadString(m, "to_symbol"))
+//   - an outgoing hop continues from files only (from_file): a file start must
+//     not widen to its package (US5) — package-level lookups belong to
+//     get_imports/get_dependents;
+//   - an incoming hop continues from packages and symbols: edge-derived
+//     to_package keeps the full key, node-derived `package` uses the bare name
+//     (to_package_name, the spelling edges carry), symbols feed defines edges.
+func frontierKeys(pts []*qdrant.RetrievedPoint, dir Direction) frontier {
+	var fr frontier
+	seen := make(map[string]bool)
+	add := func(dst *[]string, family, v string) {
+		if v == "" || seen[family+"\x00"+v] {
+			return
 		}
-		return compact(payloadString(m, "from_file"), payloadString(m, "from_package"))
+		seen[family+"\x00"+v] = true
+		*dst = append(*dst, v)
 	}
-	if dir == Incoming {
-		return compact(packageKey(m), payloadString(m, "symbol"), payloadString(m, "to_symbol"))
+	for _, p := range pts {
+		m := p.GetPayload()
+		if payloadString(m, "kind") == string(KindEdge) {
+			if dir == Incoming {
+				add(&fr.pkgKeys, "pkgkey", payloadString(m, "to_package"))
+				add(&fr.syms, "sym", payloadString(m, "to_symbol"))
+			} else {
+				add(&fr.files, "file", payloadString(m, "from_file"))
+			}
+			continue
+		}
+		if dir == Incoming {
+			add(&fr.pkgNames, "pkgname", payloadString(m, "package"))
+			add(&fr.syms, "sym", payloadString(m, "symbol"))
+			add(&fr.syms, "sym", payloadString(m, "to_symbol"))
+		} else {
+			add(&fr.files, "file", payloadString(m, "file_path"))
+			add(&fr.files, "file", payloadString(m, "location_file"))
+			add(&fr.files, "file", payloadString(m, "from_file"))
+		}
 	}
-	return compact(payloadString(m, "file_path"), payloadString(m, "location_file"),
-		payloadString(m, "from_file"), packageKey(m))
+	sort.Strings(fr.files)
+	sort.Strings(fr.pkgKeys)
+	sort.Strings(fr.pkgNames)
+	sort.Strings(fr.syms)
+	return fr
 }
 
-// packageKey is the repo-scoped package key of a node-like point ("" when the
-// payload carries no package or repo).
-func packageKey(m map[string]*qdrant.Value) string {
-	pkg, repo := payloadString(m, "package"), payloadString(m, "repo")
-	if pkg == "" || repo == "" {
-		return ""
-	}
-	return PkgKey(repo, pkg)
-}
-
+// payloadString reads a string payload field.
 func payloadString(m map[string]*qdrant.Value, key string) string {
 	if v, ok := m[key]; ok {
 		return v.GetStringValue()
 	}
 	return ""
-}
-
-// compact drops empty strings, preserving order.
-func compact(values ...string) []string {
-	out := values[:0]
-	for _, v := range values {
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
 }
 
 // pointIDKey renders a point ID for deduplication: canonical UUIDs compare as

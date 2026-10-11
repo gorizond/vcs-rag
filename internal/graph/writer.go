@@ -110,12 +110,48 @@ func DefinePoints(meta Meta, defs []chunk.GraphDefinition) []*qdrant.PointStruct
 	return out
 }
 
+// PackageName is the bare Go package name of an import (or package) path: its
+// last segment, with a Go module major-version segment stripped
+// (".../lib/v2" → "lib"). It is the spelling definition nodes carry in
+// `package`, so bare-name lookups (get_dependents by package, query_graph
+// incoming) can join edges to nodes.
+func PackageName(path string) string {
+	path = strings.TrimSuffix(strings.TrimSpace(path), "/")
+	i := strings.LastIndex(path, "/")
+	if i < 0 {
+		return path
+	}
+	seg := path[i+1:]
+	if isMajorVersion(seg) {
+		path = path[:i]
+		if j := strings.LastIndex(path, "/"); j >= 0 {
+			return path[j+1:]
+		}
+		return path
+	}
+	return seg
+}
+
+// isMajorVersion reports a Go module major-version path segment: v2, v3, ...
+func isMajorVersion(seg string) bool {
+	if len(seg) < 2 || seg[0] != 'v' {
+		return false
+	}
+	for _, r := range seg[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // ImportPoints builds the package-level imports edges (kind=edge,
 // edge_type=imports) of one file. from_package/to_package are repo-namespaced
 // (PkgKey) so same-named packages ("utils", "main") never collide across
-// repositories. external marks imports outside the indexed repository set and
-// is classified by the caller: nil means nothing is external. Pure: no client,
-// no I/O.
+// repositories; to_package_name carries the bare package name of the imported
+// path (PackageName), the spelling definition nodes use. external marks imports
+// outside the indexed repository set and is classified by the caller: nil means
+// nothing is external. Pure: no client, no I/O.
 func ImportPoints(meta Meta, f FileGraph, isExternal func(string) bool) []*qdrant.PointStruct {
 	ns := Namespace(meta.SchemaVer)
 	from := PkgKey(meta.Repo, f.Package)
@@ -125,16 +161,17 @@ func ImportPoints(meta Meta, f FileGraph, isExternal func(string) bool) []*qdran
 		out = append(out, &qdrant.PointStruct{
 			Id: qdrant.NewID(EdgeID(ns, meta.Repo, meta.Branch, EdgeImports, KeyFile(f.Path), KeyImport(f.Path, to)).String()),
 			Payload: valueMap(map[string]any{
-				"kind":         string(KindEdge),
-				"edge_type":    string(EdgeImports),
-				"from_file":    f.Path,
-				"from_package": from,
-				"to_package":   to,
-				"external":     isExternal != nil && isExternal(imp.Path),
-				"repo":         meta.Repo,
-				"branch":       meta.Branch,
-				"generation":   meta.Generation,
-				"indexed_at":   time.Now().UTC().Format(time.RFC3339),
+				"kind":            string(KindEdge),
+				"edge_type":       string(EdgeImports),
+				"from_file":       f.Path,
+				"from_package":    from,
+				"to_package":      to,
+				"to_package_name": PackageName(imp.Path),
+				"external":        isExternal != nil && isExternal(imp.Path),
+				"repo":            meta.Repo,
+				"branch":          meta.Branch,
+				"generation":      meta.Generation,
+				"indexed_at":      time.Now().UTC().Format(time.RFC3339),
 			}),
 		})
 	}

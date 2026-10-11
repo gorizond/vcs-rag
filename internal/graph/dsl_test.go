@@ -205,9 +205,15 @@ func TestTraverseDedupesAndCaps(t *testing.T) {
 	if len(sc.calls) != 2 {
 		t.Fatalf("expected start + one hop scan, got %d", len(sc.calls))
 	}
-	// The hop filter must match the frontier on the outgoing endpoints.
-	if !hasEndpointKey(sc.calls[1], "from_file", "a.go") || !hasEndpointKey(sc.calls[1], "from_package", graph.PkgKey("r", "a")) {
-		t.Fatalf("hop filter lacks frontier endpoints: %v", sc.calls[1])
+	// The hop filter must match the frontier files only: from_file=a.go. The
+	// file's package key belongs to incoming lookups — matching it on
+	// from_package would widen the scan to every edge of the whole package
+	// (US5: 616 edges instead of the file's 14).
+	if !hasEndpointKey(sc.calls[1], "from_file", "a.go") {
+		t.Fatalf("hop filter lacks the frontier file: %v", sc.calls[1])
+	}
+	if hasEndpointKey(sc.calls[1], "from_package", graph.PkgKey("r", "a")) {
+		t.Fatalf("outgoing hop filter matches the package key: the scan widens to the whole package (US5): %v", sc.calls[1])
 	}
 
 	// Result limit cuts and reports truncation.
@@ -235,8 +241,48 @@ func TestTraverseIncomingEndpoints(t *testing.T) {
 	if len(sc.calls) != 2 {
 		t.Fatalf("expected start + one hop scan, got %d", len(sc.calls))
 	}
-	// Incoming hops arrive at the frontier: to_package/to_symbol, never from_file.
-	if !hasEndpointKey(sc.calls[1], "to_package", graph.PkgKey("r", "a")) || hasEndpointKey(sc.calls[1], "from_file", "a.go") {
+	// Incoming hops arrive at the frontier: the node's bare package name
+	// (to_package_name, the spelling edges carry) and its symbol; never
+	// from_file. The node's package is bare, so a to_package full-key match
+	// would be dead weight, not a match.
+	if !hasEndpointKey(sc.calls[1], "to_package_name", "a") || !hasEndpointKey(sc.calls[1], "to_symbol", "F") {
 		t.Fatalf("incoming hop endpoints wrong: %v", sc.calls[1])
+	}
+	if hasEndpointKey(sc.calls[1], "from_file", "a.go") || hasEndpointKey(sc.calls[1], "to_package", graph.PkgKey("r", "a")) {
+		t.Fatalf("incoming hop filter carries outgoing/full-key endpoints: %v", sc.calls[1])
+	}
+}
+
+// TestTraverseFrontierScopedEdgeFilter — US5 regression: a file-scoped start
+// must keep the hop at file level. The outgoing hop filter is a single
+// from_file MatchAny over the frontier files; the file's package key (which
+// matches hundreds of package-wide edges) must not appear on any endpoint.
+func TestTraverseFrontierScopedEdgeFilter(t *testing.T) {
+	start := []*qdrant.RetrievedPoint{
+		point("11111111-1111-5111-8111-111111111111", "node",
+			map[string]string{"repo": "r", "package": "controllers", "file_path": "pkg/controllers/root.go", "symbol": "F"}),
+	}
+	sc := &fakeScroller{results: [][]*qdrant.RetrievedPoint{start}}
+	q := graph.Query{
+		StartEntity: graph.EntityFile,
+		Start:       graph.Filter{Repo: "r", FilePath: "pkg/controllers/root.go"},
+		EdgeType:    graph.EdgeImports,
+		Direction:   graph.Outgoing,
+		Hops:        1,
+		Limit:       50,
+	}
+	if _, err := graph.Traverse(context.Background(), sc, q, graph.Coverage{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sc.calls) != 2 {
+		t.Fatalf("expected start + one hop scan, got %d", len(sc.calls))
+	}
+	hop := sc.calls[1]
+	if !hasEndpointKey(hop, "from_file", "pkg/controllers/root.go") {
+		t.Fatalf("hop filter lacks the frontier file: %v", hop)
+	}
+	if hasEndpointKey(hop, "from_package", graph.PkgKey("r", "controllers")) ||
+		hasEndpointKey(hop, "to_package_name", "controllers") {
+		t.Fatalf("hop filter widened to the package: %v", hop)
 	}
 }

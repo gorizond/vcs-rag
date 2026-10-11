@@ -84,6 +84,7 @@ var graphIndexFields = []string{
 	"from_file",
 	"from_package",
 	"to_package",
+	"to_package_name",
 	"to_symbol",
 	"file_path",
 	"package",

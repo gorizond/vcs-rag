@@ -380,6 +380,7 @@ func registerTools(server *mcp.Server, t *tools) {
 		Description: "Direct (1-hop) package imports of a file or package, from the graph edges (edge_type=imports). Package-level, " +
 			"not symbol-level: one edge per imported package. direction=outgoing (default) lists what the input imports; " +
 			"direction=incoming lists who imports the input package (a file input is resolved to its package(s) first). " +
+			"package accepts the bare Go package name or a path (reduced to its last segment). " +
 			"The result object is {\"results\": [{from_file, from_package, to_package, external}], \"coverage\": [...]}.",
 	}, t.getImports)
 	mcp.AddTool(server, &mcp.Tool{
@@ -387,7 +388,9 @@ func registerTools(server *mcp.Server, t *tools) {
 		Description: "Direct (1-hop) dependents of a file or package from the graph edges: the importers. HONESTY: dependents of " +
 			"file X are the importers of X's package(s), NOT symbol referencers of X — symbol-level references are not indexed " +
 			"(package-level edges only). direction=incoming (default) lists importers of the input; direction=outgoing lists the " +
-			"input's imports. The result object is {\"results\": [{from_file, from_package, to_package, external}], \"coverage\": [...]}.",
+			"input's imports. package accepts both spellings: the bare Go package name (\"controllers\") or the import path " +
+			"(\"github.com/x/y/pkg/controllers\") — either key form is matched. " +
+			"The result object is {\"results\": [{from_file, from_package, to_package, external}], \"coverage\": [...]}.",
 	}, t.getDependents)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "query_graph",
@@ -741,27 +744,31 @@ func (t *tools) graphEdges(ctx context.Context, in graphEdgesInput, defaultDir s
 		if in.FilePath != "" {
 			f.Must = append(f.Must, qdrant.NewMatch("from_file", in.FilePath))
 		} else {
-			f.Must = append(f.Must, qdrant.NewMatchKeywords("from_package", packageKeys(repos, in.Package)...))
+			// from_package is the bare package name of the source file: any
+			// spelling of the package argument reduces to that name.
+			f.Must = append(f.Must, qdrant.NewMatchKeywords("from_package", packageKeys(repos, graph.PackageName(in.Package))...))
 		}
 	default: // incoming
-		keys := packageKeys(repos, in.Package)
-		if in.Package == "" {
+		if in.Package != "" {
+			f.Must = append(f.Must, dependentsCondition(repos, in.Package))
+		} else {
 			pkgs, err := t.filePackages(ctx, repos, in.FilePath)
 			if err != nil {
 				return nil, errorResult(ctx, codeSearchFailed, err), nil
 			}
-			keys = packageKeysAll(repos, pkgs)
-		}
-		if len(keys) == 0 {
-			// No indexed definitions for the file → no package to look up:
-			// nothing can match to_package (honest empty result, R2).
-			cov, err := t.coverageNotice(ctx, repos, nil)
-			if err != nil {
-				return nil, errorResult(ctx, codeSearchFailed, err), nil
+			if len(pkgs) == 0 {
+				// No indexed definitions for the file → no package to look up:
+				// nothing can match to_package_name (honest empty result, R2).
+				cov, err := t.coverageNotice(ctx, repos, nil)
+				if err != nil {
+					return nil, errorResult(ctx, codeSearchFailed, err), nil
+				}
+				return nil, importsResponse{Results: []importEdge{}, Coverage: cov}, nil
 			}
-			return nil, importsResponse{Results: []importEdge{}, Coverage: cov}, nil
+			// filePackages returns the bare package names of the file's
+			// definition nodes — the to_package_name spelling of the edges.
+			f.Must = append(f.Must, qdrant.NewMatchKeywords("to_package_name", pkgs...))
 		}
-		f.Must = append(f.Must, qdrant.NewMatchKeywords("to_package", keys...))
 	}
 	edges, err := t.scrollEdges(ctx, f)
 	if err != nil {
@@ -1337,14 +1344,21 @@ func packageKeys(repos []string, pkg string) []string {
 	return keys
 }
 
-func packageKeysAll(repos, pkgs []string) []string {
-	keys := make([]string, 0, len(repos)*len(pkgs))
-	for _, r := range repos {
-		for _, pkg := range pkgs {
-			keys = append(keys, graph.PkgKey(r, pkg))
-		}
+// dependentsCondition matches the importers of a package argument on both
+// spellings the edges carry: a path-like argument (contains "/" or ".") matches
+// the repo-namespaced full import path (to_package = PkgKey), and every
+// argument matches its bare package name (to_package_name, the last path
+// segment). ORing the forms keeps "controllers" and
+// "github.com/x/y/pkg/controllers" equivalent.
+func dependentsCondition(repos []string, arg string) *qdrant.Condition {
+	conds := make([]*qdrant.Condition, 0, 2)
+	if strings.ContainsAny(arg, "/.") {
+		conds = append(conds, qdrant.NewMatchKeywords("to_package", packageKeys(repos, arg)...))
 	}
-	return keys
+	if name := graph.PackageName(arg); name != "" {
+		conds = append(conds, qdrant.NewMatchKeywords("to_package_name", name))
+	}
+	return qdrant.NewFilterAsCondition(&qdrant.Filter{Should: conds})
 }
 
 // scrollEdges reads all matching import edges into the response shape.

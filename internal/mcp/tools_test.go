@@ -650,6 +650,46 @@ func conditionField(c *qdrant.Condition) string {
 	return ""
 }
 
+// hasKeyword reports whether the filter's must chain has a direct
+// field=value MatchAny condition.
+func hasKeyword(f *qdrant.Filter, field, value string) bool {
+	for _, c := range f.GetMust() {
+		fc := c.GetField()
+		if fc == nil || fc.GetKey() != field {
+			continue
+		}
+		for _, v := range fc.GetMatch().GetKeywords().GetStrings() {
+			if v == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// nestedKeyword reports whether a nested (OR) condition of the filter's must
+// chain matches field=value in its should list.
+func nestedKeyword(f *qdrant.Filter, field, value string) bool {
+	for _, c := range f.GetMust() {
+		nf := c.GetFilter()
+		if nf == nil {
+			continue
+		}
+		for _, sc := range nf.GetShould() {
+			fc := sc.GetField()
+			if fc == nil || fc.GetKey() != field {
+				continue
+			}
+			for _, v := range fc.GetMatch().GetKeywords().GetStrings() {
+				if v == value {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // defNode — one definition node payload (the graph store's canonical shape).
 func defNode(repo, file, symbol string) *qdrant.RetrievedPoint {
 	return &qdrant.RetrievedPoint{Payload: qdrant.NewValueMap(map[string]any{
@@ -772,7 +812,7 @@ func TestSearchDefinitionsSemanticFallback(t *testing.T) {
 func TestGetImportsDependentsTool(t *testing.T) {
 	const repo = "acme/demo"
 	edge := impEdge(repo, "a.go", "a", "b")
-	wantB, wantA := graph.PkgKey(repo, "b"), graph.PkgKey(repo, "a")
+	wantB := graph.PkgKey(repo, "b")
 
 	gr := &fakeGraphReader{points: []*qdrant.RetrievedPoint{edge}}
 	tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}, graph: gr}
@@ -795,7 +835,20 @@ func TestGetImportsDependentsTool(t *testing.T) {
 		t.Errorf("JSON = %s", js)
 	}
 
-	// get_dependents by package: incoming to_package carries the repo-scoped key.
+	// get_imports by package: any spelling reduces to the bare package name —
+	// from_package stores the source file's bare package.
+	gr = &fakeGraphReader{points: []*qdrant.RetrievedPoint{edge}}
+	tl.graph = gr
+	if _, _, err := tl.getImports(context.Background(), nil, graphEdgesInput{Repo: repo, Package: "github.com/x/y/pkg/a"}); err != nil {
+		t.Fatalf("getImports(package path): %v", err)
+	}
+	if len(gr.filters) == 0 || !hasKeyword(gr.filters[0], "from_package", graph.PkgKey(repo, "a")) {
+		t.Errorf("outgoing package filter = %+v, want from_package=%q", gr.filters, graph.PkgKey(repo, "a"))
+	}
+
+	// get_dependents by bare package name: the edge key form is the bare
+	// to_package_name (definition nodes carry `package` = "b"), not the
+	// full-path to_package key.
 	gr = &fakeGraphReader{points: []*qdrant.RetrievedPoint{edge}}
 	tl.graph = gr
 	_, out, err = tl.getDependents(context.Background(), nil, graphEdgesInput{Repo: repo, Package: "b"})
@@ -805,16 +858,31 @@ func TestGetImportsDependentsTool(t *testing.T) {
 	if _, ok := out.(importsResponse); !ok || len(gr.filters) == 0 || len(gr.filters[0].Must) != 3 {
 		t.Fatalf("out = %T filters = %+v", out, gr.filters)
 	}
-	last := gr.filters[0].Must[2]
-	if conditionField(last) != "to_package" ||
-		last.GetField().GetMatch().GetKeywords().GetStrings()[0] != wantB {
-		t.Errorf("incoming filter condition = %+v", last)
+	if !nestedKeyword(gr.filters[0], "to_package_name", "b") {
+		t.Errorf("bare package filter misses to_package_name: %+v", gr.filters[0])
 	}
 
-	// get_dependents by file: the file is resolved to its package(s) first.
+	// get_dependents by full import path: both key forms are matched — the
+	// repo-namespaced to_package key and the bare last segment.
+	full := "github.com/x/y/pkg/b"
+	fullKey := graph.PkgKey(repo, full)
+	gr = &fakeGraphReader{points: []*qdrant.RetrievedPoint{edge}}
+	tl.graph = gr
+	_, out, err = tl.getDependents(context.Background(), nil, graphEdgesInput{Repo: repo, Package: full})
+	if err != nil {
+		t.Fatalf("getDependents(full path): %v", err)
+	}
+	if _, ok := out.(importsResponse); !ok || len(gr.filters) == 0 {
+		t.Fatalf("out = %T filters = %+v", out, gr.filters)
+	}
+	if !nestedKeyword(gr.filters[0], "to_package", fullKey) || !nestedKeyword(gr.filters[0], "to_package_name", "b") {
+		t.Errorf("full-path filter = %+v, want to_package(PkgKey) OR to_package_name(b)", gr.filters[0])
+	}
+
+	// get_dependents by file: the file is resolved to its bare package(s).
 	seq := &scriptedGraphReader{responses: [][]*qdrant.RetrievedPoint{
 		{defNode(repo, "a.go", "F")}, // definitions → package "a"
-		{edge},                       // importers of to_package=a
+		{edge},                       // importers of to_package_name=a
 		{defNode(repo, "a.go", "F")}, // coverage marker scan
 	}}
 	tl.graph = seq
@@ -825,10 +893,8 @@ func TestGetImportsDependentsTool(t *testing.T) {
 	if r, ok := out.(importsResponse); !ok || len(r.Results) != 1 || len(seq.filters) < 2 {
 		t.Fatalf("out = %T %+v filters = %d", out, out, len(seq.filters))
 	}
-	edgeCond := seq.filters[1].Must[len(seq.filters[1].Must)-1]
-	if conditionField(edgeCond) != "to_package" ||
-		edgeCond.GetField().GetMatch().GetKeywords().GetStrings()[0] != wantA {
-		t.Errorf("resolved file filter = %+v", edgeCond)
+	if !hasKeyword(seq.filters[1], "to_package_name", "a") {
+		t.Errorf("resolved file filter = %+v, want to_package_name=a", seq.filters[1])
 	}
 
 	// A file without indexed definitions resolves to no package: an honest empty
