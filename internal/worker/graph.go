@@ -1252,12 +1252,22 @@ func treePaths(scanned []graph.FileGraph) (files, dirs []string) {
 // pass continues; the returned flag reports whether every listing of the step
 // completed — only then may Sweep generation-sweep the group/project kinds
 // (targets.Ownership), so a withheld listing keeps its stale points.
-// Deterministic IDs make the re-upsert each pass idempotent.
+// Deterministic IDs make the re-upsert each pass idempotent; the step is
+// scope-free (empty repo/branch in every ID and payload) because ownership is
+// instance-level, not repo-level: the same entity emitted from any repo pass
+// collapses onto one point.
 func ownershipPoints(ctx context.Context, deps RepoDeps, meta graph.Meta, host string, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
 	gr, ok := deps.VCS.(provider.GroupReader)
 	if !ok {
 		return nil, false
 	}
+	// The same group/project listing is emitted by every repo pass, so every
+	// point and edge of the step is built with an empty scope: the scope feeds
+	// the deterministic NodeID/EdgeID, and with it empty the same entity/edge
+	// yields the same ID from any repo pass — upsert collapses what used to be
+	// one duplicate per scanning repository.
+	m := meta
+	m.Repo, m.Branch = "", ""
 	groups, err := gr.ListGroups(ctx)
 	if err != nil {
 		orbitFail(ctx, lg, "groups", err)
@@ -1269,11 +1279,11 @@ func ownershipPoints(ctx context.Context, deps RepoDeps, meta graph.Meta, host s
 		if ctx.Err() != nil {
 			return points, false
 		}
-		gp := graph.GroupPoint(meta, g)
+		gp := graph.GroupPoint(m, g)
 		groupKey := gp.GetPayload()["node_key"].GetStringValue()
 		points = append(points, gp)
 		if parentKey := gp.GetPayload()["parent_key"].GetStringValue(); parentKey != "" {
-			points = append(points, graph.GroupContainsGroupEdge(meta, parentKey, groupKey))
+			points = append(points, graph.GroupContainsGroupEdge(m, parentKey, groupKey))
 		}
 		projects, err := gr.ListGroupProjects(ctx, g.FullPath)
 		if err != nil {
@@ -1282,8 +1292,8 @@ func ownershipPoints(ctx context.Context, deps RepoDeps, meta graph.Meta, host s
 			continue
 		}
 		for _, p := range projects {
-			points = append(points, graph.ProjectPoint(meta, host, p))
-			points = append(points, graph.GroupContainsProjectEdge(meta, groupKey, graph.RefProject(p.FullPath)))
+			points = append(points, graph.ProjectPoint(m, host, p))
+			points = append(points, graph.GroupContainsProjectEdge(m, groupKey, graph.RefProject(p.FullPath)))
 		}
 	}
 	if complete && len(points) > 0 {
