@@ -10,8 +10,8 @@ import (
 
 // allEnv lists all variables read by Load; reset before each test case.
 var allEnv = []string{
-	"GITLAB_GROUP_ID", "GITLAB_TOKEN", "GITLAB_BASE_URL",
-	"GITHUB_ORG", "GITHUB_TOKEN", "GITHUB_BASE_URL",
+	"GITLAB_GROUP_ID", "GITLAB_PROJECT_ID", "GITLAB_TOKEN", "GITLAB_BASE_URL",
+	"GITHUB_ORG", "GITHUB_REPO", "GITHUB_TOKEN", "GITHUB_BASE_URL",
 	"EMBEDDINGS_PROVIDER", "EMBEDDINGS_BASE_URL", "EMBEDDINGS_MODEL",
 	"EMBEDDINGS_DIM", "EMBEDDINGS_BATCH",
 	"QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION",
@@ -203,6 +203,77 @@ func TestLoadValid(t *testing.T) {
 			},
 		},
 		{
+			name: "gitlab: explicit project allowlist only (no group)",
+			env: map[string]string{
+				"GITLAB_PROJECT_ID":   " 42 , group/project ",
+				"GITLAB_TOKEN":        "glpat-EXAMPLE-NOT-A-TOKEN",
+				"EMBEDDINGS_PROVIDER": "ollama",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Provider.Type != "gitlab" {
+					t.Fatalf("Type = %q, want gitlab", cfg.Provider.Type)
+				}
+				// only the allowlist is set — index just those projects.
+				if want := []string{"42", "group/project"}; !slices.Equal(cfg.Provider.GitLabProjects, want) {
+					t.Errorf("GitLabProjects = %v, want %v", cfg.Provider.GitLabProjects, want)
+				}
+				if len(cfg.Provider.GitLabGroups) != 0 {
+					t.Errorf("GitLabGroups = %v, want empty", cfg.Provider.GitLabGroups)
+				}
+			},
+		},
+		{
+			// additive: groups and the allowlist are kept side by side (union
+			// happens in the provider, deduplicated).
+			name: "gitlab: groups plus project allowlist",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":     "111",
+				"GITLAB_PROJECT_ID":   "222",
+				"GITLAB_TOKEN":        "glpat-EXAMPLE-NOT-A-TOKEN",
+				"EMBEDDINGS_PROVIDER": "ollama",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if !slices.Equal(cfg.Provider.GitLabGroups, []string{"111"}) ||
+					!slices.Equal(cfg.Provider.GitLabProjects, []string{"222"}) {
+					t.Errorf("groups/projects = %v/%v, want [111]/[222]",
+						cfg.Provider.GitLabGroups, cfg.Provider.GitLabProjects)
+				}
+			},
+		},
+		{
+			name: "github: explicit repo allowlist only (no org)",
+			env: map[string]string{
+				"GITHUB_REPO":         "acme/one, acme/two",
+				"EMBEDDINGS_PROVIDER": "ollama",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Provider.Type != "github" {
+					t.Fatalf("Type = %q, want github", cfg.Provider.Type)
+				}
+				if want := []string{"acme/one", "acme/two"}; !slices.Equal(cfg.Provider.GitHubRepos, want) {
+					t.Errorf("GitHubRepos = %v, want %v", cfg.Provider.GitHubRepos, want)
+				}
+				if len(cfg.Provider.GitHubOrgs) != 0 {
+					t.Errorf("GitHubOrgs = %v, want empty", cfg.Provider.GitHubOrgs)
+				}
+			},
+		},
+		{
+			name: "github: organization plus repo allowlist",
+			env: map[string]string{
+				"GITHUB_ORG":          "acme",
+				"GITHUB_REPO":         "other/one",
+				"EMBEDDINGS_PROVIDER": "ollama",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if !slices.Equal(cfg.Provider.GitHubOrgs, []string{"acme"}) ||
+					!slices.Equal(cfg.Provider.GitHubRepos, []string{"other/one"}) {
+					t.Errorf("orgs/repos = %v/%v, want [acme]/[other/one]",
+						cfg.Provider.GitHubOrgs, cfg.Provider.GitHubRepos)
+				}
+			},
+		},
+		{
 			// T143: a public organization works without a token; discovery is
 			// uncached by default (0).
 			name: "github: public organization without token",
@@ -262,7 +333,7 @@ func TestLoadErrors(t *testing.T) {
 		{
 			name:        "no provider",
 			env:         map[string]string{"EMBEDDINGS_PROVIDER": "ollama"},
-			wantMissing: []string{"GITLAB_GROUP_ID", "GITLAB_TOKEN", "GITHUB_ORG", "GITHUB_TOKEN"},
+			wantMissing: []string{"GITLAB_GROUP_ID", "GITLAB_PROJECT_ID", "GITLAB_TOKEN", "GITHUB_ORG", "GITHUB_REPO", "GITHUB_TOKEN"},
 		},
 		{
 			name: "both providers",
@@ -274,21 +345,35 @@ func TestLoadErrors(t *testing.T) {
 			wantProblem: "both providers",
 		},
 		{
+			name: "both providers via allowlists only",
+			env: map[string]string{
+				"GITLAB_PROJECT_ID": "1", "GITLAB_TOKEN": "t",
+				"GITHUB_REPO":         "acme/one",
+				"EMBEDDINGS_PROVIDER": "ollama",
+			},
+			wantProblem: "both providers",
+		},
+		{
 			name:        "gitlab: group without token",
 			env:         map[string]string{"GITLAB_GROUP_ID": "1", "EMBEDDINGS_PROVIDER": "ollama"},
 			wantMissing: []string{"GITLAB_TOKEN"},
 		},
 		{
-			name:        "gitlab: token without group",
+			name:        "gitlab: project allowlist without token",
+			env:         map[string]string{"GITLAB_PROJECT_ID": "42", "EMBEDDINGS_PROVIDER": "ollama"},
+			wantMissing: []string{"GITLAB_TOKEN"},
+		},
+		{
+			name:        "gitlab: token without group and without project",
 			env:         map[string]string{"GITLAB_TOKEN": "t", "EMBEDDINGS_PROVIDER": "ollama"},
-			wantMissing: []string{"GITLAB_GROUP_ID"},
+			wantMissing: []string{"GITLAB_GROUP_ID", "GITLAB_PROJECT_ID"},
 		},
 		{
 			// the token is now optional for public orgs (T143) — a token alone
-			// (without an organization) is still an error.
-			name:        "github: token without organization",
+			// (without an organization or a repo) is still an error.
+			name:        "github: token without organization and without repo",
 			env:         map[string]string{"GITHUB_TOKEN": "t", "EMBEDDINGS_PROVIDER": "ollama"},
-			wantMissing: []string{"GITHUB_ORG"},
+			wantMissing: []string{"GITHUB_ORG", "GITHUB_REPO"},
 		},
 		{
 			name:        "embeddings: provider not set",

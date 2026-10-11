@@ -31,11 +31,17 @@ type NATS struct {
 type Provider struct {
 	Type string // "gitlab" | "github"
 
-	GitLabGroups  []string // GITLAB_GROUP_ID, comma-separated
-	GitLabToken   string   // GITLAB_TOKEN (secret)
-	GitLabBaseURL string   // GITLAB_BASE_URL
+	GitLabGroups []string // GITLAB_GROUP_ID, comma-separated
+	// GitLabProjects restricts discovery to explicit projects — a numeric ID
+	// or a full path (group/sub/project); additive to GitLabGroups.
+	GitLabProjects []string // GITLAB_PROJECT_ID, comma-separated
+	GitLabToken    string   // GITLAB_TOKEN (secret)
+	GitLabBaseURL  string   // GITLAB_BASE_URL
 
-	GitHubOrgs    []string // GITHUB_ORG, comma-separated
+	GitHubOrgs []string // GITHUB_ORG, comma-separated
+	// GitHubRepos restricts discovery to explicit owner/repo references;
+	// additive to GitHubOrgs.
+	GitHubRepos   []string // GITHUB_REPO, comma-separated
 	GitHubToken   string   // GITHUB_TOKEN (secret)
 	GitHubBaseURL string   // GITHUB_BASE_URL
 }
@@ -108,42 +114,55 @@ func Load() (*Config, error) {
 	cfg := &Config{}
 
 	// --- VCS provider ---
+	// The discovery set = (all projects of every configured group) ∪
+	// (every explicitly listed project/repo), deduplicated. If only the
+	// allowlist is set (no group/org), only those are indexed.
 	gitlabGroups := splitList(os.Getenv("GITLAB_GROUP_ID"))
+	gitlabProjects := splitList(os.Getenv("GITLAB_PROJECT_ID"))
 	gitlabToken := os.Getenv("GITLAB_TOKEN")
 	githubOrgs := splitList(os.Getenv("GITHUB_ORG"))
+	githubRepos := splitList(os.Getenv("GITHUB_REPO"))
 	githubToken := os.Getenv("GITHUB_TOKEN")
 
-	hasGitLab := len(gitlabGroups) > 0 || gitlabToken != ""
-	hasGitHub := len(githubOrgs) > 0 || githubToken != ""
+	hasGitLab := len(gitlabGroups) > 0 || len(gitlabProjects) > 0 || gitlabToken != ""
+	hasGitHub := len(githubOrgs) > 0 || len(githubRepos) > 0 || githubToken != ""
 
 	switch {
 	case hasGitLab && hasGitHub:
 		return nil, &ConfigError{Problem: "both providers are set (GitLab and GitHub), keep exactly one"}
 	case hasGitLab:
-		if len(gitlabGroups) == 0 {
-			return nil, &ConfigError{Problem: "GitLab group is not set", Missing: []string{"GITLAB_GROUP_ID"}}
+		if len(gitlabGroups) == 0 && len(gitlabProjects) == 0 {
+			return nil, &ConfigError{
+				Problem: "GitLab group or project is not set",
+				Missing: []string{"GITLAB_GROUP_ID", "GITLAB_PROJECT_ID"},
+			}
 		}
 		if gitlabToken == "" {
 			return nil, &ConfigError{Problem: "GitLab token is not set", Missing: []string{"GITLAB_TOKEN"}}
 		}
 		cfg.Provider.Type = "gitlab"
 		cfg.Provider.GitLabGroups = gitlabGroups
+		cfg.Provider.GitLabProjects = gitlabProjects
 		cfg.Provider.GitLabToken = gitlabToken
 		cfg.Provider.GitLabBaseURL = envDefault("GITLAB_BASE_URL", "https://gitlab.com")
 	case hasGitHub:
-		if len(githubOrgs) == 0 {
-			return nil, &ConfigError{Problem: "GitHub organization is not set", Missing: []string{"GITHUB_ORG"}}
+		if len(githubOrgs) == 0 && len(githubRepos) == 0 {
+			return nil, &ConfigError{
+				Problem: "GitHub organization or repository is not set",
+				Missing: []string{"GITHUB_ORG", "GITHUB_REPO"},
+			}
 		}
 		// T143: the token is optional for public organizations — go-github
 		// sends anonymous requests without it (60 req/h per IP).
 		cfg.Provider.Type = "github"
 		cfg.Provider.GitHubOrgs = githubOrgs
+		cfg.Provider.GitHubRepos = githubRepos
 		cfg.Provider.GitHubToken = githubToken
 		cfg.Provider.GitHubBaseURL = envDefault("GITHUB_BASE_URL", "https://api.github.com")
 	default:
 		return nil, &ConfigError{
 			Problem: "VCS provider is not set, configure GitLab or GitHub",
-			Missing: []string{"GITLAB_GROUP_ID", "GITLAB_TOKEN", "GITHUB_ORG", "GITHUB_TOKEN"},
+			Missing: []string{"GITLAB_GROUP_ID", "GITLAB_PROJECT_ID", "GITLAB_TOKEN", "GITHUB_ORG", "GITHUB_REPO", "GITHUB_TOKEN"},
 		}
 	}
 

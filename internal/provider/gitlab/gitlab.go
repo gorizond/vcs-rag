@@ -4,6 +4,7 @@ package gitlab
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
@@ -12,10 +13,12 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// Client is the GitLab provider: lists group projects (including subgroups).
+// Client is the GitLab provider: lists group projects (including subgroups)
+// unioned with explicitly configured projects.
 type Client struct {
 	api      *gitlab.Client
 	groups   []string
+	projects []string
 	ciWindow int
 }
 
@@ -29,14 +32,20 @@ func New(cfg *config.Config) (*Client, error) {
 	if ciWindow < 1 {
 		ciWindow = 50 // ponytail: fallback in case the config is built bypassing Load
 	}
-	return &Client{api: api, groups: cfg.Provider.GitLabGroups, ciWindow: ciWindow}, nil
+	return &Client{
+		api:      api,
+		groups:   cfg.Provider.GitLabGroups,
+		projects: cfg.Provider.GitLabProjects,
+		ciWindow: ciWindow,
+	}, nil
 }
 
 // Type returns "gitlab".
 func (c *Client) Type() string { return "gitlab" }
 
 // ListRepositories returns projects of all configured groups (IncludeSubGroups,
-// full pagination), deduplicated by ID.
+// full pagination) unioned with the explicit GITLAB_PROJECT_ID entries,
+// deduplicated by ID.
 func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) {
 	var all []provider.Repo
 	for _, gid := range c.groups {
@@ -50,17 +59,7 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 				return nil, fmt.Errorf("group %s: %w", gid, err)
 			}
 			for _, p := range projects {
-				ns := ""
-				if p.Namespace != nil {
-					ns = p.Namespace.FullPath
-				}
-				all = append(all, provider.Repo{
-					ID:            strconv.FormatInt(p.ID, 10),
-					Namespace:     ns,
-					Path:          p.Path,
-					CloneURL:      p.HTTPURLToRepo,
-					DefaultBranch: p.DefaultBranch,
-				})
+				all = append(all, repoFromProject(p))
 			}
 			if resp.NextPage == 0 {
 				break
@@ -68,5 +67,35 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 			opt.Page = resp.NextPage
 		}
 	}
+	// The allowlist: a numeric ID or a full path (group/sub/project) — the
+	// client URL-escapes the string and GitLab resolves both forms on the same
+	// endpoint. A project that cannot be fetched (404/403) is logged and
+	// skipped — never fatal.
+	for _, ref := range c.projects {
+		p, _, err := c.api.Projects.GetProject(ref, nil, gitlab.WithContext(ctx))
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			slog.Warn("gitlab: skipping project", "project", ref, "err", err)
+			continue
+		}
+		all = append(all, repoFromProject(p))
+	}
 	return provider.MergeRepos(all), nil
+}
+
+// repoFromProject normalizes a GitLab project.
+func repoFromProject(p *gitlab.Project) provider.Repo {
+	ns := ""
+	if p.Namespace != nil {
+		ns = p.Namespace.FullPath
+	}
+	return provider.Repo{
+		ID:            strconv.FormatInt(p.ID, 10),
+		Namespace:     ns,
+		Path:          p.Path,
+		CloneURL:      p.HTTPURLToRepo,
+		DefaultBranch: p.DefaultBranch,
+	}
 }

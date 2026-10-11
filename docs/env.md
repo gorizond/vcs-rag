@@ -13,14 +13,21 @@ the same names from `.env`. See also: [refresh](refresh.md) ·
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `GITLAB_GROUP_ID` | — | GitLab group (or comma-separated list), subgroups included. Required for the GitLab flavor |
+| `GITLAB_GROUP_ID` | — | GitLab group (or comma-separated list), subgroups included. One of `GITLAB_GROUP_ID`/`GITLAB_PROJECT_ID` is required for the GitLab flavor |
+| `GITLAB_PROJECT_ID` | — | Explicit GitLab projects (comma-separated numeric IDs or full paths like `group/sub/project`). Additive to `GITLAB_GROUP_ID` |
 | `GITLAB_TOKEN` | — | GitLab token (`read_api`). **Secret**; required for GitLab |
 | `GITLAB_BASE_URL` | `https://gitlab.com` | Self-hosted GitLab endpoint |
-| `GITHUB_ORG` | — | GitHub organization (or comma-separated list). Required for the GitHub flavor |
+| `GITHUB_ORG` | — | GitHub organization (or comma-separated list). One of `GITHUB_ORG`/`GITHUB_REPO` is required for the GitHub flavor |
+| `GITHUB_REPO` | — | Explicit GitHub repositories (comma-separated `owner/repo`). Additive to `GITHUB_ORG` |
 | `GITHUB_TOKEN` | *(empty)* | Optional for public organizations (anonymous limit: 60 requests/hour per IP); recommended for the metadata lane (issues/MRs). **Secret** |
 | `GITHUB_BASE_URL` | `https://api.github.com` | GitHub Enterprise (GHES) endpoint |
 
 Setting both flavors at once is a configuration error — keep exactly one.
+
+The discovery set = (all projects of every configured group) ∪ (every
+explicitly listed project/repo), deduplicated. If only the allowlist is set
+(no group/org), index just those. An allowlist entry that cannot be fetched
+(404/403) is logged as a WARN and skipped — never fatal.
 
 ## Embeddings
 

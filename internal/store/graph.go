@@ -156,14 +156,18 @@ func (g *GraphStore) DeleteByFilter(ctx context.Context, f *qdrant.Filter) error
 	return nil
 }
 
-// Upsert writes payload-only points (no Vectors field) in batches of at most
-// maxUpsertBatch; the last batch uses Wait=true. It mirrors Store.Upsert —
-// same batching, same T158 UTF-8 guard — but never sends a vector: the graph
-// collection is vector-less (R2), so a point carrying vectors is a caller bug
-// reported here instead of a confusing server error.
+// Upsert writes payload-only points in batches of at most maxUpsertBatch; the
+// last batch uses Wait=true. It mirrors Store.Upsert — same batching, same
+// T158 UTF-8 guard — but never sends a real vector: the graph collection is
+// vector-less (R2), so a point carrying vectors is a caller bug reported here
+// instead of a confusing server error.
+//
+// Qdrant 1.19 requires an explicit EMPTY vector set on every point of a
+// vector-less collection: omitting the field fails with "missing field
+// `vector`" / "Expected some vectors". emptyGraphVectors() supplies it.
 func (g *GraphStore) Upsert(ctx context.Context, points []*qdrant.PointStruct) error {
 	for _, p := range points {
-		if p.GetVectors() != nil {
+		if !graphVectorsEmpty(p.GetVectors()) {
 			return fmt.Errorf("qdrant: graph upsert: point %s carries vectors; the graph collection is vector-less (R2)", pointKey(p.GetId()))
 		}
 	}
@@ -177,6 +181,7 @@ func (g *GraphStore) Upsert(ctx context.Context, points []*qdrant.PointStruct) e
 		for _, p := range points[start:end] {
 			req.Points = append(req.Points, &qdrant.PointStruct{
 				Id:      p.GetId(),
+				Vectors: emptyGraphVectors(),
 				Payload: sanitizeGraphPayload(p.GetPayload()),
 			})
 		}
@@ -185,6 +190,25 @@ func (g *GraphStore) Upsert(ctx context.Context, points []*qdrant.PointStruct) e
 		}
 	}
 	return nil
+}
+
+// emptyGraphVectors is the explicit empty vector set Qdrant 1.19 requires on
+// every point of a vector-less collection (omitting it is a server error:
+// "missing field `vector`" / "Expected some vectors").
+func emptyGraphVectors() *qdrant.Vectors {
+	return qdrant.NewVectorsMap(map[string]*qdrant.Vector{})
+}
+
+// graphVectorsEmpty reports whether v carries no usable vector (nil counts as
+// empty). A point with a real single or named vector is a caller bug (R2).
+func graphVectorsEmpty(v *qdrant.Vectors) bool {
+	if v == nil {
+		return true
+	}
+	if v.GetVector() != nil {
+		return false
+	}
+	return len(v.GetVectors().GetVectors()) == 0
 }
 
 // sanitizeGraphPayload rewrites every string value of a payload to valid

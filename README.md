@@ -85,15 +85,20 @@ import/defines edges and SDLC entities, no vectors
 
 | Variable | Description |
 |----------|-------------|
-| `GITLAB_GROUP_ID` / `GITLAB_TOKEN` | GitLab group (comma-separated list) and access token |
-| `GITHUB_ORG` / `GITHUB_TOKEN` | GitHub organization (list); the token is optional for public orgs |
+| `GITLAB_GROUP_ID` / `GITLAB_PROJECT_ID` / `GITLAB_TOKEN` | GitLab group(s) and/or explicit projects (comma-separated IDs or full paths) plus access token |
+| `GITHUB_ORG` / `GITHUB_REPO` / `GITHUB_TOKEN` | GitHub organization(s) and/or explicit `owner/repo` references (comma-separated); the token is optional for public repos |
 | `EMBEDDINGS_PROVIDER` / `EMBEDDINGS_MODEL` / `EMBEDDINGS_DIM` | `ollama` or `lm-studio`, model (default `bge-m3`), dimension (default `1024`) |
 | `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant gRPC address and collection name |
 | `MCP_TRANSPORT` / `MCP_ADDR` | `stdio` (default) or `sse`; address for sse |
 | `WORKER_INTERVAL` / `WORKER_CONCURRENCY` | lane tick ceiling and the embeddings limiter ceiling (default 2) |
 | `NATS_URL` / `NATS_INSTANCE_ID` | local JetStream (refresh/auto-freshness/status) and the instance scope |
 
-The complete reference — all 30 variables with defaults and secrets — is in
+The discovery set = (all projects of every configured group) ∪ (every
+explicitly listed project/repo), deduplicated. If only the allowlist is set
+(no group/org), index just those; an entry that cannot be fetched (404/403)
+is logged as a WARN and skipped.
+
+The complete reference — all 32 variables with defaults and secrets — is in
 [`docs/env.md`](docs/env.md).
 
 Switching GitLab ↔ GitHub is env-only: the core does not change (both providers

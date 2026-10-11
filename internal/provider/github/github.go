@@ -4,8 +4,10 @@ package github
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	gh "github.com/google/go-github/v92/github"
@@ -14,10 +16,12 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
-// Client is the GitHub provider: lists organization repositories.
+// Client is the GitHub provider: lists organization repositories unioned with
+// explicitly configured repositories.
 type Client struct {
 	api      *gh.Client
 	orgs     []string
+	repos    []string
 	ciWindow int
 	logsHTTP *http.Client
 }
@@ -46,6 +50,7 @@ func New(cfg *config.Config) (*Client, error) {
 	return &Client{
 		api:      api,
 		orgs:     cfg.Provider.GitHubOrgs,
+		repos:    cfg.Provider.GitHubRepos,
 		ciWindow: ciWindow,
 		// Actions log download goes via the signed redirect URL, without Authorization.
 		logsHTTP: &http.Client{Timeout: 60 * time.Second},
@@ -56,7 +61,8 @@ func New(cfg *config.Config) (*Client, error) {
 func (c *Client) Type() string { return "github" }
 
 // ListRepositories returns repositories of all configured organizations
-// (full pagination), deduplicated by ID.
+// (full pagination) unioned with the explicit GITHUB_REPO entries,
+// deduplicated by ID.
 func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) {
 	var all []provider.Repo
 	for _, org := range c.orgs {
@@ -80,6 +86,35 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 			}
 			opt.Page = resp.NextPage
 		}
+	}
+	// The allowlist: explicit owner/repo references are fetched one by one.
+	// A repository that cannot be fetched (404/403) is logged and skipped —
+	// never fatal.
+	for _, ref := range c.repos {
+		owner, name, ok := strings.Cut(ref, "/")
+		if !ok || owner == "" || name == "" {
+			slog.Warn("github: skipping invalid repo reference", "repo", ref)
+			continue
+		}
+		r, _, err := c.api.Repositories.Get(ctx, owner, name)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			slog.Warn("github: skipping repo", "repo", ref, "err", err)
+			continue
+		}
+		ns := owner
+		if login := r.GetOwner().GetLogin(); login != "" {
+			ns = login
+		}
+		all = append(all, provider.Repo{
+			ID:            strconv.FormatInt(r.GetID(), 10),
+			Namespace:     ns,
+			Path:          r.GetName(),
+			CloneURL:      r.GetCloneURL(),
+			DefaultBranch: r.GetDefaultBranch(),
+		})
 	}
 	return provider.MergeRepos(all), nil
 }
