@@ -21,6 +21,12 @@ import (
 // the live index is operator-supplied, and a scenario with an unset input skips
 // cleanly.
 //
+// The US1 parity modes of query_graph (T016) get their own scenarios:
+// mode=aggregation counts the repo's MR points by author (SC001_Aggregation),
+// mode=path_finding follows a live import edge of GRAPH_E2E_FILE
+// (SC002_Path), mode=neighbors lists the 1-hop peers of its canonical file
+// node_key in both directions (SC003_Neighbors). They need no new fixture envs.
+//
 // Env:
 //
 //	QDRANT_URL, EMBEDDINGS_BASE_URL   live stack (same gate as the other e2e tests)
@@ -356,6 +362,166 @@ func TestE2E_Graph_US5(t *testing.T) {
 		t.Errorf("limit=1 with %d points must report truncated=true: the fixture file needs >=2 graph points (definitions + edges)", len(cut.Results))
 	}
 	t.Logf("read-back: query_graph limit=1 points=%d truncated=%v", len(cut.Results), cut.Truncated)
+}
+
+// TestE2E_Graph_SC001_Aggregation — US1 parity e2e of mode=aggregation
+// (SC-001): an exact grouped count of the fixture repo's MR/PR points by
+// author. The answer is rows of {key,count,value}; with op=count value equals
+// the group count, and every answer carries a coverage notice. Skipped when the
+// fixture has no author-bearing MR/PR points (a code-only index).
+//
+// Env: GRAPH_E2E_REPO (see the file header).
+func TestE2E_Graph_SC001_Aggregation(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+
+	line := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":     "aggregation",
+		"op":       "count",
+		"group_by": "author",
+		"start":    map[string]any{"entity": "mr_file", "filters": map[string]any{"repo": repo}},
+		"limit":    100,
+	})
+	assertNoToolError(t, line)
+	agg := decodeTool[gAggResp](t, line)
+	assertCoverage(t, "query_graph(aggregation)", agg.Coverage, repo)
+	if len(agg.Groups) == 0 {
+		t.Skipf("aggregation(count by author) for %q returned no groups: the fixture index has no MR/PR points with an author", repo)
+	}
+	var total uint64
+	for _, g := range agg.Groups {
+		if g.Key == "" {
+			t.Errorf("aggregation group with empty key: %+v", g)
+		}
+		if g.Count == 0 {
+			t.Errorf("aggregation group %q: count=0", g.Key)
+		}
+		if g.Value != float64(g.Count) {
+			t.Errorf("aggregation group %q: op=count value=%v, want %d", g.Key, g.Value, g.Count)
+		}
+		total += g.Count
+	}
+	if agg.Truncated && len(agg.Groups) < 100 {
+		t.Errorf("truncated=true with only %d groups (< limit): an exact facet count is never cut silently", len(agg.Groups))
+	}
+	t.Logf("read-back: aggregation(count by author) groups=%d points=%d truncated=%v", len(agg.Groups), total, agg.Truncated)
+}
+
+// TestE2E_Graph_SC002_Path — US1 parity e2e of mode=path_finding (SC-002): the
+// shortest path between the fixture file and one of its live import targets.
+// The target is read back from the graph (a real to_key of an imports edge), so
+// the pair is known-connected: the engine must answer found — a cap may make it
+// inconclusive — never not_found, and never a hard failure. When the fixture
+// file has no indexed import the scenario skips.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_FILE (>=1 outgoing import).
+func TestE2E_Graph_SC002_Path(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	file := graphFixture(t, "GRAPH_E2E_FILE")
+
+	// read one real endpoint from the live index: the file's first import edge.
+	imps := decodeTool[gQueryResp](t, graphCall(t, proc, 2, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"repo": repo, "file_path": file}},
+		"edge":  map[string]any{"type": "imports", "direction": "outgoing"},
+		"limit": 50,
+	}))
+	from, to := graph.RefFile(repo, file), ""
+	for _, h := range imps.Results {
+		if h.Kind == "edge" && h.EdgeType == "imports" && h.ToKey != "" {
+			to = h.ToKey
+			break
+		}
+	}
+	if to == "" {
+		t.Skipf("no import edge from %q in the live graph: GRAPH_E2E_FILE must have >=1 outgoing import", file)
+	}
+
+	line := graphCall(t, proc, 3, "query_graph", map[string]any{
+		"mode":      "path_finding",
+		"from":      from,
+		"to":        to,
+		"type":      "shortest",
+		"max_depth": 3,
+		"rel_types": []string{"imports"},
+	})
+	assertNoToolError(t, line)
+	path := decodeTool[gPathResp](t, line)
+	switch path.Status {
+	case "found", "not_found", "inconclusive":
+	default:
+		t.Fatalf("path_finding status %q outside found|not_found|inconclusive", path.Status)
+	}
+	if path.Status == "not_found" {
+		t.Errorf("path_finding(%s → %s) = not_found although that import edge is indexed: an existing edge is found or, at worst, inconclusive", from, to)
+	}
+	if len(path.Path) > 0 {
+		if path.Path[0] != from || path.Path[len(path.Path)-1] != to {
+			t.Errorf("path endpoints %q → %q, want %q → %q", path.Path[0], path.Path[len(path.Path)-1], from, to)
+		}
+		if len(path.Edges) != len(path.Path)-1 {
+			t.Errorf("path: %d nodes but %d edges (want nodes-1)", len(path.Path), len(path.Edges))
+		}
+		for i, e := range path.Edges {
+			if e.FromKey != path.Path[i] || e.ToKey != path.Path[i+1] {
+				t.Errorf("path edge %d %s → %s breaks the %q → %q chain", i, e.FromKey, e.ToKey, path.Path[i], path.Path[i+1])
+			}
+			if e.EdgeType == "" {
+				t.Errorf("path edge %d without edge_type: %+v", i, e)
+			}
+		}
+	}
+	assertCoverage(t, "query_graph(path_finding)", path.Coverage, repo)
+	t.Logf("read-back: path_finding status=%s nodes=%d edges=%d truncated=%v (%s → %s)", path.Status, len(path.Path), len(path.Edges), path.Truncated, from, to)
+}
+
+// TestE2E_Graph_SC003_Neighbors — US1 parity e2e of mode=neighbors (SC-003):
+// the 1-hop peers of the fixture file's canonical node_key in both directions
+// over the imports+defines relations. The fixture file has >=1 outgoing import,
+// so the peer list is non-empty; every peer is either a resolved stored node or
+// an honest pseudo-node, and the answer carries a coverage notice.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_FILE (>=1 outgoing import).
+func TestE2E_Graph_SC003_Neighbors(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	file := graphFixture(t, "GRAPH_E2E_FILE")
+
+	centre := graph.RefFile(repo, file)
+	line := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":      "neighbors",
+		"node_key":  centre,
+		"direction": "both",
+		"rel_types": []string{"imports", "defines"},
+		"limit":     100,
+	})
+	assertNoToolError(t, line)
+	nb := decodeTool[gNeighborsResp](t, line)
+	assertCoverage(t, "query_graph(neighbors)", nb.Coverage, repo)
+	if len(nb.Neighbors) == 0 {
+		t.Fatalf("neighbors(%q) returned no peers: the fixture file must have >=1 outgoing import", centre)
+	}
+	for _, n := range nb.Neighbors {
+		if n.Key == "" || n.Key == centre {
+			t.Errorf("neighbor with empty or self key %q", n.Key)
+		}
+		if n.Type == "" {
+			t.Errorf("neighbor %q: type is empty", n.Key)
+		}
+		if len(n.EdgeTypes) == 0 {
+			t.Errorf("neighbor %q: no edge_types", n.Key)
+		}
+		if n.Resolved {
+			if n.Node == nil {
+				t.Errorf("neighbor %q: resolved but no node payload", n.Key)
+			} else if nk, _ := n.Node["node_key"].(string); nk != n.Key {
+				t.Errorf("neighbor %q: resolved node carries node_key %q", n.Key, nk)
+			}
+		} else if n.Node != nil {
+			t.Errorf("neighbor %q: unresolved but carries a node payload", n.Key)
+		}
+	}
+	t.Logf("read-back: neighbors(%s) peers=%d truncated=%v", centre, len(nb.Neighbors), nb.Truncated)
 }
 
 // TestE2E_Graph_SC008_CI — US4 (SC-008 CI): the ci domain preserves the whole
@@ -704,12 +870,59 @@ type gQueryHit struct {
 	EdgeType  string `json:"edge_type"`
 	FromFile  string `json:"from_file"`
 	ToPackage string `json:"to_package"`
+	ToKey     string `json:"to_key"`
 	Symbol    string `json:"symbol"`
 	FilePath  string `json:"file_path"`
 }
 
 type gQueryResp struct {
 	Results   []gQueryHit `json:"results"`
+	Coverage  []gCoverage `json:"coverage"`
+	Truncated bool        `json:"truncated"`
+}
+
+// gAggGroup / gAggResp — mode=aggregation rows (T016); value equals count for
+// op=count.
+type gAggGroup struct {
+	Key   string  `json:"key"`
+	Count uint64  `json:"count"`
+	Value float64 `json:"value"`
+}
+
+type gAggResp struct {
+	Groups    []gAggGroup `json:"groups"`
+	Coverage  []gCoverage `json:"coverage"`
+	Truncated bool        `json:"truncated"`
+}
+
+// gPathEdge / gPathResp — mode=path_finding (T016): the status is honest
+// (found|not_found|inconclusive) and the path is the canonical key chain.
+type gPathEdge struct {
+	FromKey  string `json:"from_key"`
+	ToKey    string `json:"to_key"`
+	EdgeType string `json:"edge_type"`
+}
+
+type gPathResp struct {
+	Status    string      `json:"status"`
+	Path      []string    `json:"path"`
+	Edges     []gPathEdge `json:"edges"`
+	Coverage  []gCoverage `json:"coverage"`
+	Truncated bool        `json:"truncated"`
+}
+
+// gNeighbor / gNeighborsResp — mode=neighbors (T016): resolved peers carry
+// their stored node; the rest are pseudo-nodes (resolved:false, no node).
+type gNeighbor struct {
+	Key       string         `json:"key"`
+	Type      string         `json:"type"`
+	Resolved  bool           `json:"resolved"`
+	EdgeTypes []string       `json:"edge_types"`
+	Node      map[string]any `json:"node"`
+}
+
+type gNeighborsResp struct {
+	Neighbors []gNeighbor `json:"neighbors"`
 	Coverage  []gCoverage `json:"coverage"`
 	Truncated bool        `json:"truncated"`
 }

@@ -40,6 +40,15 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 			"collection", cfg.Qdrant.GraphCollection, "err", err)
 		return nil
 	}
+	// T008 migration (WORKER_GRAPH_SCHEMA_VER 1→2): the uuid5 namespace is
+	// folded with the schema version (graph.Namespace), so the normal per-pass
+	// re-scan below already rewrites every point under fresh IDs carrying the
+	// canonical keys (node_key/from_key/to_key) — no manual backfill hook and
+	// no set_payload pass are needed. A set_payload enrichment of the legacy
+	// points would be wasted work: they are re-keyed, not patched, and the
+	// first completed pass of a repo+branch deletes every stale generation of
+	// it (Sweep, T016) including the whole old namespace. Until that pass,
+	// canonical-key path/neighbors over the repo simply resolve nothing.
 	p := newPacer(cfg.Worker.GraphInterval)
 	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
 	if err := p.sleep(ctx, p.startDelay()); err != nil {

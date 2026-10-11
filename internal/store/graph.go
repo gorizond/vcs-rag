@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/qdrant/go-client/qdrant"
@@ -63,10 +64,11 @@ func (g *GraphStore) EnsureGraphCollection(ctx context.Context) error {
 	return nil
 }
 
-// graphIndexFields are the payload indexes of the graph collection; kind,
-// edge_type, ... schema_ver, symbol, symbol_kind, ... mr_id, ... are keyword,
-// only symbol_text is full-text. commit_sha, patch, signature, generation,
-// and indexed_at are deliberately NOT indexed.
+// graphIndexFields are the payload indexes of the graph collection. All are
+// keyword (array payloads such as tags index element-wise) except symbol_text
+// (full-text) and the graphDatetimeIndexFields; commit_sha, patch, signature,
+// generation, and indexed_at are deliberately NOT indexed, and body/title are
+// never indexed (bodies stay unindexed).
 var graphIndexFields = []string{
 	"kind",
 	"node_type",
@@ -93,6 +95,40 @@ var graphIndexFields = []string{
 	"author",
 	"status",
 	"severity",
+	// Orbit parity: canonical node/edge keys and endpoint type discriminators.
+	"node_key",
+	"from_key",
+	"to_key",
+	"from_type",
+	"to_type",
+	// New node payload fields (user/note/work item/milestone/label/runner).
+	"vcs_user_id",
+	"login",
+	"name",
+	"parent_key",
+	"author_key",
+	"item_id",
+	"item_type",
+	"ms_id",
+	"label_key",
+	"scope",
+	"runner_id",
+	"runner_type",
+	"tags",
+	// Timestamps, indexed as datetime (see graphDatetimeIndexFields).
+	"created_at",
+	"updated_at",
+	"due_date",
+	"last_seen_at",
+}
+
+// graphDatetimeIndexFields are indexed as FieldTypeDatetime instead of the
+// keyword default.
+var graphDatetimeIndexFields = map[string]bool{
+	"created_at":   true,
+	"updated_at":   true,
+	"due_date":     true,
+	"last_seen_at": true,
 }
 
 // graphOnDiskIndexFields are indexed on disk (long values, many distinct
@@ -103,6 +139,10 @@ var graphOnDiskIndexFields = map[string]bool{
 	"to_package": true,
 	"from_file":  true,
 	"repo":       true,
+	"node_key":   true,
+	"from_key":   true,
+	"to_key":     true,
+	"parent_key": true,
 }
 
 // EnsureGraphIndexes creates the payload indexes (idempotent: repeating a
@@ -117,6 +157,9 @@ func (g *GraphStore) EnsureGraphIndexes(ctx context.Context) error {
 		}
 		if field == "symbol_text" {
 			req.FieldType = qdrant.FieldType_FieldTypeText.Enum()
+		}
+		if graphDatetimeIndexFields[field] {
+			req.FieldType = qdrant.FieldType_FieldTypeDatetime.Enum()
 		}
 		if graphOnDiskIndexFields[field] {
 			req.FieldIndexParams = &qdrant.PayloadIndexParams{
@@ -143,6 +186,51 @@ func (g *GraphStore) CountByFilter(ctx context.Context, f *qdrant.Filter) (uint6
 		return 0, fmt.Errorf("qdrant: graph count: %w", err)
 	}
 	return n, nil
+}
+
+// Count returns the exact number of graph points under a filter; it is the
+// orbit-parity spelling of CountByFilter, kept as a thin alias so callers of
+// the graph API do not have to know the vector store's name.
+func (g *GraphStore) Count(ctx context.Context, f *qdrant.Filter) (uint64, error) {
+	return g.CountByFilter(ctx, f)
+}
+
+// Facet groups graph points by one payload key under an optional filter and
+// returns value→count. Counts are ALWAYS exact (Exact: true): the graph API
+// feeds planning decisions, where approximate counts are not acceptable.
+// limit caps the number of returned values; 0 leaves the server default.
+func (g *GraphStore) Facet(ctx context.Context, key string, f *qdrant.Filter, limit uint64) (map[string]uint64, error) {
+	req := &qdrant.FacetCounts{
+		CollectionName: g.collection,
+		Key:            key,
+		Filter:         f,
+		Exact:          qdrant.PtrOf(true),
+	}
+	if limit > 0 {
+		req.Limit = qdrant.PtrOf(limit)
+	}
+	hits, err := g.client.Facet(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("qdrant: graph facet %q: %w", key, err)
+	}
+	out := make(map[string]uint64, len(hits))
+	for _, h := range hits {
+		out[facetValueKey(h.GetValue())] = h.GetCount()
+	}
+	return out, nil
+}
+
+// facetValueKey renders a facet value as the map key: keyword facets arrive
+// as strings, datetime/integer facets as integers, bool facets as bools.
+func facetValueKey(v *qdrant.FacetValue) string {
+	switch v.GetVariant().(type) {
+	case *qdrant.FacetValue_IntegerValue:
+		return strconv.FormatInt(v.GetIntegerValue(), 10)
+	case *qdrant.FacetValue_BoolValue:
+		return strconv.FormatBool(v.GetBoolValue())
+	default:
+		return v.GetStringValue()
+	}
 }
 
 // DeleteByFilter deletes graph points by filter (Wait=true).

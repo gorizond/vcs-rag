@@ -18,6 +18,12 @@ var ErrNotImplemented = errors.New("not implemented")
 // instead of failing the pass.
 var ErrVulnerabilitiesUnavailable = errors.New("vulnerabilities unavailable")
 
+// ErrDomainUnavailable marks an optionally-gated domain (notes, users, work
+// items, milestones, labels, runners) as unavailable on this provider/instance
+// (T005): a 403/404 or a token missing the required scope is a capability
+// signal — the caller skips the domain instead of failing the pass.
+var ErrDomainUnavailable = errors.New("domain unavailable")
+
 // TailLines returns the last n lines of the text (n<=0 — no truncation).
 func TailLines(s string, n int) string {
 	if n <= 0 || s == "" {
@@ -215,4 +221,98 @@ type CIPipelineDetailProvider interface {
 // VulnerabilityProvider lists security findings of a repository.
 type VulnerabilityProvider interface {
 	ListVulnerabilities(ctx context.Context, repo Repo) ([]VulnerabilityFinding, error)
+}
+
+// Note is a comment/note on an issue or change request (T005; GitLab notes,
+// GitHub issue/PR comments — including system/bot notes when the provider
+// surfaces them).
+type Note struct {
+	ID          int64
+	ParentKind  string // issue | change_request
+	ParentID    int
+	AuthorID    string
+	AuthorLogin string
+	Body        string
+	System      bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// User is a normalized user account (T005).
+type User struct {
+	ID    string
+	Login string
+	Name  string
+	State string
+}
+
+// WorkItem is a normalized issue/task (T005); ItemType distinguishes GitLab
+// issues from tasks, GitHub always reports "issue".
+type WorkItem struct {
+	ID          int
+	ItemType    string // issue | task
+	State       string
+	Title       string
+	UpdatedAt   time.Time
+	AuthorID    string
+	AssigneeIDs []string
+	LabelNames  []string
+	MilestoneID int
+}
+
+// Milestone is a normalized milestone (T005).
+type Milestone struct {
+	ID      int
+	Title   string
+	State   string
+	DueDate *time.Time
+}
+
+// Label is a normalized label (T005); Scope is "group"|"project" on GitLab,
+// empty where the provider has no scoped labels.
+type Label struct {
+	Name  string
+	Scope string
+	Color string
+}
+
+// Runner is a normalized CI runner (T005); Online mirrors the provider's
+// online/contacted flag.
+type Runner struct {
+	ID          int
+	Description string
+	State       string
+	RunnerType  string
+	Tags        []string
+	Online      bool
+}
+
+// NotesProvider lists comments/notes of an issue or change request.
+type NotesProvider interface {
+	ListNotes(ctx context.Context, repo Repo, parentKind string, parentID int) ([]Note, error)
+}
+
+// UsersProvider fetches a single user account.
+type UsersProvider interface {
+	GetUser(ctx context.Context, id string) (User, error)
+}
+
+// WorkItemsProvider lists issues/tasks of a repository.
+type WorkItemsProvider interface {
+	ListWorkItems(ctx context.Context, repo Repo) ([]WorkItem, error)
+}
+
+// MilestonesProvider lists milestones of a repository.
+type MilestonesProvider interface {
+	ListMilestones(ctx context.Context, repo Repo) ([]Milestone, error)
+}
+
+// LabelsProvider lists labels of a repository.
+type LabelsProvider interface {
+	ListLabels(ctx context.Context, repo Repo) ([]Label, error)
+}
+
+// RunnersProvider lists CI runners available to a repository.
+type RunnersProvider interface {
+	ListRunners(ctx context.Context, repo Repo) ([]Runner, error)
 }

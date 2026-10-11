@@ -330,10 +330,35 @@ worker/NATS tools:
 | `search_definitions` | symbol definitions from the graph; `mode=auto` (default) tries name matching first, then falls back to the semantic code search; `name` matches the symbol exactly or as a full-text token (no substring/prefix) |
 | `get_imports` | direct 1-hop package imports of a file or package (`direction=outgoing` default: what the input imports) |
 | `get_dependents` | direct 1-hop importers (`direction=incoming` default). **Package-level, not symbol-level**: the dependents of file X are the importers of X's package(s), not symbol referencers |
-| `query_graph` | structured N-hop traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`) + filters, optional edge selector (`imports`/`defines`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
+| `query_graph` | graph query family (`mode` = `traversal` default / `aggregation` / `path_finding` / `neighbors`, see below); traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`) + filters, optional edge selector (`imports`/`defines`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
 | `graph_schema` | self-describing graph schema: node/edge/entity types, query DSL version/operators, per-repo coverage markers |
 | `index_status` | worker indexing status (below) |
 | `refresh_repo` | on-demand refresh of one repository (registered only with `NATS_URL` set) |
+
+### Graph query modes (`query_graph`)
+
+`mode` selects the query family — `traversal` (default, above), `aggregation`,
+`path_finding` or `neighbors` (all four are declared by
+`graph_schema` → `query_dsl.modes`). Canonical keys identify a graph point:
+`repo|file:<path>`, `repo|pkg:<package>` and the SDLC forms; see the
+[query DSL](docs/graph.md#query-dsl-query_graph). Every mode carries the
+coverage notice and `truncated`.
+
+- **aggregation** — grouped counts/values: `op` (`count` default; `sum`,
+  `avg`, `min`, `max` need `field`), `group_by` (comma = composite key),
+  `sort` (`key`/`count`/`value`, prefix `-` for descending) and `limit`
+  (default 30, max 1000). Ungrouped `count` is exact; the fold caps the scan
+  at **50 000** points and **10 000** groups (`MCP_GRAPH_AGG_MAX_*`). A fold
+  cut returns partial values with `truncated: true`; an exact grouped count
+  beyond the group cap is refused with `aggregation_cap_exceeded`.
+- **path_finding** — the shortest path between the canonical `from`/`to`
+  keys; `rel_types` (edge types) is **required**, `max_depth` is 1..3 (`hops`
+  is the alias). `status` is honest: `found`, `not_found`, or `inconclusive`
+  when a cap/coverage gap cut the search — never reported as `not_found`.
+- **neighbors** — the 1-hop peers of `node_key`: `direction` = `outgoing`
+  (default) / `incoming` / `both`, optional `rel_types`. A peer without a
+  stored node is a pseudo-node (`resolved: false`, no payload); a resolved
+  peer carries its node.
 
 ## Indexing status (`index_status`)
 

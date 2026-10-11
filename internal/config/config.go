@@ -74,7 +74,12 @@ type Worker struct {
 	GCInterval     time.Duration // repo-GC pass tick (WORKER_GC_INTERVAL, default 15m)
 	GCDryRun       bool          // WORKER_GC_DRY_RUN (default true — the kill-switch)
 	GraphInterval  time.Duration // graph lane tick (WORKER_GRAPH_INTERVAL, default 30m)
-	// GraphSchemaVer is part of the graph uuid5 namespace (WORKER_GRAPH_SCHEMA_VER, default "1").
+	// GraphSchemaVer is part of the graph uuid5 namespace
+	// (WORKER_GRAPH_SCHEMA_VER, default "2"). Bumped 1→2 for the edge
+	// key-space feature: adding/re-keying node and edge kinds changes the
+	// graph schema, and fresh deterministic ids must not collide with the
+	// v0.0.18 namespace. A bump re-keys every graph id and therefore
+	// requires a full graph reindex (re-scan) — see docs/reindex.md.
 	GraphSchemaVer string
 	// GraphMaxReposPerPass caps repositories processed per graph pass
 	// (WORKER_GRAPH_MAX_REPOS_PER_PASS, default 5).
@@ -89,10 +94,19 @@ type Worker struct {
 	CIWindow             int   // ponytail: starting default, to be refined based on facts
 }
 
-// MCP is the MCP server transport (FR-013).
+// MCP is the MCP server transport (FR-013) and query-mode caps.
 type MCP struct {
 	Transport string // "stdio" | "sse"
 	Addr      string // address for sse
+	// GraphAggMaxScanned caps payload points scanned per aggregation request
+	// (MCP_GRAPH_AGG_MAX_SCANNED, default 50000).
+	GraphAggMaxScanned int
+	// GraphAggMaxGroups caps distinct groups returned by an aggregation
+	// (MCP_GRAPH_AGG_MAX_GROUPS, default 10000).
+	GraphAggMaxGroups int
+	// GraphPathMaxDepth caps path traversal depth
+	// (MCP_GRAPH_PATH_MAX_DEPTH, default 3, clamped to ≤3).
+	GraphPathMaxDepth int
 }
 
 // ConfigError is a configuration error listing the variable names that must be
@@ -279,7 +293,7 @@ func Load() (*Config, error) {
 		GCInterval:           gcInterval,
 		GCDryRun:             gcDryRun,
 		GraphInterval:        graphInterval,
-		GraphSchemaVer:       envDefault("WORKER_GRAPH_SCHEMA_VER", "1"),
+		GraphSchemaVer:       envDefault("WORKER_GRAPH_SCHEMA_VER", "2"),
 		GraphMaxReposPerPass: graphMaxRepos,
 		DiscoveryMinInterval: discoveryMin,
 		Concurrency:          concurrency,
@@ -308,9 +322,29 @@ func Load() (*Config, error) {
 	if transport != "stdio" && transport != "sse" {
 		return nil, &ConfigError{Problem: "MCP_TRANSPORT: invalid value (stdio|sse)"}
 	}
+	// T001: query-mode caps — agg scan/group ceilings and the path depth bound.
+	aggMaxScanned, err := envInt("MCP_GRAPH_AGG_MAX_SCANNED", 50000)
+	if err != nil {
+		return nil, err
+	}
+	aggMaxGroups, err := envInt("MCP_GRAPH_AGG_MAX_GROUPS", 10000)
+	if err != nil {
+		return nil, err
+	}
+	pathMaxDepth, err := envInt("MCP_GRAPH_PATH_MAX_DEPTH", 3)
+	if err != nil {
+		return nil, err
+	}
+	// The contract caps shortest-path depth at 3; larger values are clamped.
+	if pathMaxDepth > 3 {
+		pathMaxDepth = 3
+	}
 	cfg.MCP = MCP{
-		Transport: transport,
-		Addr:      envDefault("MCP_ADDR", ":8080"),
+		Transport:          transport,
+		Addr:               envDefault("MCP_ADDR", ":8080"),
+		GraphAggMaxScanned: aggMaxScanned,
+		GraphAggMaxGroups:  aggMaxGroups,
+		GraphPathMaxDepth:  pathMaxDepth,
 	}
 
 	return cfg, nil
