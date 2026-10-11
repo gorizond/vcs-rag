@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -131,8 +133,13 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 // (T015): mirror → branch snapshot → tree → blob → chunk.Extract → writer. A
 // completed scan writes the coverage marker (T057) and only then sweeps the
 // stale generations of that repo+branch (T016) — a failed or canceled pass
-// never sweeps. CPU-only: no embeddings, no commit budget (R13). Lock-free by
-// design: the lane and the refresh composition hold the per-repo lock.
+// never sweeps. The orbit phases (US2/US3) run after the code graph: the
+// change-request list feeds both the mr_file diffs and the change-request
+// notes, then the planning nodes (work items, milestones, labels) and the
+// users/notes. Every orbit domain is best-effort: a failed or unavailable
+// listing withholds only that domain's sweep (SweepTargets) and never the
+// pass. CPU-only: no embeddings, no commit budget (R13). Lock-free by design:
+// the lane and the refresh composition hold the per-repo lock.
 func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, vuln *vulnGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
@@ -186,7 +193,12 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 	// US2/T025: file diffs of the repository's change requests. A provider
 	// failure fails the repository pass before its coverage marker and sweep
 	// (T016: a failed pass never sweeps); processSafely isolates it (FR-014).
-	diffPoints, err := mrFilePoints(ctx, deps, repo, meta, lg)
+	// The list is shared with the change-request notes of the orbit phase.
+	crs, err := deps.VCS.ListChangeRequests(ctx, repo)
+	if err != nil {
+		return written, fmt.Errorf("MR/PR list: %w", err)
+	}
+	diffPoints, err := mrFilePoints(ctx, deps, repo, meta, crs, lg)
 	if err != nil {
 		return written, err
 	}
@@ -215,6 +227,20 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 		}
 		written += len(vulnPts)
 	}
+	// US3/T031 + US2/T023: the orbit nodes — work items, milestones, labels,
+	// then the users and their notes/comments. Each domain is best-effort and
+	// idempotent (deterministic IDs); the targets tell Sweep which kinds saw a
+	// complete listing and may be generation-swept.
+	host := vcsHost(cfg, deps.VCSType)
+	planning, items, targets := workItemPoints(ctx, deps, repo, meta, host, lg)
+	people, userSweep := userNotePoints(ctx, deps, repo, meta, host, items, crs, targets.WorkItems, lg)
+	targets.Users = userSweep
+	if orbitPts := append(planning, people...); len(orbitPts) > 0 {
+		if err := gs.Upsert(ctx, orbitPts); err != nil {
+			return written, fmt.Errorf("orbit write: %w", err)
+		}
+		written += len(orbitPts)
+	}
 	// T057: the coverage marker of the completed scan, upserted again every
 	// pass (deterministic ID, last writer wins).
 	if err := gs.Upsert(ctx, []*qdrant.PointStruct{graph.CoveragePoint(meta, tip)}); err != nil {
@@ -224,7 +250,7 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 	if ctx.Err() != nil {
 		return written, nil // a canceled pass is never swept (T016)
 	}
-	deleted, err := graph.Sweep(ctx, gs, meta.Repo, branch, generation, cfg.Worker.GCDryRun)
+	deleted, err := graph.Sweep(ctx, gs, meta.Repo, branch, generation, cfg.Worker.GCDryRun, targets)
 	if err != nil {
 		return written, fmt.Errorf("sweep: %w", err)
 	}
@@ -239,14 +265,10 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 // idempotent and keep the points of the current generation alive for the sweep.
 // ponytail: diffs are re-fetched every pass; add an updated_at sidecar if the
 // provider API cost of unchanged MRs matters.
-func mrFilePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) ([]*qdrant.PointStruct, error) {
+func mrFilePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, crs []provider.ChangeRequest, lg *slog.Logger) ([]*qdrant.PointStruct, error) {
 	diffProvider, ok := deps.VCS.(provider.ChangeRequestDiffProvider)
 	if !ok {
 		return nil, nil
-	}
-	crs, err := deps.VCS.ListChangeRequests(ctx, repo)
-	if err != nil {
-		return nil, fmt.Errorf("MR/PR list: %w", err)
 	}
 	var points []*qdrant.PointStruct
 	for _, cr := range crs {
@@ -264,6 +286,230 @@ func mrFilePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta g
 		lg.Info("graph: mr_file diffs fetched", "mrs", len(crs), "files", len(points))
 	}
 	return points, nil
+}
+
+// vcsHost is the provider instance host stamped on the user node keys (RefUser)
+// and vcs_host: the configured base URL's host, so a self-hosted instance never
+// shares user identity with gitlab.com/github.com. The default GitHub REST
+// endpoint is the API host, not the instance — the instance identity is
+// github.com (user.go's contract); an unparsable or absent base URL falls back
+// to the provider type.
+func vcsHost(cfg *config.Config, vcsType string) string {
+	if cfg == nil {
+		return vcsType
+	}
+	base := cfg.Provider.GitLabBaseURL
+	if vcsType == "github" {
+		base = cfg.Provider.GitHubBaseURL
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return vcsType
+	}
+	if vcsType == "github" && u.Host == "api.github.com" {
+		return "github.com"
+	}
+	return u.Host
+}
+
+// orbitFail logs one failed best-effort orbit listing: a typed unavailable
+// (403/404, missing scope) is a capability signal logged at info, anything
+// else at warn; a canceled context stays silent. Never an error — the only
+// cost of a failed domain is that its sweep stays withheld (SweepTargets).
+func orbitFail(ctx context.Context, lg *slog.Logger, domain string, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	if errors.Is(err, provider.ErrDomainUnavailable) {
+		lg.Info("graph: orbit domain unavailable, skipped", "domain", domain, "err", err)
+		return
+	}
+	lg.Warn("graph: orbit listing failed, skipped", "domain", domain, "err", err)
+}
+
+// workItemPoints builds the planning nodes and item edges of one repository
+// (US3/T031): the work items (issues/tasks), milestones and labels, each
+// through its optional provider seam. A domain whose listing failed is skipped
+// and stays unswept (the returned targets); the items feed the users/notes
+// phase. The authored/assigned_to edges resolve users by RefUser(host, id), so
+// they join UserPoint by construction; a labelled edge is written only for a
+// label the successful listing carries (a differently-scoped ref would dangle
+// forever). Deterministic IDs make the re-upsert each pass idempotent.
+// ponytail: the three listings are re-fetched every pass; add an updated_at
+// sidecar if the provider API cost of unchanged planning data matters.
+func workItemPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, host string, lg *slog.Logger) ([]*qdrant.PointStruct, []provider.WorkItem, graph.SweepTargets) {
+	var (
+		pts     []*qdrant.PointStruct
+		items   []provider.WorkItem
+		targets graph.SweepTargets
+	)
+	if p, ok := deps.VCS.(provider.WorkItemsProvider); ok {
+		listed, err := p.ListWorkItems(ctx, repo)
+		if err != nil {
+			orbitFail(ctx, lg, "work items", err)
+		} else {
+			items, targets.WorkItems = listed, true
+		}
+	}
+	if p, ok := deps.VCS.(provider.MilestonesProvider); ok {
+		listed, err := p.ListMilestones(ctx, repo)
+		if err != nil {
+			orbitFail(ctx, lg, "milestones", err)
+		} else {
+			targets.Milestones = true
+			for _, ms := range listed {
+				pts = append(pts, graph.MilestonePoint(meta, ms))
+			}
+		}
+	}
+	labelScope := map[string]string{}
+	if p, ok := deps.VCS.(provider.LabelsProvider); ok {
+		listed, err := p.ListLabels(ctx, repo)
+		if err != nil {
+			orbitFail(ctx, lg, "labels", err)
+		} else {
+			targets.Labels = true
+			for _, l := range listed {
+				labelScope[l.Name] = l.Scope
+				pts = append(pts, graph.LabelPoint(meta, l))
+			}
+		}
+	}
+	for _, item := range items {
+		pts = append(pts, graph.WorkItemPoint(meta, item))
+		if item.AuthorID != "" {
+			pts = append(pts, graph.AuthoredEdge(meta, item, graph.RefUser(host, item.AuthorID)))
+		}
+		for _, id := range item.AssigneeIDs {
+			if id != "" {
+				pts = append(pts, graph.AssignedToEdge(meta, item, graph.RefUser(host, id)))
+			}
+		}
+		for _, name := range item.LabelNames {
+			scope, ok := labelScope[name]
+			if !ok {
+				continue // no label node of this name: the edge would dangle
+			}
+			pts = append(pts, graph.LabelledEdge(meta, item, scope, name))
+		}
+		if item.MilestoneID != 0 {
+			pts = append(pts, graph.InMilestoneEdge(meta, item, strconv.Itoa(item.MilestoneID)))
+		}
+	}
+	return pts, items, targets
+}
+
+// userNotePoints builds the user nodes and the note nodes/edges of one
+// repository (US2/T023): the comments of every work item and change request,
+// then the accounts behind the item authors, assignees and note authors. Users
+// are fetched once per pass, deduped by provider id. ok reports whether the
+// user set of the pass is complete — work items listed, every listable note
+// parent listed, every GetUser succeeded — only then may Sweep
+// generation-sweep user nodes, else it would delete accounts a partial pass did
+// not re-see. A comment with an empty author id is written without author_key
+// and without its edge (ghost account).
+// ponytail: comments are re-fetched per parent every pass; an updated_at
+// sidecar could skip unchanged ones if the provider API cost matters.
+func userNotePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, host string, items []provider.WorkItem, crs []provider.ChangeRequest, itemsOK bool, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
+	notes, notesOK := deps.VCS.(provider.NotesProvider)
+	users, usersOK := deps.VCS.(provider.UsersProvider)
+	if !notesOK && !usersOK {
+		return nil, false
+	}
+	var pts []*qdrant.PointStruct
+	ids := map[string]bool{}
+	collect := func(id string) {
+		if id != "" {
+			ids[id] = true
+		}
+	}
+	for _, item := range items {
+		collect(item.AuthorID)
+		for _, id := range item.AssigneeIDs {
+			collect(id)
+		}
+	}
+	// notesComplete: the note set is enumerable only when every parent was
+	// listed; a provider without the notes seam has no notes at all (complete).
+	notesComplete := !notesOK
+	if notesOK {
+		notesComplete = itemsOK // an unlisted work item makes the note set partial
+		appendNotes := func(parentKind, parentKey string, parentID int) (stop bool) {
+			ns, err := notes.ListNotes(ctx, repo, parentKind, parentID)
+			if err != nil {
+				orbitFail(ctx, lg, parentKind+" notes", err)
+				notesComplete = false
+				return errors.Is(err, provider.ErrDomainUnavailable)
+			}
+			for _, n := range ns {
+				key := graph.RefNote(meta.Repo, strconv.FormatInt(n.ID, 10))
+				authorKey := ""
+				if n.AuthorID != "" {
+					authorKey = graph.RefUser(host, n.AuthorID)
+					collect(n.AuthorID)
+				}
+				pts = append(pts, graph.NotePoint(meta, n, parentKey, authorKey))
+				if authorKey != "" {
+					pts = append(pts, graph.CommentedPoint(meta, key, authorKey))
+				}
+			}
+			return false
+		}
+		var off bool
+		if itemsOK {
+			for _, item := range items {
+				if ctx.Err() != nil {
+					return pts, false
+				}
+				key := graph.RefWorkItem(meta.Repo, item.ItemType, strconv.Itoa(item.ID))
+				if off = appendNotes("issue", key, item.ID); off {
+					break
+				}
+			}
+		}
+		if !off {
+			for _, cr := range crs {
+				if ctx.Err() != nil {
+					return pts, false
+				}
+				if appendNotes("change_request", changeRequestParent(meta.Repo, meta.VCSType, int(cr.ID)), int(cr.ID)) {
+					break
+				}
+			}
+		}
+	}
+	userComplete := usersOK && itemsOK && notesComplete
+	if usersOK {
+		sorted := make([]string, 0, len(ids))
+		for id := range ids {
+			sorted = append(sorted, id)
+		}
+		sort.Strings(sorted)
+		for _, id := range sorted {
+			if ctx.Err() != nil {
+				return pts, false
+			}
+			u, err := users.GetUser(ctx, id)
+			if err != nil {
+				userComplete = false
+				lg.Debug("graph: user fetch failed, node skipped", "user", id, "err", err)
+				continue
+			}
+			pts = append(pts, graph.UserPoint(meta, host, u))
+		}
+	}
+	return pts, userComplete
+}
+
+// changeRequestParent is the canonical parent ref of a change request's notes:
+// GitLab MRs are not work-item nodes (the issues-only reader, R8), so they get
+// the dedicated merge_request discriminator; GitHub PRs ARE work items
+// (item_type "issue"), so their notes join the PR's work-item node.
+func changeRequestParent(repo, vcsType string, id int) string {
+	if vcsType == "github" {
+		return graph.RefWorkItem(repo, "issue", strconv.Itoa(id))
+	}
+	return graph.RefWorkItem(repo, "merge_request", strconv.Itoa(id))
 }
 
 // ciPoints builds the ci points of one repository (US4/T044): the jobs of the

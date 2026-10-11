@@ -27,6 +27,14 @@ import (
 // (SC002_Path), mode=neighbors lists the 1-hop peers of its canonical file
 // node_key in both directions (SC003_Neighbors). They need no new fixture envs.
 //
+// The people/planning domains (SC-004/SC-005) get their own scenarios:
+// SC004_UserNote finds a user by login and the notes of one parent as nodes
+// (entity=user|note), then traverses commented (note → author) and authored
+// (work_item → author) through mode=neighbors; SC005_Planning finds a work
+// item, its milestone and its labels as nodes by canonical node_key
+// (entity=work_item|milestone|label), then walks assigned_to/authored out and
+// in_milestone/labelled back.
+//
 // Env:
 //
 //	QDRANT_URL, EMBEDDINGS_BASE_URL   live stack (same gate as the other e2e tests)
@@ -41,6 +49,9 @@ import (
 //	GRAPH_E2E_PR_STATE                canonical state of >=1 MR/PR of the repo (SC-003)
 //	GRAPH_E2E_ISSUE_LABEL/_AUTHOR/_MILESTONE  optional: pin those issue filters
 //	GRAPH_E2E_VULN_FINDINGS           "1": the fixture's security API is available (SC-008 security)
+//	GRAPH_E2E_LOGIN                   a login of an indexed user (SC-004)
+//	GRAPH_E2E_NOTE_PARENT            canonical parent ref of indexed notes, e.g. "repo|wi:issue#3" (SC-004)
+//	GRAPH_E2E_WORK_ITEM_KEY          canonical work_item ref, e.g. "repo|wi:issue#1" (SC-005)
 //
 // Example:
 //
@@ -49,6 +60,8 @@ import (
 //	GRAPH_E2E_FILE=internal/worker/refresh.go GRAPH_E2E_PACKAGE=internal/worker \
 //	GRAPH_E2E_FOREIGN_REPO=gorizond/other GRAPH_E2E_MR_FILE=internal/mcp/tools.go \
 //	GRAPH_E2E_ISSUE_STATE=open GRAPH_E2E_PR_STATE=merged GRAPH_E2E_ISSUE_LABEL=bug \
+//	GRAPH_E2E_LOGIN=alice GRAPH_E2E_NOTE_PARENT='gorizond/vcs-rag|wi:issue#3' \
+//	GRAPH_E2E_WORK_ITEM_KEY='gorizond/vcs-rag|wi:issue#1' \
 //	go test -tags e2e ./tests/integration -run TestE2E_Graph -v -count=1
 func TestE2E_Graph_SC001(t *testing.T) {
 	proc := startGraphMCP(t)
@@ -524,6 +537,236 @@ func TestE2E_Graph_SC003_Neighbors(t *testing.T) {
 	t.Logf("read-back: neighbors(%s) peers=%d truncated=%v", centre, len(nb.Neighbors), nb.Truncated)
 }
 
+// TestE2E_Graph_SC004_UserNote — US2 (SC-004): the people/comment domain is
+// queryable. A user is found as a node by login (entity=user), the notes of
+// one parent are listed as nodes by parent_key (entity=note, body capped), and
+// the relation edges are traversed through mode=neighbors: commented from a
+// note to its author, authored from the note's parent (a work item) to its
+// author. Skipped when the fixture index has no matching user/note points; the
+// authored leg skip-notes when the parent carries no authored edge.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_LOGIN + GRAPH_E2E_NOTE_PARENT (see the header).
+func TestE2E_Graph_SC004_UserNote(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	login := graphFixture(t, "GRAPH_E2E_LOGIN")
+	parent := graphFixture(t, "GRAPH_E2E_NOTE_PARENT")
+
+	// 1) find the user node by login.
+	uLine := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":  "traversal",
+		"start": map[string]any{"entity": "user", "filters": map[string]any{"repo": repo, "login": login}},
+		"limit": 10,
+	})
+	assertNoToolError(t, uLine)
+	users := decodeTool[gQueryResp](t, uLine)
+	if len(users.Results) == 0 {
+		t.Skipf("no user node with login %q in %q: the fixture has no US2 user points", login, repo)
+	}
+	for _, h := range users.Results {
+		if h.Kind != "user" || h.Login != login {
+			t.Errorf("user lookup returned %+v, want kind=user login=%q", h, login)
+		}
+		if h.NodeKey == "" || h.VCSUserID == "" {
+			t.Errorf("user node without node_key/vcs_user_id: %+v", h)
+		}
+	}
+	assertCoverage(t, "query_graph(user)", users.Coverage, repo)
+	userKey := users.Results[0].NodeKey
+
+	// 2) the notes of one parent, bodies capped at the note cap.
+	nLine := graphCall(t, proc, 3, "query_graph", map[string]any{
+		"mode":  "traversal",
+		"start": map[string]any{"entity": "note", "filters": map[string]any{"repo": repo, "parent_key": parent}},
+		"limit": 50,
+	})
+	assertNoToolError(t, nLine)
+	notes := decodeTool[gQueryResp](t, nLine)
+	if len(notes.Results) == 0 {
+		t.Skipf("no note nodes for parent %q in %q: the fixture has no US2 note points", parent, repo)
+	}
+	for _, h := range notes.Results {
+		if h.Kind != "note" || h.ParentKey != parent || h.NoteID == "" {
+			t.Errorf("note lookup returned %+v, want kind=note parent_key=%q", h, parent)
+		}
+		if len(h.Body) > graph.MaxNoteBodyBytes {
+			t.Errorf("note %s: body %d bytes > cap %d", h.NoteID, len(h.Body), graph.MaxNoteBodyBytes)
+		}
+	}
+	assertCoverage(t, "query_graph(note)", notes.Coverage, repo)
+	noteKey := notes.Results[0].NodeKey
+	t.Logf("read-back: user=%s notes=%d", userKey, len(notes.Results))
+
+	// 3) commented: the note links to its author.
+	cLine := graphCall(t, proc, 4, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": noteKey, "direction": "outgoing",
+		"rel_types": []string{"commented"}, "filters": map[string]any{"repo": repo}, "limit": 50,
+	})
+	assertNoToolError(t, cLine)
+	commented := decodeTool[gNeighborsResp](t, cLine)
+	authors := 0
+	for _, n := range commented.Neighbors {
+		if n.Type != "user" {
+			t.Errorf("commented neighbour %q: type=%q, want user", n.Key, n.Type)
+		}
+		if !n.Resolved || n.Node == nil {
+			t.Errorf("commented neighbour %q: author node not resolved: %+v", n.Key, n)
+			continue
+		}
+		if nk, _ := n.Node["node_key"].(string); nk != n.Key {
+			t.Errorf("commented neighbour %q: resolved node carries node_key %q", n.Key, nk)
+		}
+		authors++
+	}
+	if authors == 0 {
+		t.Errorf("neighbors(%s, commented) returned no author: the stored note must link to its author (R7)", noteKey)
+	}
+
+	// 4) authored: the parent item links to its author; a parent without
+	// authored users (planning ingest not run) skip-notes honestly.
+	aLine := graphCall(t, proc, 5, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": parent, "direction": "outgoing",
+		"rel_types": []string{"authored"}, "filters": map[string]any{"repo": repo}, "limit": 50,
+	})
+	assertNoToolError(t, aLine)
+	authored := decodeTool[gNeighborsResp](t, aLine)
+	if len(authored.Neighbors) == 0 {
+		t.Logf("skip-note: parent %q has no authored edge in the live graph", parent)
+	} else {
+		for _, n := range authored.Neighbors {
+			if n.Type != "user" || !n.Resolved {
+				t.Errorf("authored neighbour %q: type=%q resolved=%v, want a resolved user", n.Key, n.Type, n.Resolved)
+			}
+		}
+	}
+	t.Logf("read-back: user=%s comments=%d authored=%d", userKey, authors, len(authored.Neighbors))
+}
+
+// TestE2E_Graph_SC005_Planning — US3 (SC-005): the planning domain is
+// queryable. The work item is found as a node by canonical node_key
+// (entity=work_item, with item_id/item_type); its milestone and labels are
+// then found as nodes (entity=milestone|label) and the relation edges are
+// walked through mode=neighbors: assigned_to/authored out of the item to
+// users, in_milestone/labelled back from the milestone/label to the item.
+// Skipped when the fixture index has no such work item; the milestone/label
+// legs skip-note when the fixture item carries none.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_WORK_ITEM_KEY (see the header).
+func TestE2E_Graph_SC005_Planning(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	wiKey := graphFixture(t, "GRAPH_E2E_WORK_ITEM_KEY")
+
+	// 1) the work item node itself.
+	wiLine := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":  "traversal",
+		"start": map[string]any{"entity": "work_item", "filters": map[string]any{"repo": repo, "node_key": wiKey}},
+		"limit": 5,
+	})
+	assertNoToolError(t, wiLine)
+	wi := decodeTool[gQueryResp](t, wiLine)
+	if len(wi.Results) == 0 {
+		t.Skipf("no work_item node %q in %q: the fixture has no US3 planning points", wiKey, repo)
+	}
+	for _, h := range wi.Results {
+		if h.Kind != "work_item" || h.NodeKey != wiKey || h.ItemID == "" || h.ItemType == "" {
+			t.Errorf("work_item lookup returned %+v, want kind=work_item node_key=%q with item_id/item_type", h, wiKey)
+		}
+	}
+	assertCoverage(t, "query_graph(work_item)", wi.Coverage, repo)
+
+	// 2) assigned_to/authored: the people around the item.
+	pLine := graphCall(t, proc, 3, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": wiKey, "direction": "outgoing",
+		"rel_types": []string{"assigned_to", "authored"}, "filters": map[string]any{"repo": repo}, "limit": 100,
+	})
+	assertNoToolError(t, pLine)
+	people := decodeTool[gNeighborsResp](t, pLine)
+	if len(people.Neighbors) == 0 {
+		t.Logf("skip-note: work item %q has no assigned_to/authored edges in the live graph", wiKey)
+	}
+	for _, n := range people.Neighbors {
+		if n.Type != "user" || !n.Resolved {
+			t.Errorf("people neighbour %q: type=%q resolved=%v, want a resolved user", n.Key, n.Type, n.Resolved)
+		}
+	}
+	t.Logf("read-back: work_item=%s people=%d", wiKey, len(people.Neighbors))
+
+	// 3) milestone/label: the target nodes and the reverse edges.
+	for _, leg := range []struct{ rel, node string }{
+		{"in_milestone", "milestone"},
+		{"labelled", "label"},
+	} {
+		centres := planningPeerKeys(t, proc, 4, wiKey, leg.rel, repo)
+		if len(centres) == 0 {
+			t.Logf("skip-note: work item %q has no %s edge in the live graph", wiKey, leg.rel)
+			continue
+		}
+		centre := centres[0]
+		nLine := graphCall(t, proc, 5, "query_graph", map[string]any{
+			"mode":  "traversal",
+			"start": map[string]any{"entity": leg.node, "filters": map[string]any{"repo": repo, "node_key": centre}},
+			"limit": 5,
+		})
+		assertNoToolError(t, nLine)
+		node := decodeTool[gQueryResp](t, nLine)
+		if len(node.Results) == 0 {
+			t.Errorf("%s %q is an edge target but not a stored node", leg.node, centre)
+			continue
+		}
+		for _, h := range node.Results {
+			if h.Kind != leg.node || h.NodeKey != centre || (h.MsID == "" && h.LabelKey == "") {
+				t.Errorf("%s lookup returned %+v, want kind=%s node_key=%q", leg.node, h, leg.node, centre)
+			}
+		}
+		assertCoverage(t, "query_graph("+leg.node+")", node.Coverage, repo)
+		assertPlanningBackLink(t, proc, 6, centre, wiKey, leg.rel, repo, leg.node)
+	}
+}
+
+// planningPeerKeys returns the canonical keys of the peers reached from centre
+// over one planning relation (mode=neighbors, outgoing).
+func planningPeerKeys(t *testing.T, p *mcpProcess, id int, centre, relType, repo string) []string {
+	t.Helper()
+	line := graphCall(t, p, id, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": centre, "direction": "outgoing",
+		"rel_types": []string{relType}, "filters": map[string]any{"repo": repo}, "limit": 100,
+	})
+	assertNoToolError(t, line)
+	nb := decodeTool[gNeighborsResp](t, line)
+	keys := make([]string, 0, len(nb.Neighbors))
+	for _, n := range nb.Neighbors {
+		keys = append(keys, n.Key)
+	}
+	return keys
+}
+
+// assertPlanningBackLink checks the reverse of a planning edge: the centre (a
+// milestone/label node) must list the work item back over relType, with the
+// peer type the edge carries. node names the centre family in the messages.
+func assertPlanningBackLink(t *testing.T, p *mcpProcess, id int, centre, itemKey, relType, repo, node string) {
+	t.Helper()
+	line := graphCall(t, p, id, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": centre, "direction": "incoming",
+		"rel_types": []string{relType}, "filters": map[string]any{"repo": repo}, "limit": 100,
+	})
+	assertNoToolError(t, line)
+	back := decodeTool[gNeighborsResp](t, line)
+	found := false
+	for _, n := range back.Neighbors {
+		if n.Type != "work_item" || !n.Resolved {
+			t.Errorf("%s %q: %s neighbour %q: type=%q resolved=%v, want a resolved work_item", node, centre, relType, n.Key, n.Type, n.Resolved)
+		}
+		if n.Key == itemKey {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("%s is not symmetric: work item %q missing among %d items of %s %q", relType, itemKey, len(back.Neighbors), node, centre)
+	}
+	t.Logf("read-back: %s back from %s %q: items=%d", relType, node, centre, len(back.Neighbors))
+}
+
 // TestE2E_Graph_SC008_CI — US4 (SC-008 CI): the ci domain preserves the whole
 // run history, not just failures. query_graph(entity:"ci") with a status filter
 // finds both failed and successful runs; every job row carries job/duration
@@ -873,6 +1116,18 @@ type gQueryHit struct {
 	ToKey     string `json:"to_key"`
 	Symbol    string `json:"symbol"`
 	FilePath  string `json:"file_path"`
+	// US2/US3 node payloads (SC-004/SC-005).
+	NodeKey   string `json:"node_key"`
+	Login     string `json:"login"`
+	VCSUserID string `json:"vcs_user_id"`
+	NoteID    string `json:"note_id"`
+	ParentKey string `json:"parent_key"`
+	AuthorKey string `json:"author_key"`
+	Body      string `json:"body"`
+	ItemID    string `json:"item_id"`
+	ItemType  string `json:"item_type"`
+	MsID      string `json:"ms_id"`
+	LabelKey  string `json:"label_key"`
 }
 
 type gQueryResp struct {
