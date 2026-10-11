@@ -4,7 +4,8 @@ Self-hosted, VCS-agnostic RAG service over source code and repository metadata.
 An alternative to GitLab Orbit: mirrors repositories (GitLab/GitHub), chunks
 code, builds embeddings, and serves search via an MCP server.
 
-<img width="2752" height="1536" alt="VCS Rag" src="https://github.com/user-attachments/assets/ffc92810-1c21-4f5c-b7f5-65ae6abb7252" />
+<img width="2752" height="1536" alt="VCS Rag" src="https://github.com/user-attachments/assets/4d6a6bc8-5f13-48e3-8bf4-29055800718c" />
+
 
 
 One binary — two modes:
