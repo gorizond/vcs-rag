@@ -296,17 +296,20 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 	key := repoSlug(task.Repo)
 
 	// coalesce guard: a duplicate request for a fresh run/result is a no-op.
-	// The in_progress window equals the effective ack wait, so a redelivery
-	// after a crash is older than the window and proceeds (T112).
-	if st, ok := c.readStatus(key); ok {
-		now := time.Now()
-		fresh := (st.State == "in_progress" && now.Sub(st.StartedAt) < refreshCoalesceWindow) ||
-			(st.State == "done" && now.Sub(st.FinishedAt) < refreshDoneFresh)
-		if fresh {
-			c.stats.coalesced.Add(1)
-			c.logger.Info("refresh coalesced", "repo", task.Repo, "state", st.State)
-			_ = msg.Ack()
-			return
+	// T158: a redelivery (NumDelivered > 1) means the previous attempt did not
+	// ack — it is never coalesced, otherwise a fast failure inside the window
+	// would swallow the task and leave the KV in_progress forever.
+	if msg.NumDelivered() == 1 {
+		if st, ok := c.readStatus(key); ok {
+			now := time.Now()
+			fresh := (st.State == "in_progress" && now.Sub(st.StartedAt) < refreshCoalesceWindow) ||
+				(st.State == "done" && now.Sub(st.FinishedAt) < refreshDoneFresh)
+			if fresh {
+				c.stats.coalesced.Add(1)
+				c.logger.Info("refresh coalesced", "repo", task.Repo, "state", st.State)
+				_ = msg.Ack()
+				return
+			}
 		}
 	}
 
@@ -341,10 +344,14 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 	c.logger.Info("refresh start", "repo", task.Repo, "origin", origin, "delivery", msg.NumDelivered())
 
 	// T130: while the refresh runs, the index lane yields.
+	// T158: a panic must not escape the consumer — it becomes a failed status
+	// with the panic in errors[] and keeps the normal retry semantics.
 	refreshActive.Store(true)
 	done := make(chan struct{})
 	go c.heartbeatLoop(ctx, done, task.Repo, started)
-	res := c.run(ctx, repo, task.Origin)
+	res := runRefreshTask(ctx, c.logger, task.Repo, func() RefreshResult {
+		return c.run(ctx, repo, task.Origin)
+	})
 	close(done)
 	refreshActive.Store(false)
 	status := refreshStatus{
@@ -379,6 +386,20 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 		c.logger.Warn("refresh failed (retry)", "repo", task.Repo,
 			"delivery", msg.NumDelivered(), "errors", res.Errors)
 	}
+}
+
+// runRefreshTask runs the refresh composition with a panic guard (T158): a
+// panic inside the run (e.g. an invalid-UTF-8 payload in a transitive call)
+// becomes a failed result with the panic in errors[] — the consumer keeps its
+// retry semantics and the KV never stays in_progress.
+func runRefreshTask(ctx context.Context, lg *slog.Logger, repo string, fn func() RefreshResult) (res RefreshResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			lg.Error("refresh run panicked", "repo", repo, "panic", fmt.Sprint(r))
+			res.Errors = append(res.Errors, fmt.Sprintf("panic: %v", r))
+		}
+	}()
+	return fn()
 }
 
 // heartbeatLoop logs "refresh still running" every heartbeat while the run

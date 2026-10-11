@@ -540,3 +540,97 @@ func TestRefreshHeartbeatLog(t *testing.T) {
 		t.Errorf("completion log missing: %q", buf.String())
 	}
 }
+
+// T158: a panicking refresh run must not escape the consumer — the KV becomes
+// failed (with the request id), the delivery is Naked, and the redelivery
+// really runs the composition instead of being coalesced.
+func TestRefreshPanicBecomesFailedAndRetries(t *testing.T) {
+	ctx := context.Background()
+	kv := newFakeKV()
+	runs := 0
+	c := newTestConsumer(kv, func(context.Context, provider.Repo, string) RefreshResult {
+		runs++
+		if runs == 1 {
+			panic("invalid UTF-8 in string: \"\\x88\\xac\\xef\"")
+		}
+		return RefreshResult{CommitsIndexed: 2}
+	})
+
+	msg := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: 1}
+	c.handle(ctx, msg) // must not panic
+	if runs != 1 {
+		t.Fatalf("runs = %d, want 1", runs)
+	}
+	data, err := kv.Get(repoSlug("grp/fixture"))
+	if err != nil {
+		t.Fatalf("KV after the panic: %v", err)
+	}
+	var st refreshStatus
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.State != "failed" || st.RequestID != "r1" || len(st.Errors) == 0 ||
+		!strings.Contains(st.Errors[0], "panic") {
+		t.Fatalf("KV after the panic = %+v, want a terminal failed with the panic", st)
+	}
+	if msg.naks != 1 {
+		t.Errorf("nak = %d, want a retryable failure", msg.naks)
+	}
+
+	// the redelivery is not swallowed by the failed status: it runs again.
+	msg2 := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: 2}
+	c.handle(ctx, msg2)
+	if runs != 2 {
+		t.Fatalf("redelivery swallowed: runs = %d, want 2", runs)
+	}
+	if msg2.acks != 1 {
+		t.Errorf("redelivery ack = %d, want the successful run acked", msg2.acks)
+	}
+}
+
+// T158: a redelivery bypasses the coalesce guard; a fresh duplicate with
+// NumDelivered == 1 is still coalesced (negative control).
+func TestRefreshRedeliveryNotCoalesced(t *testing.T) {
+	ctx := context.Background()
+	fresh := func() *fakeKV {
+		kv := newFakeKV()
+		data, err := json.Marshal(refreshStatus{State: "in_progress", RequestID: "old",
+			StartedAt: time.Now().UTC()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := kv.Put(repoSlug("grp/fixture"), data); err != nil {
+			t.Fatal(err)
+		}
+		return kv
+	}
+
+	// delivery 1 with a fresh in_progress run: coalesced (the T112 behavior).
+	kvFirst := fresh()
+	firstRuns := 0
+	cFirst := newTestConsumer(kvFirst, func(context.Context, provider.Repo, string) RefreshResult {
+		firstRuns++
+		return RefreshResult{}
+	})
+	dup := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: 1}
+	cFirst.handle(ctx, dup)
+	if firstRuns != 0 || dup.acks != 1 {
+		t.Fatalf("fresh duplicate: runs=%d acks=%d, want a coalesced no-op", firstRuns, dup.acks)
+	}
+
+	// delivery 2 with the same fresh in_progress state: it must run.
+	kvRetry := fresh()
+	runs := 0
+	cRetry := newTestConsumer(kvRetry, func(context.Context, provider.Repo, string) RefreshResult {
+		runs++
+		return RefreshResult{CommitsIndexed: 1}
+	})
+	retry := &fakeMsg{data: taskMsg(t, "grp/fixture"), delivered: 2}
+	cRetry.handle(ctx, retry)
+	if runs != 1 {
+		t.Fatalf("redelivery swallowed by the coalesce window: runs = %d", runs)
+	}
+	if retry.acks != 1 {
+		t.Errorf("redelivery ack = %d, want 1", retry.acks)
+	}
+}
