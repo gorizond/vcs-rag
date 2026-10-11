@@ -7,7 +7,7 @@ local `.env` or the orchestrator's secret store — never in the repository.
 
 The quickstart uses [`.env.example`](../.env.example); the compose stacks read
 the same names from `.env`. See also: [refresh](refresh.md) ·
-[GC](gc.md) · [reindex](reindex.md).
+[GC](gc.md) · [graph](graph.md) · [reindex](reindex.md).
 
 ## VCS provider (exactly one flavor)
 

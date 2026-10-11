@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -241,4 +242,194 @@ func extractJobLog(data []byte, jobName string) (string, error) {
 		}
 	}
 	return sb.String(), nil
+}
+
+// ListPipelineJobs returns every job of one workflow run (T042/F4): the run
+// carries ref/sha, each job its status/conclusion and started/completed
+// timestamps. Actions has no stage concept, so Stage stays empty; the API also
+// returns per-step details, but the graph model has no step level — only the
+// job row is stored.
+func (c *Client) ListPipelineJobs(ctx context.Context, repo provider.Repo, pipelineID int) ([]provider.CIPipelineDetail, error) {
+	run, _, err := c.api.Actions.GetWorkflowRunByID(ctx, repo.Namespace, repo.Path, int64(pipelineID))
+	if err != nil {
+		return nil, fmt.Errorf("github: workflow run %s#%d: %w", repo.Path, pipelineID, err)
+	}
+	opt := &gh.ListWorkflowJobsOptions{Filter: "latest", ListOptions: gh.ListOptions{PerPage: 100}}
+	var out []provider.CIPipelineDetail
+	for {
+		jobs, resp, err := c.api.Actions.ListWorkflowJobs(ctx, repo.Namespace, repo.Path, int64(pipelineID), opt)
+		if err != nil {
+			return nil, fmt.Errorf("github: jobs run %d: %w", pipelineID, err)
+		}
+		for _, j := range jobs.GetJobs() {
+			out = append(out, provider.CIPipelineDetail{
+				PipelineID: pipelineID,
+				JobName:    j.GetName(),
+				Status:     provider.NormalizeCIStatus(j.GetStatus(), j.GetConclusion()),
+				Ref:        run.GetHeadBranch(),
+				CommitSHA:  run.GetHeadSHA(),
+				DurationMS: jobDuration(j).Milliseconds(),
+			})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+// ListDeployments returns the recent deployments (T042/F4) with the state of
+// the latest deployment status. ponytail: one page (100) and one status call
+// per deployment — an N+1; paginate wider only if deployments ever matter.
+func (c *Client) ListDeployments(ctx context.Context, repo provider.Repo) ([]provider.DeploymentInfo, error) {
+	deps, _, err := c.api.Repositories.ListDeployments(ctx, repo.Namespace, repo.Path,
+		&gh.DeploymentsListOptions{ListOptions: gh.ListOptions{PerPage: 100}})
+	if err != nil {
+		return nil, fmt.Errorf("github: deployments %s: %w", repo.Path, err)
+	}
+	out := make([]provider.DeploymentInfo, 0, len(deps))
+	for _, d := range deps {
+		status := ""
+		states, _, err := c.api.Repositories.ListDeploymentStatuses(ctx, repo.Namespace, repo.Path,
+			d.GetID(), &gh.ListOptions{PerPage: 1})
+		if err != nil {
+			return nil, fmt.Errorf("github: deployment statuses %s#%d: %w", repo.Path, d.GetID(), err)
+		}
+		if len(states) > 0 {
+			status = provider.NormalizeCIStatus(states[0].GetState(), "")
+		}
+		out = append(out, provider.DeploymentInfo{
+			ID:          int(d.GetID()),
+			Environment: d.GetEnvironment(),
+			Status:      status,
+			Ref:         d.GetRef(),
+			CommitSHA:   d.GetSHA(),
+		})
+	}
+	return out, nil
+}
+
+// ListEnvironments returns the repository environments (T042/F4).
+func (c *Client) ListEnvironments(ctx context.Context, repo provider.Repo) ([]provider.EnvironmentInfo, error) {
+	opt := &gh.EnvironmentListOptions{ListOptions: gh.ListOptions{PerPage: 100}}
+	var out []provider.EnvironmentInfo
+	for {
+		envs, resp, err := c.api.Repositories.ListEnvironments(ctx, repo.Namespace, repo.Path, opt)
+		if err != nil {
+			return nil, fmt.Errorf("github: environments %s: %w", repo.Path, err)
+		}
+		for _, e := range envs.GetEnvironments() {
+			out = append(out, provider.EnvironmentInfo{Name: e.GetName()})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+// ListVulnerabilities returns the open Dependabot and code-scanning alerts
+// (T046/F5). A 403/404 on both endpoints means the token lacks the
+// security_events scope (or the feature is off) — reported as
+// provider.ErrVulnerabilitiesUnavailable; when only one endpoint is off the
+// other's findings are still returned.
+func (c *Client) ListVulnerabilities(ctx context.Context, repo provider.Repo) ([]provider.VulnerabilityFinding, error) {
+	var out []provider.VulnerabilityFinding
+	depOff, csOff := false, false
+
+	deps, _, err := c.api.Dependabot.ListRepoAlerts(ctx, repo.Namespace, repo.Path,
+		&gh.ListAlertsOptions{State: gh.Ptr("open"), ListOptions: gh.ListOptions{PerPage: 100}})
+	switch {
+	case err == nil:
+		for _, a := range deps {
+			out = append(out, provider.VulnerabilityFinding{
+				ID:           strconv.Itoa(a.GetNumber()),
+				Severity:     depSeverity(a),
+				Scanner:      "dependabot",
+				State:        vulnState(a.GetState()),
+				LocationFile: a.GetDependency().GetManifestPath(),
+			})
+		}
+	case isSecurityUnavailable(err):
+		depOff = true
+	default:
+		return nil, fmt.Errorf("github: dependabot alerts %s: %w", repo.Path, err)
+	}
+
+	alerts, _, err := c.api.CodeScanning.ListAlertsForRepo(ctx, repo.Namespace, repo.Path,
+		&gh.AlertListOptions{State: "open", ListOptions: gh.ListOptions{PerPage: 100}})
+	switch {
+	case err == nil:
+		for _, a := range alerts {
+			out = append(out, provider.VulnerabilityFinding{
+				ID:           strconv.Itoa(a.GetNumber()),
+				Severity:     scanSeverity(a),
+				Scanner:      "code-scanning",
+				State:        vulnState(a.GetState()),
+				LocationFile: a.GetMostRecentInstance().GetLocation().GetPath(),
+			})
+		}
+	case isSecurityUnavailable(err):
+		csOff = true
+	default:
+		return nil, fmt.Errorf("github: code scanning alerts %s: %w", repo.Path, err)
+	}
+
+	if depOff && csOff {
+		return nil, provider.ErrVulnerabilitiesUnavailable
+	}
+	return out, nil
+}
+
+// isSecurityUnavailable reports whether err is a GitHub 403/404: the endpoint
+// is disabled or the token lacks the security_events scope.
+func isSecurityUnavailable(err error) bool {
+	var er *gh.ErrorResponse
+	return errors.As(err, &er) && er.Response != nil &&
+		(er.Response.StatusCode == http.StatusForbidden || er.Response.StatusCode == http.StatusNotFound)
+}
+
+// depSeverity maps a Dependabot advisory severity onto the canonical set;
+// "moderate" is the old GitHub spelling of "medium".
+func depSeverity(a *gh.DependabotAlert) string {
+	switch s := a.GetSecurityAdvisory().GetSeverity(); s {
+	case "critical", "high", "low":
+		return s
+	case "moderate":
+		return "medium"
+	default:
+		return "info"
+	}
+}
+
+// scanSeverity maps a code-scanning alert onto the canonical severity: the
+// security severity level wins, the plain rule severity is the fallback.
+func scanSeverity(a *gh.Alert) string {
+	switch s := a.GetRule().GetSecuritySeverityLevel(); s {
+	case "critical", "high", "medium", "low":
+		return s
+	}
+	switch a.GetRule().GetSeverity() {
+	case "error":
+		return "high"
+	case "warning":
+		return "medium"
+	default:
+		return "info"
+	}
+}
+
+// vulnState maps a GitHub alert state (open|dismissed|fixed|auto_dismissed)
+// onto the canonical vulnerability state (detected|dismissed|resolved).
+func vulnState(state string) string {
+	switch state {
+	case "dismissed", "auto_dismissed":
+		return "dismissed"
+	case "fixed":
+		return "resolved"
+	default:
+		return "detected"
+	}
 }

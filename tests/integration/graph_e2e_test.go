@@ -34,6 +34,7 @@ import (
 //	GRAPH_E2E_ISSUE_STATE             canonical state of >=1 issue of the repo (SC-003)
 //	GRAPH_E2E_PR_STATE                canonical state of >=1 MR/PR of the repo (SC-003)
 //	GRAPH_E2E_ISSUE_LABEL/_AUTHOR/_MILESTONE  optional: pin those issue filters
+//	GRAPH_E2E_VULN_FINDINGS           "1": the fixture's security API is available (SC-008 security)
 //
 // Example:
 //
@@ -286,6 +287,227 @@ func TestE2E_Graph_SC007(t *testing.T) {
 	t.Logf("read-back: repo=%q hits=%d, foreign=%q hits=%d", repo, len(own.Results), foreign, len(other.Results))
 }
 
+// TestE2E_Graph_US5 — the query DSL end-to-end (SC-005 + R5 negatives): a
+// simple node+edge+filter request returns structured points with a coverage
+// notice; a query without a selective predicate is rejected with error code
+// non_selective_query (no scan); a result-limit cut reports truncated:true
+// instead of failing.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_FILE (a file with >=1 outgoing import and
+// >=1 definition — see the file header).
+func TestE2E_Graph_US5(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	file := graphFixture(t, "GRAPH_E2E_FILE")
+
+	// 1) the simple DSL: the file's definitions and their outgoing imports.
+	resp := decodeTool[gQueryResp](t, graphCall(t, proc, 2, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"repo": repo, "file_path": file}},
+		"edge":  map[string]any{"type": "imports", "direction": "outgoing"},
+		"hops":  1,
+		"limit": 50,
+	}))
+	if len(resp.Results) == 0 {
+		t.Fatalf("query_graph(repo=%q, file=%q) returned nothing: is the fixture file in the live graph index?", repo, file)
+	}
+	edges := 0
+	for _, h := range resp.Results {
+		if h.Repo != repo {
+			t.Errorf("foreign repo %q in results (want %q)", h.Repo, repo)
+		}
+		if h.Kind == "edge" {
+			if h.EdgeType != "imports" || h.FromFile != file {
+				t.Errorf("edge result %+v, want imports from %q", h, file)
+			}
+			edges++
+		}
+	}
+	if edges == 0 {
+		t.Errorf("no import edge from %q among %d results", file, len(resp.Results))
+	}
+	assertCoverage(t, "query_graph", resp.Coverage, repo)
+	if resp.Truncated && len(resp.Results) < 50 {
+		t.Errorf("truncated=true with only %d results (< limit)", len(resp.Results))
+	}
+	t.Logf("read-back: query_graph points=%d edges=%d truncated=%v", len(resp.Results), edges, resp.Truncated)
+
+	// 2) no selective predicate: rejected before any scan (R5).
+	code, msg := decodeToolError(t, graphCall(t, proc, 3, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"branch": "main"}},
+	}))
+	if code != "non_selective_query" {
+		t.Errorf("non-selective query code = %q, want non_selective_query (message: %s)", code, msg)
+	}
+	if !strings.Contains(msg, "repo") { // the message names the selective predicates
+		t.Errorf("non-selective message does not name the selective predicates: %q", msg)
+	}
+
+	// 3) a limit cut is signaled, not failed (R5 caps).
+	cut := decodeTool[gQueryResp](t, graphCall(t, proc, 4, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"repo": repo, "file_path": file}},
+		"edge":  map[string]any{"type": "*", "direction": "outgoing"},
+		"hops":  1,
+		"limit": 1,
+	}))
+	if len(cut.Results) == 0 {
+		t.Fatalf("query_graph(limit=1) returned nothing: is the fixture file in the live graph index?")
+	}
+	if !cut.Truncated {
+		t.Errorf("limit=1 with %d points must report truncated=true: the fixture file needs >=2 graph points (definitions + edges)", len(cut.Results))
+	}
+	t.Logf("read-back: query_graph limit=1 points=%d truncated=%v", len(cut.Results), cut.Truncated)
+}
+
+// TestE2E_Graph_SC008_CI — US4 (SC-008 CI): the ci domain preserves the whole
+// run history, not just failures. query_graph(entity:"ci") with a status filter
+// finds both failed and successful runs; every job row carries job/duration
+// (stage too when the provider has the concept — GitLab jobs do, GitHub
+// Actions does not); deployment/environment rows are asserted when present.
+// Skipped when the fixture repo has no ci points at all (provider without
+// CIPipelineDetailProvider or a graph pass not run yet).
+//
+// Env: GRAPH_E2E_REPO (see the file header).
+func TestE2E_Graph_SC008_CI(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+
+	baseLine := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "ci", "filters": map[string]any{"repo": repo}},
+		"limit": 100,
+	})
+	assertNoToolError(t, baseLine)
+	base := decodeTool[gQueryCIResp](t, baseLine)
+	if len(base.Results) == 0 {
+		t.Skipf("no ci points for repo %q: the fixture has no CI domain indexed", repo)
+	}
+	assertCoverage(t, "query_graph(ci)", base.Coverage, repo)
+
+	// SC-008: failed and success runs alike, each job row with stage/job/duration.
+	for _, st := range []string{"failed", "success"} {
+		line := graphCall(t, proc, 3, "query_graph", map[string]any{
+			"start": map[string]any{"entity": "ci", "filters": map[string]any{"repo": repo, "status": st}},
+			"limit": 100,
+		})
+		assertNoToolError(t, line)
+		resp := decodeTool[gQueryCIResp](t, line)
+		jobs := 0
+		for _, h := range resp.Results {
+			if h.Kind != "ci" || h.Repo != repo {
+				t.Errorf("ci query on %q returned a foreign/invalid point: %+v", repo, h)
+				continue
+			}
+			if h.Status != st || !canonicalCIStatuses[h.Status] {
+				t.Errorf("status filter %q returned status %q (point %s)", st, h.Status, h.ID)
+			}
+			if h.CiLevel != "job" {
+				continue
+			}
+			jobs++
+			if h.JobName == "" || h.DurationMS == nil {
+				t.Errorf("job row without job_name/duration_ms: %+v", h)
+			}
+			// GitLab carries the stage on the job; GitHub Actions has no stage concept.
+			if h.VCSType == "gitlab" && h.Stage == "" {
+				t.Errorf("gitlab job row without stage: %+v", h)
+			}
+		}
+		if jobs == 0 {
+			t.Errorf("status=%q: no ci_level=job rows among %d points of %q — the fixture needs a %s run with jobs", st, len(resp.Results), repo, st)
+		}
+		t.Logf("read-back: status=%s points=%d jobs=%d", st, len(resp.Results), jobs)
+	}
+
+	// deployment/environment rows: asserted when the provider exposes them.
+	for _, level := range []string{"deployment", "environment"} {
+		line := graphCall(t, proc, 4, "query_graph", map[string]any{
+			"start": map[string]any{"entity": "ci", "filters": map[string]any{"repo": repo, "ci_level": level}},
+			"limit": 100,
+		})
+		assertNoToolError(t, line)
+		resp := decodeTool[gQueryCIResp](t, line)
+		if len(resp.Results) == 0 {
+			t.Logf("skip-note: no ci_level=%q rows for %q (optional for this provider)", level, repo)
+			continue
+		}
+		for _, h := range resp.Results {
+			if h.Kind != "ci" || h.CiLevel != level {
+				t.Errorf("ci_level=%q query returned %+v", level, h)
+			}
+			if h.Env == "" {
+				t.Errorf("ci_level=%q row without env: %+v", level, h)
+			}
+		}
+		t.Logf("read-back: ci_level=%s rows=%d", level, len(resp.Results))
+	}
+}
+
+// TestE2E_Graph_SC008_Security — US6 (SC-008 security): the security domain is
+// conditional on the provider API/role. When the fixture declares availability
+// (GRAPH_E2E_VULN_FINDINGS=1) query_graph(entity:"vuln") must return well-formed
+// findings; otherwise an empty answer is the explicit "domain off" signal —
+// error-free, the schema still declares the entity and the other domains keep
+// working. Skipped only by the shared QDRANT_URL/EMBEDDINGS_BASE_URL gate.
+//
+// Env: GRAPH_E2E_REPO; optional GRAPH_E2E_VULN_FINDINGS=1.
+func TestE2E_Graph_SC008_Security(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+
+	line := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "vuln", "filters": map[string]any{"repo": repo}},
+		"limit": 100,
+	})
+	assertNoToolError(t, line)
+	resp := decodeTool[gVulnResp](t, line)
+
+	findings := 0
+	for _, h := range resp.Results {
+		if h.Kind != "vuln" {
+			continue // hop edges from the findings' location files may accompany the points
+		}
+		findings++
+		if h.Repo != repo {
+			t.Errorf("vuln query on %q returned repo %q", repo, h.Repo)
+		}
+		if !canonicalVulnSeverities[h.Severity] {
+			t.Errorf("vuln %s: severity %q outside the canonical set", h.ID, h.Severity)
+		}
+		if !canonicalVulnStates[h.State] {
+			t.Errorf("vuln %s: state %q outside the canonical set", h.ID, h.State)
+		}
+		if h.Scanner == "" {
+			t.Errorf("vuln %s: scanner is empty: %+v", h.ID, h)
+		}
+	}
+	if findings > 0 {
+		assertCoverage(t, "query_graph(vuln)", resp.Coverage, repo)
+		t.Logf("read-back: security domain available, findings=%d", findings)
+		return
+	}
+
+	// The security domain is unavailable on this instance (403/404 or no
+	// findings): the answer is an explicit empty one — assertNoToolError above
+	// proves it is not an error.
+	if os.Getenv("GRAPH_E2E_VULN_FINDINGS") == "1" {
+		t.Fatalf("GRAPH_E2E_VULN_FINDINGS=1 but query_graph(entity:vuln) returned no findings for %q", repo)
+	}
+	assertCoverage(t, "query_graph(vuln, off)", resp.Coverage, repo)
+	// Off, not gone: the schema still declares the entity type.
+	sch := decodeTool[gSchemaResp](t, graphCall(t, proc, 3, "graph_schema", map[string]any{}))
+	if !hasType(sch.EntityTypes, "vuln") {
+		t.Errorf("security domain is off but graph_schema no longer declares the vuln entity: %+v", sch.EntityTypes)
+	}
+	// The rest of the graph lane keeps answering for the same repo.
+	other := decodeTool[gQueryResp](t, graphCall(t, proc, 4, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"repo": repo}},
+		"limit": 5,
+	}))
+	if len(other.Results) == 0 {
+		t.Errorf("definition domain returned nothing for %q while the security domain is off: other domains must keep working", repo)
+	}
+	t.Logf("read-back: security domain unavailable (empty, no error); definitions still answer: %d points", len(other.Results))
+}
+
 // --- helpers ---
 
 // startGraphMCP builds the binary, starts the production MCP server over stdio
@@ -369,6 +591,51 @@ func decodeTool[T any](t *testing.T, line string) T {
 	return out
 }
 
+// decodeToolError unwraps a structured tool error ({"code","message"} — the
+// shared toolError contract; the Out=any handlers keep IsError unset, so the
+// code lives in structuredContent).
+func decodeToolError(t *testing.T, line string) (code, message string) {
+	t.Helper()
+	var env struct {
+		Result struct {
+			StructuredContent json.RawMessage `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(line), &env); err != nil {
+		t.Fatalf("decode error response: %v: %s", err, truncateForLog(line, 300))
+	}
+	var te struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(env.Result.StructuredContent, &te); err != nil {
+		t.Fatalf("decode structured error: %v: %s", err, truncateForLog(string(env.Result.StructuredContent), 300))
+	}
+	return te.Code, te.Message
+}
+
+// assertNoToolError fails when a tool answered with the shared structured error
+// contract ({"code","message"}) instead of a result: the Out=any handlers keep
+// IsError unset, so decodeTool alone would read such an error as an empty
+// result. A malformed or empty response is left to decodeTool.
+func assertNoToolError(t *testing.T, line string) {
+	t.Helper()
+	var env struct {
+		Result struct {
+			StructuredContent json.RawMessage `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(line), &env); err != nil || len(env.Result.StructuredContent) == 0 {
+		return
+	}
+	var te struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(env.Result.StructuredContent, &te); err == nil && te.Code != "" {
+		t.Fatalf("tool error: %s", truncateForLog(line, 400))
+	}
+}
+
 // assertCoverage checks that the per-repo coverage notice names the repo.
 func assertCoverage(t *testing.T, tool string, cov []gCoverage, repo string) {
 	t.Helper()
@@ -429,6 +696,24 @@ type gEdgesResp struct {
 	Coverage []gCoverage   `json:"coverage"`
 }
 
+// gQueryHit / gQueryResp — query_graph results (payload flattened + id).
+type gQueryHit struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Repo      string `json:"repo"`
+	EdgeType  string `json:"edge_type"`
+	FromFile  string `json:"from_file"`
+	ToPackage string `json:"to_package"`
+	Symbol    string `json:"symbol"`
+	FilePath  string `json:"file_path"`
+}
+
+type gQueryResp struct {
+	Results   []gQueryHit `json:"results"`
+	Coverage  []gCoverage `json:"coverage"`
+	Truncated bool        `json:"truncated"`
+}
+
 type gPRFileChunk struct {
 	FilePath       string `json:"file_path"`
 	Status         string `json:"status"`
@@ -473,6 +758,56 @@ type gPRsResp struct {
 var canonicalStates = map[string]bool{
 	"open": true, "merged": true, "closed": true, "locked": true, "draft": true,
 }
+
+// gQueryCIHit / gQueryCIResp — US4 ci points of query_graph (SC-008 CI);
+// duration_ms is a pointer: presence is asserted, 0 is a legitimate duration.
+type gQueryCIHit struct {
+	ID         string   `json:"id"`
+	Kind       string   `json:"kind"`
+	Repo       string   `json:"repo"`
+	VCSType    string   `json:"vcs_type"`
+	CiLevel    string   `json:"ci_level"`
+	Status     string   `json:"status"`
+	JobName    string   `json:"job_name"`
+	Stage      string   `json:"stage"`
+	Env        string   `json:"env"`
+	DurationMS *float64 `json:"duration_ms"`
+}
+
+type gQueryCIResp struct {
+	Results  []gQueryCIHit `json:"results"`
+	Coverage []gCoverage   `json:"coverage"`
+}
+
+// gVulnHit / gVulnResp — US6 vuln points of query_graph (SC-008 security).
+type gVulnHit struct {
+	ID           string `json:"id"`
+	Kind         string `json:"kind"`
+	Repo         string `json:"repo"`
+	Severity     string `json:"severity"`
+	Scanner      string `json:"scanner"`
+	State        string `json:"state"`
+	LocationFile string `json:"location_file"`
+}
+
+type gVulnResp struct {
+	Results  []gVulnHit  `json:"results"`
+	Coverage []gCoverage `json:"coverage"`
+}
+
+// canonicalCIStatuses / canonicalVulnSeverities / canonicalVulnStates — the
+// unified vocabularies of the ci/vuln payloads (data-model §5–6).
+var (
+	canonicalCIStatuses = map[string]bool{
+		"success": true, "failed": true, "running": true, "pending": true, "canceled": true, "skipped": true,
+	}
+	canonicalVulnSeverities = map[string]bool{
+		"critical": true, "high": true, "medium": true, "low": true, "info": true,
+	}
+	canonicalVulnStates = map[string]bool{
+		"detected": true, "confirmed": true, "dismissed": true, "resolved": true,
+	}
+)
 
 type gNamed struct {
 	Name string `json:"name"`

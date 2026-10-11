@@ -12,6 +12,12 @@ import (
 // ErrNotImplemented is returned by method stubs; implemented in US4.
 var ErrNotImplemented = errors.New("not implemented")
 
+// ErrVulnerabilitiesUnavailable marks the security domain as unavailable on
+// this provider/instance (T046/F5): a 403/404 or a token missing the security
+// scope is a capability signal, not a failure — the caller skips the domain
+// instead of failing the pass.
+var ErrVulnerabilitiesUnavailable = errors.New("vulnerabilities unavailable")
+
 // TailLines returns the last n lines of the text (n<=0 — no truncation).
 func TailLines(s string, n int) string {
 	if n <= 0 || s == "" {
@@ -52,6 +58,36 @@ func NormalizeState(state string) string {
 		return "open"
 	}
 	return state
+}
+
+// NormalizeCIStatus maps a raw CI state onto the canonical vocabulary
+// success|failed|running|pending|canceled|skipped (data-model §5, F4). GitLab
+// passes the job/pipeline status (conclusion empty); GitHub passes the
+// workflow/job (status, conclusion) pair.
+func NormalizeCIStatus(status, conclusion string) string {
+	switch conclusion {
+	case "success":
+		return "success"
+	case "failure", "timed_out":
+		return "failed"
+	case "cancelled":
+		return "canceled"
+	case "skipped", "neutral":
+		return "skipped"
+	}
+	switch status {
+	case "success":
+		return "success"
+	case "failed":
+		return "failed"
+	case "running", "in_progress":
+		return "running"
+	case "canceled", "cancelled", "cancelling":
+		return "canceled"
+	case "skipped":
+		return "skipped"
+	}
+	return "pending"
 }
 
 // Issue is an issue/task (GitLab issue = GitHub issue).

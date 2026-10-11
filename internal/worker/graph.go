@@ -2,9 +2,12 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/qdrant/go-client/qdrant"
@@ -45,8 +48,11 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	// T015: a rotating window start — with more repositories than the per-pass
 	// cap, consecutive passes still cover every repository over time.
 	start := 0
+	// T048: the security-domain availability is probed once per lane and
+	// latches off on 403/404, never failing the pass.
+	vuln := &vulnGate{}
 	for {
-		sum := graphPass(ctx, cfg, deps, snap, gs, start)
+		sum := graphPass(ctx, cfg, deps, snap, gs, start, vuln)
 		start += int(sum.repos.Load())
 		// Written points are the real-work signal: with none the lane backs
 		// off to its ceiling instead of spinning.
@@ -73,7 +79,7 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 // (T015): per-repo lock, failure isolation (FR-014). One generation stamp is
 // shared by every repository of the pass — the sweep of a repository (T016)
 // compares against exactly the generation of its scan.
-func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs *store.GraphStore, start int) *summary {
+func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs *store.GraphStore, start int, vuln *vulnGate) *summary {
 	sum := newSummary("graph")
 	repos := snap.get()
 	if len(repos) == 0 {
@@ -94,7 +100,7 @@ func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *sna
 		sum.countRepo(processSafely(ctx, deps.Logger, repo, "graph", func() error {
 			// T110: the per-repo lock is taken at the call site only.
 			return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
-				written, err := processGraphRepo(ctx, cfg, deps, gs, repo, generation)
+				written, err := processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, vuln)
 				if err == nil {
 					sum.addUpdated(written)
 				}
@@ -105,13 +111,20 @@ func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *sna
 	return sum
 }
 
-// processGraphRepo extracts the graph of one repository's default branch
+// processGraphRepo is the entry of the refresh composition: an explicit
+// one-repo refresh probes the security domain on its own (a fresh gate), while
+// the graph lane calls processGraphRepoPass with its lane-wide gate.
+func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int) (int, error) {
+	return processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, &vulnGate{})
+}
+
+// processGraphRepoPass extracts the graph of one repository's default branch
 // (T015): mirror → branch snapshot → tree → blob → chunk.Extract → writer. A
 // completed scan writes the coverage marker (T057) and only then sweeps the
 // stale generations of that repo+branch (T016) — a failed or canceled pass
 // never sweeps. CPU-only: no embeddings, no commit budget (R13). Lock-free by
 // design: the lane and the refresh composition hold the per-repo lock.
-func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int) (int, error) {
+func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, vuln *vulnGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
 	if err != nil {
@@ -174,6 +187,25 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 		}
 	}
 	written += len(diffPoints)
+	// US4/T044: ci points of the recent pipelines (success and failure),
+	// deployments and environments. Provider failures are best-effort inside
+	// ciPoints — they never fail the pass; only a store write error does.
+	ciPts := ciPoints(ctx, deps, repo, meta, lg)
+	if len(ciPts) > 0 {
+		if err := gs.Upsert(ctx, ciPts); err != nil {
+			return written, fmt.Errorf("ci write: %w", err)
+		}
+		written += len(ciPts)
+	}
+	// US6/T048: security findings behind the lane-wide availability gate; an
+	// unavailable domain is skipped (logged once), never failing the pass.
+	vulnPts := vuln.ingest(ctx, deps, repo, meta, lg)
+	if len(vulnPts) > 0 {
+		if err := gs.Upsert(ctx, vulnPts); err != nil {
+			return written, fmt.Errorf("vuln write: %w", err)
+		}
+		written += len(vulnPts)
+	}
 	// T057: the coverage marker of the completed scan, upserted again every
 	// pass (deterministic ID, last writer wins).
 	if err := gs.Upsert(ctx, []*qdrant.PointStruct{graph.CoveragePoint(meta, tip)}); err != nil {
@@ -223,6 +255,121 @@ func mrFilePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta g
 		lg.Info("graph: mr_file diffs fetched", "mrs", len(crs), "files", len(points))
 	}
 	return points, nil
+}
+
+// ciPoints builds the ci points of one repository (US4/T044): the jobs of the
+// recent pipelines — successful and failed alike — plus deployments and
+// environments, read through the optional CIPipelineDetailProvider seam. A
+// provider without CI-detail support yields nil. Best-effort by design: a
+// provider error is logged and the rest of the pass continues (the metadata
+// lane's failed-jobs vector path is untouched). Deterministic IDs make the
+// re-upsert each pass idempotent and keep the points of the current generation
+// alive for the sweep.
+// ponytail: pipelines/jobs are re-fetched every pass; add an updated_at
+// sidecar if the provider API cost of unchanged pipelines matters.
+func ciPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) []*qdrant.PointStruct {
+	detail, ok := deps.VCS.(provider.CIPipelineDetailProvider)
+	if !ok {
+		return nil
+	}
+	var points []*qdrant.PointStruct
+	pipelines, err := deps.VCS.ListPipelines(ctx, repo)
+	if err != nil {
+		if ctx.Err() == nil {
+			lg.Warn("graph: pipeline list failed, ci jobs skipped", "err", err)
+		}
+	} else {
+		for _, p := range pipelines {
+			if ctx.Err() != nil {
+				return points
+			}
+			pid, err := strconv.Atoi(p.ID)
+			if err != nil {
+				continue // non-numeric provider pipeline ID: not addressable
+			}
+			jobs, err := detail.ListPipelineJobs(ctx, repo, pid)
+			if err != nil {
+				lg.Warn("graph: pipeline jobs failed, pipeline skipped", "pipeline", p.ID, "err", err)
+				continue
+			}
+			for _, j := range jobs {
+				points = append(points, graph.CiPoint(meta, graph.CiLevelJob, p.ID, j.JobName,
+					j.Stage, j.Status, j.DurationMS, j.Ref, j.Env, j.CommitSHA))
+			}
+		}
+	}
+	deployments, err := detail.ListDeployments(ctx, repo)
+	if err != nil {
+		if ctx.Err() == nil {
+			lg.Warn("graph: deployments failed, skipped", "err", err)
+		}
+	} else {
+		for _, d := range deployments {
+			points = append(points, graph.CiPoint(meta, graph.CiLevelDeployment, strconv.Itoa(d.ID),
+				"", "", d.Status, 0, d.Ref, d.Environment, d.CommitSHA))
+		}
+	}
+	envs, err := detail.ListEnvironments(ctx, repo)
+	if err != nil {
+		if ctx.Err() == nil {
+			lg.Warn("graph: environments failed, skipped", "err", err)
+		}
+	} else {
+		for _, e := range envs {
+			points = append(points, graph.CiPoint(meta, graph.CiLevelEnvironment, "", e.Name,
+				"", e.State, 0, "", e.Name, ""))
+		}
+	}
+	return points
+}
+
+// vulnGate latches the availability of the security domain for one graph lane
+// (US6/T048). The first call is the probe itself: a typed unavailable
+// (403/404, missing scope) turns the domain off for the process and is logged
+// once; transient provider errors are logged and left to the next repo/pass.
+// ponytail: a per-repo 404 (dependabot/code-scanning off on one repo) also
+// latches the whole lane off; a per-repo probe would be finer.
+type vulnGate struct {
+	mu  sync.Mutex
+	off bool
+}
+
+// ingest reads the vulnerabilities of one repository and returns their points.
+// It returns nil when the provider has no security support, the domain is off,
+// the call failed or there are no findings — never an error.
+func (g *vulnGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) []*qdrant.PointStruct {
+	vp, ok := deps.VCS.(provider.VulnerabilityProvider)
+	if !ok {
+		return nil
+	}
+	g.mu.Lock()
+	off := g.off
+	g.mu.Unlock()
+	if off {
+		return nil
+	}
+	findings, err := vp.ListVulnerabilities(ctx, repo)
+	if err != nil {
+		if errors.Is(err, provider.ErrVulnerabilitiesUnavailable) {
+			g.mu.Lock()
+			g.off = true
+			g.mu.Unlock()
+			lg.Info("graph: security domain unavailable, vuln ingest off", "err", err)
+			return nil
+		}
+		if ctx.Err() == nil {
+			lg.Warn("graph: vulnerabilities fetch failed, repo skipped", "err", err)
+		}
+		return nil
+	}
+	points := make([]*qdrant.PointStruct, 0, len(findings))
+	for _, f := range findings {
+		points = append(points, graph.VulnPoint(meta, f.ID, f.Severity, f.Scanner, f.State, f.LocationFile))
+	}
+	if len(points) > 0 {
+		lg.Info("graph: vuln findings fetched", "findings", len(points))
+	}
+	return points
 }
 
 // repoModulePath reads the root go.mod module path of the scanned tree ("" —

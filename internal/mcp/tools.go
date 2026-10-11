@@ -48,6 +48,10 @@ const (
 // codeInvalidInput — argument validation errors of the graph tools (T017–T019).
 const codeInvalidInput = "invalid_input"
 
+// codeNonSelective — a graph query without a selective indexed predicate
+// (T035/T037, R5): the compiler refuses it instead of scanning the collection.
+const codeNonSelective = "non_selective_query"
+
 // tools — MCP tool implementations on top of narrow interfaces.
 type tools struct {
 	embedder  Embedder
@@ -127,6 +131,29 @@ type graphEdgesInput struct {
 // graphSchemaInput — T019 (no required arguments).
 type graphSchemaInput struct {
 	Repo string `json:"repo,omitempty" jsonschema:"optional repo scope for coverage_per_repo"`
+}
+
+// queryGraphInput — T037 (contracts/mcp-tools.md query_graph): start entity
+// plus filters, an optional edge selector, hops/limit and global filters.
+type queryGraphInput struct {
+	Start   queryGraphStart `json:"start" jsonschema:"start entity (entity + filters)"`
+	Edge    queryGraphEdge  `json:"edge,omitempty" jsonschema:"optional edge selector of the expansion"`
+	Hops    int             `json:"hops,omitempty" jsonschema:"traversal depth: 1..3; 3 is the server cap (default 1)"`
+	Limit   int             `json:"limit,omitempty" jsonschema:"result limit: default 30, maximum 1000"`
+	Filters map[string]any  `json:"filters,omitempty" jsonschema:"global filters applied to the start and expansion points; at least one selective predicate (repo|file_path|from_file|to_package|from_package|symbol|mr_id) is required"`
+}
+
+// queryGraphStart — the DSL start selector: entity ∈ definition|file|mr_file|
+// ci|vuln; filters are Qdrant operators on indexed payload fields.
+type queryGraphStart struct {
+	Entity  string         `json:"entity" jsonschema:"start entity: definition | file | mr_file | ci | vuln"`
+	Filters map[string]any `json:"filters,omitempty" jsonschema:"start-point filters; must contain at least one selective indexed predicate"`
+}
+
+// queryGraphEdge — the DSL edge selector of the expansion.
+type queryGraphEdge struct {
+	Type      string `json:"type,omitempty" jsonschema:"edge type: imports | defines | * (default *)"`
+	Direction string `json:"direction,omitempty" jsonschema:"traversal direction: outgoing | incoming (default outgoing)"`
 }
 
 // resultsResponse is the structured payload of every search tool (T148):
@@ -221,6 +248,15 @@ type importEdge struct {
 type importsResponse struct {
 	Results  []importEdge `json:"results"`
 	Coverage []coverage   `json:"coverage"`
+}
+
+// queryGraphResponse — T037: the traversal points (payload fields flattened,
+// plus the point id), the per-repo coverage notice, and the truncation flag
+// (an R5 cap cut the walk; the query itself still succeeded).
+type queryGraphResponse struct {
+	Results   []map[string]any `json:"results"`
+	Coverage  []coverage       `json:"coverage"`
+	Truncated bool             `json:"truncated"`
 }
 
 // graphSchemaResponse — the self-description of the graph collection (T019).
@@ -353,6 +389,16 @@ func registerTools(server *mcp.Server, t *tools) {
 			"(package-level edges only). direction=incoming (default) lists importers of the input; direction=outgoing lists the " +
 			"input's imports. The result object is {\"results\": [{from_file, from_package, to_package, external}], \"coverage\": [...]}.",
 	}, t.getDependents)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "query_graph",
+		Description: "Unified structured traversal (US5): start entity (definition|file|mr_file|ci|vuln) + filters, optional edge " +
+			"selector (type imports|defines|*, direction outgoing|incoming), hops 1..3 (default 1), limit default 30 max 1000. " +
+			"Filters are Qdrant operators on indexed payload fields: scalar = exact match, list = in/match-any, null = is_null, " +
+			"{gt,gte,lt,lte} = numeric range. REQUIRED: at least one selective predicate " +
+			"(repo|file_path|from_file|to_package|from_package|symbol|mr_id) — a filter on kind/branch alone is rejected with " +
+			"error code non_selective_query instead of scanning. Caps cut the walk and set truncated=true. " +
+			"The result object is {\"results\": [{...payload, id}], \"coverage\": [...], \"truncated\": bool}.",
+	}, t.queryGraph)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "graph_schema",
 		Description: "Self-describing graph schema: node types (definition) with indexed properties, edge types (imports, defines), " +
@@ -726,6 +772,223 @@ func (t *tools) graphEdges(ctx context.Context, in graphEdgesInput, defaultDir s
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
 	return nil, importsResponse{Results: edges, Coverage: cov}, nil
+}
+
+// --- query_graph (T037) ---
+
+// graphScroller adapts the tools' GraphReader to graph.Scroller (the same
+// single method): the traversal stays pure logic over an injected scanner.
+type graphScroller struct{ g GraphReader }
+
+func (s graphScroller) ScrollAll(ctx context.Context, f *qdrant.Filter, limit uint32) ([]*qdrant.RetrievedPoint, error) {
+	return s.g.ScrollAll(ctx, f, limit)
+}
+
+// queryGraph — the unified structured traversal (T037, FR-016/017): the DSL is
+// compiled by graph.Compile (selectivity guard + hops/limit caps) and executed
+// by graph.Traverse over the graph store. A non-selective query is rejected
+// with code non_selective_query BEFORE any scan (R5); a cap cut is reported as
+// truncated:true, never as a failure.
+func (t *tools) queryGraph(ctx context.Context, _ *mcp.CallToolRequest, in queryGraphInput) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
+	defer cancel()
+	if t.graph == nil {
+		return nil, errorResult(ctx, codeSearchFailed, errGraphStore), nil
+	}
+	q, err := in.graphQuery()
+	if err != nil {
+		return nil, toolError{Code: codeInvalidInput, Message: err.Error()}, nil
+	}
+	// Compile explicitly: its validation must reject the query before any scan
+	// (Traverse compiles internally too; this call only classifies the error).
+	if _, err := graph.Compile(q); err != nil {
+		if errors.Is(err, graph.ErrNonSelective) {
+			return nil, errorResult(ctx, codeNonSelective, err), nil
+		}
+		return nil, toolError{Code: codeInvalidInput, Message: err.Error()}, nil
+	}
+	res, err := graph.Traverse(ctx, graphScroller{g: t.graph}, q, graph.Coverage{})
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	hits := make([]map[string]any, 0, len(res.Points))
+	for _, p := range res.Points {
+		m := payloadMap(p)
+		m["id"] = queryPointID(p.GetId())
+		hits = append(hits, m)
+	}
+	cov, err := t.coverageNotice(ctx, queryRepos(in, res.Points), nil)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	return nil, queryGraphResponse{Results: hits, Coverage: cov, Truncated: res.Truncated}, nil
+}
+
+// graphQuery maps the wire DSL to graph.Query: the start and global filter maps
+// become raw Qdrant conditions, the edge selector sets type/direction, hops and
+// limit pass through (graph.Compile clamps them).
+func (in queryGraphInput) graphQuery() (graph.Query, error) {
+	start, err := queryConditions(in.Start.Filters)
+	if err != nil {
+		return graph.Query{}, err
+	}
+	global, err := queryConditions(in.Filters)
+	if err != nil {
+		return graph.Query{}, err
+	}
+	return graph.Query{
+		StartEntity: graph.Entity(in.Start.Entity),
+		Start:       graph.Filter{Conditions: start},
+		Filter:      graph.Filter{Conditions: global},
+		EdgeType:    graph.EdgeType(in.Edge.Type),
+		Direction:   graph.Direction(in.Edge.Direction),
+		Hops:        in.Hops,
+		Limit:       in.Limit,
+	}, nil
+}
+
+// queryConditions compiles a DSL filter map into Qdrant conditions, one per
+// field (ANDed). Supported value forms (contracts/mcp-tools.md operators):
+// string → exact match; bool → boolean match; number → integer match; list →
+// match-any/in; null → is_null; {gt,gte,lt,lte} → numeric range. Fields are
+// sorted so the compiled filter is deterministic.
+func queryConditions(filters map[string]any) ([]*qdrant.Condition, error) {
+	fields := make([]string, 0, len(filters))
+	for field := range filters {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	out := make([]*qdrant.Condition, 0, len(fields))
+	for _, field := range fields {
+		c, err := queryCondition(field, filters[field])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// queryCondition compiles one field value; an unsupported form is a validation
+// error, never a silently dropped filter.
+func queryCondition(field string, v any) (*qdrant.Condition, error) {
+	switch t := v.(type) {
+	case string:
+		return qdrant.NewMatch(field, t), nil
+	case bool:
+		return qdrant.NewMatchBool(field, t), nil
+	case float64:
+		return qdrant.NewMatchInt(field, int64(t)), nil
+	case nil:
+		return qdrant.NewIsNull(field), nil
+	case []any:
+		return queryListCondition(field, t)
+	case map[string]any:
+		return queryRangeCondition(field, t)
+	default:
+		return nil, fmt.Errorf("filter %q: unsupported value type %T", field, v)
+	}
+}
+
+// queryListCondition compiles the list form (in/match-any). An empty list
+// becomes an empty MatchAny, which the compiler short-circuits into an empty
+// result without a scan (T035).
+func queryListCondition(field string, values []any) (*qdrant.Condition, error) {
+	if len(values) == 0 {
+		return qdrant.NewMatchKeywords(field), nil
+	}
+	if _, ok := values[0].(string); ok {
+		ss := make([]string, 0, len(values))
+		for _, v := range values {
+			s, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("filter %q: list must be all strings or all numbers, got %T", field, v)
+			}
+			ss = append(ss, s)
+		}
+		return qdrant.NewMatchKeywords(field, ss...), nil
+	}
+	ns := make([]int64, 0, len(values))
+	for _, v := range values {
+		n, ok := v.(float64)
+		if !ok {
+			return nil, fmt.Errorf("filter %q: list must be all strings or all numbers, got %T", field, v)
+		}
+		ns = append(ns, int64(n))
+	}
+	return qdrant.NewMatchInts(field, ns...), nil
+}
+
+// queryRangeCondition compiles the numeric range form {gt,gte,lt,lte}; at
+// least one bound is required and unknown operators are rejected (a typo must
+// not silently widen the query).
+func queryRangeCondition(field string, spec map[string]any) (*qdrant.Condition, error) {
+	r := &qdrant.Range{}
+	for key, dst := range map[string]**float64{"gt": &r.Gt, "gte": &r.Gte, "lt": &r.Lt, "lte": &r.Lte} {
+		v, ok := spec[key]
+		if !ok {
+			continue
+		}
+		n, ok := v.(float64)
+		if !ok {
+			return nil, fmt.Errorf("filter %q.%s: expected a number, got %T", field, key, v)
+		}
+		*dst = qdrant.PtrOf(n)
+	}
+	if r.Gt == nil && r.Gte == nil && r.Lt == nil && r.Lte == nil {
+		return nil, fmt.Errorf("filter %q: range needs at least one of gt, gte, lt, lte", field)
+	}
+	for key := range spec {
+		switch key {
+		case "gt", "gte", "lt", "lte":
+		default:
+			return nil, fmt.Errorf("filter %q: unknown range operator %q (want gt|gte|lt|lte)", field, key)
+		}
+	}
+	return qdrant.NewRange(field, r), nil
+}
+
+// queryRepos collects the repos a query touched: the explicit repo filter (a
+// string or a list) of the start and global filter maps plus the repos of the
+// returned points — even an empty result then carries a coverage notice for
+// the scoped repo (data-model §9: every graph answer carries coverage).
+func queryRepos(in queryGraphInput, pts []*qdrant.RetrievedPoint) []string {
+	seen := map[string]bool{}
+	var repos []string
+	add := func(repo string) {
+		if repo != "" && !seen[repo] {
+			seen[repo] = true
+			repos = append(repos, repo)
+		}
+	}
+	for _, filters := range []map[string]any{in.Start.Filters, in.Filters} {
+		switch v := filters["repo"].(type) {
+		case string:
+			add(v)
+		case []any:
+			for _, e := range v {
+				if s, ok := e.(string); ok {
+					add(s)
+				}
+			}
+		}
+	}
+	for _, p := range pts {
+		add(payloadString(payloadMap(p), "repo"))
+	}
+	sort.Strings(repos)
+	return repos
+}
+
+// queryPointID renders a point ID (UUID or numeric) for the response.
+func queryPointID(id *qdrant.PointId) string {
+	if id == nil {
+		return ""
+	}
+	if u := id.GetUuid(); u != "" {
+		return u
+	}
+	return fmt.Sprintf("%d", id.GetNum())
 }
 
 // graphSchema — the self-describing graph schema (T019). coverage_per_repo is
