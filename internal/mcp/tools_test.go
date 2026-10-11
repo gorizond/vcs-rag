@@ -359,13 +359,13 @@ func TestNormalizeRepoFilterAllTools(t *testing.T) {
 // T133-fix: the negative control — a full-path input and its short form build
 // the same payload filter (both resolved through the index).
 func TestNormalizeRepoFilterFullPathSameAsShort(t *testing.T) {
-	lister := &fakeRepoLister{repos: mkRepos("example-orgexample-group/gitops/databases")}
+	lister := &fakeRepoLister{repos: mkRepos("example/group/gitops/databases")}
 	tl := &tools{embedder: &mockEmbedder{}, repos: newRepoIndex(lister)}
 
 	msFull := &mockSearcher{}
 	tl.searcher = msFull
 	if _, _, err := tl.searchCode(context.Background(), nil, searchCodeInput{
-		Query: "x", Repo: "example-orgexample-group/gitops/databases"}); err != nil {
+		Query: "x", Repo: "example/group/gitops/databases"}); err != nil {
 		t.Fatal(err)
 	}
 	msShort := &mockSearcher{}
@@ -376,7 +376,7 @@ func TestNormalizeRepoFilterFullPathSameAsShort(t *testing.T) {
 	if !reflect.DeepEqual(msFull.gotFilter, msShort.gotFilter) {
 		t.Errorf("full path filter = %+v, short form = %+v", msFull.gotFilter, msShort.gotFilter)
 	}
-	want := store.Filter{GroupOrg: "example-orgexample-group/gitops", Repo: "databases", Type: "code"}
+	want := store.Filter{GroupOrg: "example/group/gitops", Repo: "databases", Type: "code"}
 	if !reflect.DeepEqual(msFull.gotFilter, want) {
 		t.Errorf("filter = %+v, want the stored pair %+v", msFull.gotFilter, want)
 	}
