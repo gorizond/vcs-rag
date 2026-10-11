@@ -15,6 +15,7 @@ import (
 
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/embed"
+	"github.com/gorizond/vcs-rag/internal/graph"
 	"github.com/gorizond/vcs-rag/internal/provider/factory"
 	"github.com/gorizond/vcs-rag/internal/store"
 )
@@ -44,6 +45,9 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	// T017–T019: the graph tools read the payload-only graph collection; the
 	// graph store shares the vector store's gRPC client (no second connection).
 	tl.graph = store.NewGraphStore(st, cfg.Qdrant.GraphCollection)
+	// T016: the aggregation fold caps come from configuration
+	// (MCP_GRAPH_AGG_MAX_SCANNED / MCP_GRAPH_AGG_MAX_GROUPS).
+	graph.SetAggCaps(cfg.MCP.GraphAggMaxScanned, cfg.MCP.GraphAggMaxGroups)
 	tl.graphSchemaVer = cfg.Worker.GraphSchemaVer
 	// T132: the repository list index resolves short-form repo filters without
 	// extra API calls; the provider constructor makes no network calls, and a

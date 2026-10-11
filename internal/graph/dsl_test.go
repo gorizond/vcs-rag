@@ -286,3 +286,64 @@ func TestTraverseFrontierScopedEdgeFilter(t *testing.T) {
 		t.Fatalf("hop filter widened to the package: %v", hop)
 	}
 }
+
+// T044: direction and edge-type validation of the compiler (the mode surface
+// itself is pinned in TestCompileModeValidation, ids_test.go).
+func TestCompileDirectionAndEdgeTypeValidation(t *testing.T) {
+	sel := graph.Filter{Repo: "r"}
+	if _, err := graph.Compile(graph.Query{Start: sel, Direction: "sideways"}); err == nil || !strings.Contains(err.Error(), "invalid direction") {
+		t.Fatalf("invalid direction: got %v", err)
+	}
+	for _, et := range []graph.EdgeType{
+		graph.EdgeImports, graph.EdgeDefines, graph.EdgeAuthored, graph.EdgeCommented,
+		graph.EdgeAssignedTo, graph.EdgeLabelled, graph.EdgeInMilestone, graph.EdgeExecutedBy,
+		"*", "",
+	} {
+		if _, err := graph.Compile(graph.Query{Start: sel, EdgeType: et}); err != nil {
+			t.Errorf("edge type %q rejected: %v", et, err)
+		}
+	}
+	if _, err := graph.Compile(graph.Query{Start: sel, EdgeType: "calls"}); err == nil || !strings.Contains(err.Error(), "invalid edge type") {
+		t.Fatalf("unknown edge type: got %v", err)
+	}
+}
+
+// T044: the start-entity discriminators, including the Orbit families (US2–US4):
+// every family compiles to its kind; definition and file share the node
+// discriminator (node_type=definition) and unknown entities are refused.
+func TestCompileStartEntityDiscriminators(t *testing.T) {
+	for _, tc := range []struct {
+		entity   graph.Entity
+		kind     string
+		nodeType string
+	}{
+		{graph.EntityDefinition, "node", "definition"},
+		{graph.EntityFile, "node", "definition"},
+		{graph.EntityMrFile, "mr_file", ""},
+		{graph.EntityCi, "ci", ""},
+		{graph.EntityVuln, "vuln", ""},
+		{graph.EntityUser, "user", ""},
+		{graph.EntityNote, "note", ""},
+		{graph.EntityWorkItem, "work_item", ""},
+		{graph.EntityMilestone, "milestone", ""},
+		{graph.EntityLabel, "label", ""},
+		{graph.EntityRunner, "runner", ""},
+	} {
+		c, err := graph.Compile(graph.Query{StartEntity: tc.entity, Start: graph.Filter{Repo: "r"}})
+		if err != nil {
+			t.Fatalf("entity %q: %v", tc.entity, err)
+		}
+		if !hasMatch(c.Start, "kind", tc.kind) {
+			t.Errorf("entity %q: compiled start misses kind=%q: %v", tc.entity, tc.kind, c.Start)
+		}
+		if tc.nodeType != "" && !hasMatch(c.Start, "node_type", tc.nodeType) {
+			t.Errorf("entity %q: compiled start misses node_type=%q: %v", tc.entity, tc.nodeType, c.Start)
+		}
+		if tc.nodeType == "" && hasMatch(c.Start, "node_type", "definition") {
+			t.Errorf("entity %q: unrelated families must not pin node_type: %v", tc.entity, c.Start)
+		}
+	}
+	if _, err := graph.Compile(graph.Query{StartEntity: "bogus", Start: graph.Filter{Repo: "r"}}); err == nil || !strings.Contains(err.Error(), "invalid start entity") {
+		t.Fatalf("unknown entity: got %v", err)
+	}
+}

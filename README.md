@@ -62,11 +62,17 @@ flowchart LR
   VCS[(GitLab / GitHub)] -->|list + fetch| D[discovery]
   D --> MI[mirror]
   MI --> CH[chunk + embed]
-  CH --> QD[(Qdrant)]
+  CH --> QD[("Qdrant: code + metadata (vcs_rag)")]
   MET["metadata: issues / MR / CI"] --> QD
   GC["GC: vanished repos and entities"] --> QD
+  MI --> GR["graph lane: scan + generation sweep"]
+  VCS -.->|SDLC listings| GR
+  GR -->|"nodes: definition, user, note, work_item, milestone, label, runner"| QDG[("Qdrant graph: vcs_rag_graph_*, payload-only, no vectors")]
+  GR -->|"edges: imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by"| QDG
   QD --> MCP[MCP server]
+  QDG --> MCP
   MCP -->|search_code, search_*| CL[LLM / IDE client]
+  MCP -->|"search_definitions, get_imports, get_dependents, graph_schema, query_graph (traversal / aggregation / path_finding / neighbors)"| CL
   MCP -->|index_status| KV[(status KV)]
   MCP -.->|refresh_repo, auto-refresh| NATS[NATS JetStream]
   NATS -.-> MET
@@ -77,9 +83,19 @@ The background lanes (discovery → mirror → index → metadata, plus the GC a
 graph lanes) keep the index fresh; the MCP server only reads Qdrant and, with
 NATS, can pull one repository on demand ([refresh flow](docs/refresh.md)) or
 refresh it automatically before a repo-scoped search (Auto freshness below).
-The graph lane writes a separate payload-only collection — definition nodes,
-import/defines edges and SDLC entities, no vectors
-([graph layer](docs/graph.md)).
+The graph lane writes a separate **payload-only** collection
+(`QDRANT_GRAPH_COLLECTION`, default `vcs_rag_graph`, instance-scoped) —
+definition nodes, `imports`/`defines` edges and the Orbit-parity families
+(user, note, work_item, milestone, label, runner) with their relations
+(`authored`, `commented`, `assigned_to`, `labelled`, `in_milestone`,
+`executed_by`), joined by canonical `node_key`/`from_key`/`to_key` refs and
+carrying **no vectors** (zero embeddings). Stale generations are removed by a
+mark-and-sweep GC after each successful repository scan
+([graph layer](docs/graph.md)); the MCP serves both collections — the search
+tools read code/metadata, the graph tools (`search_definitions`, `get_imports`,
+`get_dependents`, `graph_schema`, `query_graph`) read the graph. Real-time CDC
+is a non-goal — freshness comes from the periodic lanes (or an on-demand
+refresh).
 
 ## Key environment variables
 
@@ -98,7 +114,7 @@ explicitly listed project/repo), deduplicated. If only the allowlist is set
 (no group/org), index just those; an entry that cannot be fetched (404/403)
 is logged as a WARN and skipped.
 
-The complete reference — all 32 variables with defaults and secrets — is in
+The complete reference — all 39 variables with defaults and secrets — is in
 [`docs/env.md`](docs/env.md).
 
 Switching GitLab ↔ GitHub is env-only: the core does not change (both providers
@@ -330,10 +346,37 @@ worker/NATS tools:
 | `search_definitions` | symbol definitions from the graph; `mode=auto` (default) tries name matching first, then falls back to the semantic code search; `name` matches the symbol exactly or as a full-text token (no substring/prefix) |
 | `get_imports` | direct 1-hop package imports of a file or package (`direction=outgoing` default: what the input imports) |
 | `get_dependents` | direct 1-hop importers (`direction=incoming` default). **Package-level, not symbol-level**: the dependents of file X are the importers of X's package(s), not symbol referencers |
-| `query_graph` | structured N-hop traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`) + filters, optional edge selector (`imports`/`defines`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
+| `query_graph` | graph query family (`mode` = `traversal` default / `aggregation` / `path_finding` / `neighbors`, see below); traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`/`user`/`note`/`work_item`/`milestone`/`label`/`runner`) + filters, optional edge selector (`imports`/`defines`/`authored`/`commented`/`assigned_to`/`labelled`/`in_milestone`/`executed_by`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
 | `graph_schema` | self-describing graph schema: node/edge/entity types, query DSL version/operators, per-repo coverage markers |
 | `index_status` | worker indexing status (below) |
 | `refresh_repo` | on-demand refresh of one repository (registered only with `NATS_URL` set) |
+
+### Graph query modes (`query_graph`)
+
+`mode` selects the query family — `traversal` (default, above), `aggregation`,
+`path_finding` or `neighbors` (all four are declared by
+`graph_schema` → `query_dsl.modes`). Canonical keys identify a graph point:
+`repo|file:<path>`, `repo|pkg:<package>`, `user:<host>#<id>`,
+`repo|note#<id>`, `repo|wi:<type>#<iid>`, `repo|ms#<id>`,
+`lab:<scope>|<name>`, `runner:<host>#<id>`; see the
+[query DSL](docs/graph.md#query-dsl-query_graph). Every mode carries the
+coverage notice and `truncated`.
+
+- **aggregation** — grouped counts/values: `op` (`count` default; `sum`,
+  `avg`, `min`, `max` need `field`), `group_by` (comma = composite key),
+  `sort` (`key`/`count`/`value`, prefix `-` for descending) and `limit`
+  (default 30, max 1000). Ungrouped `count` is exact; the fold caps the scan
+  at **50 000** points and **10 000** groups (`MCP_GRAPH_AGG_MAX_*`). A fold
+  cut returns partial values with `truncated: true`; an exact grouped count
+  beyond the group cap is refused with `aggregation_cap_exceeded`.
+- **path_finding** — the shortest path between the canonical `from`/`to`
+  keys; `rel_types` (edge types) is **required**, `max_depth` is 1..3 (`hops`
+  is the alias). `status` is honest: `found`, `not_found`, or `inconclusive`
+  when a cap/coverage gap cut the search — never reported as `not_found`.
+- **neighbors** — the 1-hop peers of `node_key`: `direction` = `outgoing`
+  (default) / `incoming` / `both`, optional `rel_types`. A peer without a
+  stored node is a pseudo-node (`resolved: false`, no payload); a resolved
+  peer carries its node.
 
 ## Indexing status (`index_status`)
 
@@ -382,6 +425,10 @@ The published value lives in `worker_status_<instance id>` (key `status`, TTL
 
 - **Loopback by default**: the compose stacks publish Qdrant, NATS and MCP on
   `127.0.0.1`; the MCP server has no built-in authentication.
+- **The graph has no per-user ACL**: per-user authorization is an explicit
+  punt — `MCP_AUTHZ_ENABLED` is a reserved no-op and nothing filters results by
+  user; the query tools serve the instance's whole graph to a trusted loopback
+  consumer ([graph layer](docs/graph.md#authz-and-freshness-scope)).
 - For remote clients expose only the MCP endpoint through a reverse proxy with
   **TLS and auth** (e.g. an ingress with basic auth / an OIDC proxy); keep
   Qdrant and NATS private.

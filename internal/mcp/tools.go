@@ -52,6 +52,10 @@ const codeInvalidInput = "invalid_input"
 // (T035/T037, R5): the compiler refuses it instead of scanning the collection.
 const codeNonSelective = "non_selective_query"
 
+// codeAggCapExceeded — an exact aggregation hit the configured group cap
+// (T012): the query is refused instead of returning a partial exact count.
+const codeAggCapExceeded = "aggregation_cap_exceeded"
+
 // tools — MCP tool implementations on top of narrow interfaces.
 type tools struct {
 	embedder  Embedder
@@ -133,14 +137,30 @@ type graphSchemaInput struct {
 	Repo string `json:"repo,omitempty" jsonschema:"optional repo scope for coverage_per_repo"`
 }
 
-// queryGraphInput — T037 (contracts/mcp-tools.md query_graph): start entity
-// plus filters, an optional edge selector, hops/limit and global filters.
+// queryGraphInput — T037/T016 (contracts/mcp-tools.md query_graph): the query
+// family (mode; empty = traversal), the start entity plus filters, an optional
+// edge selector, hops/limit, global filters, and the mode-specific arguments
+// (canonical keys for path_finding/neighbors, aggregation knobs).
 type queryGraphInput struct {
-	Start   queryGraphStart `json:"start" jsonschema:"start entity (entity + filters)"`
-	Edge    queryGraphEdge  `json:"edge,omitempty" jsonschema:"optional edge selector of the expansion"`
-	Hops    int             `json:"hops,omitempty" jsonschema:"traversal depth: 1..3; 3 is the server cap (default 1)"`
-	Limit   int             `json:"limit,omitempty" jsonschema:"result limit: default 30, maximum 1000"`
-	Filters map[string]any  `json:"filters,omitempty" jsonschema:"global filters applied to the start and expansion points; at least one selective predicate (repo|file_path|from_file|to_package|from_package|symbol|mr_id) is required"`
+	// Mode selects the query family (T016); empty defaults to traversal,
+	// preserving the pre-parity behaviour.
+	Mode      string          `json:"mode,omitempty" jsonschema:"query family: traversal (default) | aggregation | path_finding | neighbors"`
+	Start     queryGraphStart `json:"start,omitempty" jsonschema:"start entity (entity + filters); traversal only"`
+	Edge      queryGraphEdge  `json:"edge,omitempty" jsonschema:"optional edge selector of the expansion"`
+	Hops      int             `json:"hops,omitempty" jsonschema:"traversal: depth 1..3; path_finding: same as max_depth (default 1, cap 3)"`
+	Limit     int             `json:"limit,omitempty" jsonschema:"result limit: default 30, maximum 1000"`
+	Filters   map[string]any  `json:"filters,omitempty" jsonschema:"global filters applied to the start and expansion points; at least one selective predicate (repo|file_path|from_file|to_package|from_package|symbol|mr_id|node_key|from_key|to_key) is required"`
+	From      string          `json:"from,omitempty" jsonschema:"path_finding: canonical from_key (e.g. \"repo|file:path\")"`
+	To        string          `json:"to,omitempty" jsonschema:"path_finding: canonical to_key"`
+	Type      string          `json:"type,omitempty" jsonschema:"path_finding: shortest (default; the only kind)"`
+	MaxDepth  int             `json:"max_depth,omitempty" jsonschema:"path_finding: max depth 1..3 (clamped; default 1)"`
+	NodeKey   string          `json:"node_key,omitempty" jsonschema:"neighbors: canonical node_key of the centre (e.g. \"repo|file:path\")"`
+	Direction string          `json:"direction,omitempty" jsonschema:"neighbors: outgoing | incoming | both (default outgoing; edge.direction takes precedence)"`
+	RelTypes  []string        `json:"rel_types,omitempty" jsonschema:"path_finding (required) / neighbors: relation edge_type values"`
+	Op        string          `json:"op,omitempty" jsonschema:"aggregation: count | sum | avg | min | max (default count)"`
+	Field     string          `json:"field,omitempty" jsonschema:"aggregation: value field for sum/avg/min/max"`
+	GroupBy   string          `json:"group_by,omitempty" jsonschema:"aggregation: group column (comma = composite key)"`
+	Sort      string          `json:"sort,omitempty" jsonschema:"aggregation: sort column (key | count | value); prefix - for descending"`
 }
 
 // queryGraphStart — the DSL start selector: entity ∈ definition|file|mr_file|
@@ -259,6 +279,58 @@ type queryGraphResponse struct {
 	Truncated bool             `json:"truncated"`
 }
 
+// aggregationResponse — T016, mode=aggregation: the group rows (key + the
+// group count + the op value) and the truncation flag (a fold/limit cap cut
+// the answer; an exact-count cap over the group ceiling is refused instead).
+type aggregationResponse struct {
+	Groups    []aggGroupView `json:"groups"`
+	Coverage  []coverage     `json:"coverage"`
+	Truncated bool           `json:"truncated"`
+}
+
+// aggGroupView is one aggregation row; Value equals Count for op=count.
+type aggGroupView struct {
+	Key   string  `json:"key"`
+	Count uint64  `json:"count"`
+	Value float64 `json:"value"`
+}
+
+// pathResponse — T016, mode=path_finding: the honest status ("found",
+// "not_found", or "inconclusive" when a cap/coverage gap cut the search), the
+// found path (canonical node keys in order) with one edge per hop, and the
+// coverage notice.
+type pathResponse struct {
+	Status    string         `json:"status"`
+	Path      []string       `json:"path"`
+	Edges     []pathEdgeView `json:"edges"`
+	Coverage  []coverage     `json:"coverage"`
+	Truncated bool           `json:"truncated"`
+}
+
+// pathEdgeView is one hop of a found path, in stored edge direction.
+type pathEdgeView struct {
+	FromKey  string `json:"from_key"`
+	ToKey    string `json:"to_key"`
+	EdgeType string `json:"edge_type"`
+}
+
+// neighborsResponse — T016, mode=neighbors: the 1-hop peers; resolved peers
+// carry their stored node (payload + id), unresolved ones are pseudo-nodes.
+type neighborsResponse struct {
+	Neighbors []neighborView `json:"neighbors"`
+	Coverage  []coverage     `json:"coverage"`
+	Truncated bool           `json:"truncated"`
+}
+
+// neighborView is one peer of the centre; Node is present only when resolved.
+type neighborView struct {
+	Key       string         `json:"key"`
+	Type      string         `json:"type,omitempty"`
+	Resolved  bool           `json:"resolved"`
+	EdgeTypes []string       `json:"edge_types,omitempty"`
+	Node      map[string]any `json:"node,omitempty"`
+}
+
 // graphSchemaResponse — the self-description of the graph collection (T019).
 type graphSchemaResponse struct {
 	NodeTypes       []nodeTypeSpec   `json:"node_types"`
@@ -287,6 +359,7 @@ type entityTypeSpec struct {
 
 type queryDSL struct {
 	Version   string   `json:"version"`
+	Modes     []string `json:"modes"`
 	Operators []string `json:"operators"`
 }
 
@@ -394,18 +467,24 @@ func registerTools(server *mcp.Server, t *tools) {
 	}, t.getDependents)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "query_graph",
-		Description: "Unified structured traversal (US5): start entity (definition|file|mr_file|ci|vuln) + filters, optional edge " +
-			"selector (type imports|defines|*, direction outgoing|incoming), hops 1..3 (default 1), limit default 30 max 1000. " +
+		Description: "Unified structured graph query (US5, T016): mode=traversal (default) walks the start entity " +
+			"(definition|file|mr_file|ci|vuln) + filters over an optional edge selector (type imports|defines|*, direction " +
+			"outgoing|incoming), hops 1..3, limit default 30 max 1000. mode=aggregation groups by op (count|sum|avg|min|max) " +
+			"over field with group_by/sort. mode=path_finding finds the shortest path between the canonical from/to keys " +
+			"(rel_types required; max_depth 1..3; status found|not_found|inconclusive). mode=neighbors lists the 1-hop " +
+			"neighbours of node_key (direction outgoing|incoming|both, optional rel_types). " +
 			"Filters are Qdrant operators on indexed payload fields: scalar = exact match, list = in/match-any, null = is_null, " +
 			"{gt,gte,lt,lte} = numeric range. REQUIRED: at least one selective predicate " +
-			"(repo|file_path|from_file|to_package|from_package|symbol|mr_id) — a filter on kind/branch alone is rejected with " +
+			"(repo|file_path|from_file|to_package|from_package|symbol|mr_id|node_key|from_key|to_key) — a filter on kind/branch alone is rejected with " +
 			"error code non_selective_query instead of scanning. Caps cut the walk and set truncated=true. " +
-			"The result object is {\"results\": [{...payload, id}], \"coverage\": [...], \"truncated\": bool}.",
+			"The result object is {\"results\": [{...payload, id}], \"coverage\": [...], \"truncated\": bool}; aggregation answers " +
+			"{\"groups\": [{key,count,value}], ...}, path_finding {\"path\": [...], \"status\": ..., ...}, neighbors {\"neighbors\": [...]}.",
 	}, t.queryGraph)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "graph_schema",
-		Description: "Self-describing graph schema: node types (definition) with indexed properties, edge types (imports, defines), " +
-			"declared entity types (mr_file, ci, vuln), the query DSL version/operators, and coverage_per_repo " +
+		Description: "Self-describing graph schema: node types (definition, user, note, work_item, milestone, label, runner) with indexed properties, " +
+			"edge types (imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by), " +
+			"entity types (mr_file; ci and vuln implemented, vuln gated on provider API/role), the query DSL version/operators, and coverage_per_repo " +
 			"(repo, indexed_commit, generation, indexed_at, languages_with_resolvers) from the per-repo coverage markers — " +
 			"best-effort, empty when no scan has completed yet.",
 	}, t.graphSchema)
@@ -781,7 +860,7 @@ func (t *tools) graphEdges(ctx context.Context, in graphEdgesInput, defaultDir s
 	return nil, importsResponse{Results: edges, Coverage: cov}, nil
 }
 
-// --- query_graph (T037) ---
+// --- query_graph (T037/T016) ---
 
 // graphScroller adapts the tools' GraphReader to graph.Scroller (the same
 // single method): the traversal stays pure logic over an injected scanner.
@@ -791,11 +870,46 @@ func (s graphScroller) ScrollAll(ctx context.Context, f *qdrant.Filter, limit ui
 	return s.g.ScrollAll(ctx, f, limit)
 }
 
-// queryGraph — the unified structured traversal (T037, FR-016/017): the DSL is
-// compiled by graph.Compile (selectivity guard + hops/limit caps) and executed
-// by graph.Traverse over the graph store. A non-selective query is rejected
-// with code non_selective_query BEFORE any scan (R5); a cap cut is reported as
-// truncated:true, never as a failure.
+// graphAggReader is the exact-aggregation surface of the production graph
+// store (*store.GraphStore): Count and Facet, which the narrow GraphReader
+// does not carry.
+type graphAggReader interface {
+	Count(ctx context.Context, f *qdrant.Filter) (uint64, error)
+	Facet(ctx context.Context, key string, f *qdrant.Filter, limit uint64) (map[string]uint64, error)
+}
+
+// graphAggregator adapts the tools' graph store to graph.Aggregator (T016):
+// ScrollAll forwards to the injected reader, Count/Facet forward when the
+// underlying value exposes them (the production store does).
+type graphAggregator struct{ g GraphReader }
+
+func (a graphAggregator) ScrollAll(ctx context.Context, f *qdrant.Filter, limit uint32) ([]*qdrant.RetrievedPoint, error) {
+	return a.g.ScrollAll(ctx, f, limit)
+}
+
+func (a graphAggregator) Count(ctx context.Context, f *qdrant.Filter) (uint64, error) {
+	s, ok := a.g.(graphAggReader)
+	if !ok {
+		return 0, errGraphStore
+	}
+	return s.Count(ctx, f)
+}
+
+func (a graphAggregator) Facet(ctx context.Context, key string, f *qdrant.Filter, limit uint64) (map[string]uint64, error) {
+	s, ok := a.g.(graphAggReader)
+	if !ok {
+		return nil, errGraphStore
+	}
+	return s.Facet(ctx, key, f, limit)
+}
+
+// queryGraph — the unified structured graph query (T037/T016, FR-016/017):
+// mode selects the family (traversal default, so the pre-parity pipeline is
+// unchanged); every mode compiles through graph.Compile's selectivity guard
+// and runs one of the graph engines over the graph store. A non-selective
+// query is rejected with code non_selective_query BEFORE any scan (R5); a cap
+// cut is reported as truncated:true (or an honest "inconclusive" path), never
+// as a failure.
 func (t *tools) queryGraph(ctx context.Context, _ *mcp.CallToolRequest, in queryGraphInput) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
@@ -806,13 +920,23 @@ func (t *tools) queryGraph(ctx context.Context, _ *mcp.CallToolRequest, in query
 	if err != nil {
 		return nil, toolError{Code: codeInvalidInput, Message: err.Error()}, nil
 	}
-	// Compile explicitly: its validation must reject the query before any scan
-	// (Traverse compiles internally too; this call only classifies the error).
-	if _, err := graph.Compile(q); err != nil {
-		if errors.Is(err, graph.ErrNonSelective) {
-			return nil, errorResult(ctx, codeNonSelective, err), nil
+	// Shared pre-flight of the compiling modes (traversal/aggregation/
+	// path_finding): validation and the selectivity guard reject the query
+	// before any scan, keeping the contractual codes. Every engine recompiles
+	// internally; this call only classifies. neighbors compiles nowhere (its
+	// "both" direction is outside the traversal Directions).
+	if q.Mode != graph.ModeNeighbors {
+		if out, rejected := compileCheck(ctx, q); rejected {
+			return nil, out, nil
 		}
-		return nil, toolError{Code: codeInvalidInput, Message: err.Error()}, nil
+	}
+	switch q.Mode {
+	case graph.ModeAggregation:
+		return t.queryGraphAggregation(ctx, in, q)
+	case graph.ModePathFinding:
+		return t.queryGraphPath(ctx, in, q)
+	case graph.ModeNeighbors:
+		return t.queryGraphNeighbors(ctx, in, q)
 	}
 	res, err := graph.Traverse(ctx, graphScroller{g: t.graph}, q, graph.Coverage{})
 	if err != nil {
@@ -831,10 +955,116 @@ func (t *tools) queryGraph(ctx context.Context, _ *mcp.CallToolRequest, in query
 	return nil, queryGraphResponse{Results: hits, Coverage: cov, Truncated: res.Truncated}, nil
 }
 
-// graphQuery maps the wire DSL to graph.Query: the start and global filter maps
-// become raw Qdrant conditions, the edge selector sets type/direction, hops and
-// limit pass through (graph.Compile clamps them).
+// queryGraphAggregation — mode=aggregation (T016): graph.Aggregate over the
+// graph store. The scan/group caps are the package-global graph.AggCaps,
+// seeded from MCP_GRAPH_AGG_MAX_* at server start; an exact-count group cap
+// is an honest refusal (aggregation_cap_exceeded), a fold cap sets truncated.
+func (t *tools) queryGraphAggregation(ctx context.Context, in queryGraphInput, q graph.Query) (*mcp.CallToolResult, any, error) {
+	res, err := graph.Aggregate(ctx, graphAggregator{g: t.graph}, q)
+	if err != nil {
+		return nil, graphEngineError(ctx, err), nil
+	}
+	groups := make([]aggGroupView, 0, len(res.Groups))
+	for _, g := range res.Groups {
+		groups = append(groups, aggGroupView{Key: g.Key, Count: g.Count, Value: g.Value})
+	}
+	cov, err := t.coverageNotice(ctx, queryRepos(in, nil), nil)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	return nil, aggregationResponse{Groups: groups, Coverage: cov, Truncated: res.Truncated}, nil
+}
+
+// queryGraphPath — mode=path_finding (T016): graph.ShortestPath between the
+// canonical from/to keys. "inconclusive" is preserved verbatim: a cap or a
+// coverage gap must never be reported as "not_found".
+func (t *tools) queryGraphPath(ctx context.Context, in queryGraphInput, q graph.Query) (*mcp.CallToolResult, any, error) {
+	res, err := graph.ShortestPath(ctx, graphScroller{g: t.graph}, q, graph.Coverage{})
+	if err != nil {
+		return nil, graphEngineError(ctx, err), nil
+	}
+	edges := make([]pathEdgeView, 0, len(res.Edges))
+	for _, e := range res.Edges {
+		edges = append(edges, pathEdgeView{FromKey: e.FromKey, ToKey: e.ToKey, EdgeType: e.EdgeType})
+	}
+	cov, err := t.coverageNotice(ctx, queryRepos(in, nil, q.FromKey, q.ToKey), nil)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	return nil, pathResponse{
+		Status: string(res.Status), Path: res.Nodes, Edges: edges,
+		Coverage: cov, Truncated: res.Truncated,
+	}, nil
+}
+
+// queryGraphNeighbors — mode=neighbors (T016): the 1-hop peers of the
+// canonical node_key. Resolved peers carry their stored node payload; the rest
+// are honest pseudo-nodes (resolved:false).
+func (t *tools) queryGraphNeighbors(ctx context.Context, in queryGraphInput, q graph.Query) (*mcp.CallToolResult, any, error) {
+	res, err := graph.Neighbors(ctx, graphScroller{g: t.graph}, q)
+	if err != nil {
+		return nil, graphEngineError(ctx, err), nil
+	}
+	views := make([]neighborView, 0, len(res.Neighbors))
+	var nodes []*qdrant.RetrievedPoint
+	for _, n := range res.Neighbors {
+		v := neighborView{Key: n.Key, Type: n.Type, Resolved: n.Resolved, EdgeTypes: n.EdgeTypes}
+		if n.Node != nil {
+			m := payloadMap(n.Node)
+			m["id"] = queryPointID(n.Node.GetId())
+			v.Node = m
+			nodes = append(nodes, n.Node)
+		}
+		views = append(views, v)
+	}
+	cov, err := t.coverageNotice(ctx, queryRepos(in, nodes, q.NodeKey), nil)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	return nil, neighborsResponse{Neighbors: views, Coverage: cov, Truncated: res.Truncated}, nil
+}
+
+// compileCheck is the shared pre-flight of the compiling modes: a compile
+// failure answers invalid_input, a non-selective query keeps the contractual
+// non_selective_query code — both rejected before any scan.
+func compileCheck(ctx context.Context, q graph.Query) (out any, rejected bool) {
+	_, err := graph.Compile(q)
+	if err == nil {
+		return nil, false
+	}
+	if errors.Is(err, graph.ErrNonSelective) {
+		return errorResult(ctx, codeNonSelective, err), true
+	}
+	return toolError{Code: codeInvalidInput, Message: err.Error()}, true
+}
+
+// graphEngineError classifies a graph-engine error onto the tool error
+// contract: the contractual tokens keep their codes (non_selective_query,
+// aggregation_cap_exceeded); rel_types_required is an input validation error;
+// the rest are store failures.
+func graphEngineError(ctx context.Context, err error) toolError {
+	switch {
+	case errors.Is(err, graph.ErrNonSelective):
+		return errorResult(ctx, codeNonSelective, err)
+	case errors.Is(err, graph.ErrAggCapExceeded):
+		return errorResult(ctx, codeAggCapExceeded, err)
+	case errors.Is(err, graph.ErrRelTypesRequired):
+		return toolError{Code: codeInvalidInput, Message: err.Error()}
+	}
+	return errorResult(ctx, codeSearchFailed, err)
+}
+
+// graphQuery maps the wire DSL to graph.Query: mode selects the family (empty
+// = traversal), start and global filter maps become raw Qdrant conditions, the
+// edge selector sets type/direction, hops and limit pass through (Compile
+// clamps them), and the mode-specific arguments (canonical keys, rel_types,
+// aggregation knobs) are carried over. Mode-argument validation happens here,
+// before any engine runs.
 func (in queryGraphInput) graphQuery() (graph.Query, error) {
+	mode, err := parseGraphMode(in.Mode)
+	if err != nil {
+		return graph.Query{}, err
+	}
 	start, err := queryConditions(in.Start.Filters)
 	if err != nil {
 		return graph.Query{}, err
@@ -843,15 +1073,86 @@ func (in queryGraphInput) graphQuery() (graph.Query, error) {
 	if err != nil {
 		return graph.Query{}, err
 	}
-	return graph.Query{
+	dir := in.Edge.Direction
+	if dir == "" {
+		dir = in.Direction // neighbors shorthand; edge.direction wins when set
+	}
+	q := graph.Query{
+		Mode:        mode,
 		StartEntity: graph.Entity(in.Start.Entity),
 		Start:       graph.Filter{Conditions: start},
 		Filter:      graph.Filter{Conditions: global},
 		EdgeType:    graph.EdgeType(in.Edge.Type),
-		Direction:   graph.Direction(in.Edge.Direction),
+		Direction:   graph.Direction(dir),
 		Hops:        in.Hops,
 		Limit:       in.Limit,
-	}, nil
+		FromKey:     strings.TrimSpace(in.From),
+		ToKey:       strings.TrimSpace(in.To),
+		NodeKey:     strings.TrimSpace(in.NodeKey),
+		RelTypes:    in.RelTypes,
+		AggOp:       strings.ToLower(strings.TrimSpace(in.Op)),
+		AggField:    strings.TrimSpace(in.Field),
+		GroupBy:     strings.TrimSpace(in.GroupBy),
+		Sort:        strings.TrimSpace(in.Sort),
+	}
+	switch q.Mode {
+	case graph.ModeAggregation:
+		if err := validateAggArgs(q); err != nil {
+			return graph.Query{}, err
+		}
+	case graph.ModePathFinding:
+		if q.FromKey == "" || q.ToKey == "" {
+			return graph.Query{}, errors.New("path_finding requires both from and to")
+		}
+		if t := strings.TrimSpace(in.Type); t != "" && t != "shortest" {
+			return graph.Query{}, fmt.Errorf(`path_finding type must be "shortest" (got %q)`, in.Type)
+		}
+		if in.MaxDepth > 0 {
+			q.Hops = in.MaxDepth
+		}
+	case graph.ModeNeighbors:
+		if q.NodeKey == "" {
+			return graph.Query{}, errors.New("neighbors requires node_key")
+		}
+		switch q.Direction {
+		case "", graph.Outgoing, graph.Incoming, graph.DirectionBoth:
+		default:
+			return graph.Query{}, fmt.Errorf("neighbors direction must be outgoing, incoming or both (got %q)", dir)
+		}
+	}
+	return q, nil
+}
+
+// parseGraphMode normalizes the wire mode; empty defaults to traversal, an
+// unknown mode is a validation error before any scan.
+func parseGraphMode(raw string) (graph.Mode, error) {
+	switch mode := graph.Mode(strings.ToLower(strings.TrimSpace(raw))); mode {
+	case "":
+		return graph.ModeTraversal, nil
+	case graph.ModeTraversal, graph.ModeAggregation, graph.ModePathFinding, graph.ModeNeighbors:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("mode must be \"traversal\", \"aggregation\", \"path_finding\" or \"neighbors\" (got %q)", raw)
+	}
+}
+
+// validateAggArgs is the cheap wire validation of the aggregation arguments
+// (graph.Aggregate re-validates): the op enum and the field requirement of
+// the fold ops.
+func validateAggArgs(q graph.Query) error {
+	op := q.AggOp
+	if op == "" {
+		op = "count"
+	}
+	switch op {
+	case "count", "sum", "avg", "min", "max":
+	default:
+		return fmt.Errorf("aggregation op must be count, sum, avg, min or max (got %q)", q.AggOp)
+	}
+	if op != "count" && q.AggField == "" {
+		return fmt.Errorf("aggregation op %q requires field", op)
+	}
+	return nil
 }
 
 // queryConditions compiles a DSL filter map into Qdrant conditions, one per
@@ -956,10 +1257,11 @@ func queryRangeCondition(field string, spec map[string]any) (*qdrant.Condition, 
 }
 
 // queryRepos collects the repos a query touched: the explicit repo filter (a
-// string or a list) of the start and global filter maps plus the repos of the
-// returned points — even an empty result then carries a coverage notice for
-// the scoped repo (data-model §9: every graph answer carries coverage).
-func queryRepos(in queryGraphInput, pts []*qdrant.RetrievedPoint) []string {
+// string or a list) of the start and global filter maps, the repos of the
+// returned points, and the repos carried by canonical keys (from/to/node_key)
+// — even an empty result then carries a coverage notice for the scoped repo
+// (data-model §9: every graph answer carries coverage).
+func queryRepos(in queryGraphInput, pts []*qdrant.RetrievedPoint, keys ...string) []string {
 	seen := map[string]bool{}
 	var repos []string
 	add := func(repo string) {
@@ -980,11 +1282,29 @@ func queryRepos(in queryGraphInput, pts []*qdrant.RetrievedPoint) []string {
 			}
 		}
 	}
+	for _, k := range keys {
+		add(refRepo(k))
+	}
 	for _, p := range pts {
 		add(payloadString(payloadMap(p), "repo"))
 	}
 	sort.Strings(repos)
 	return repos
+}
+
+// refRepo is the repository scope of a canonical payload key: repo-scoped
+// forms are "repo|file:…", "repo|pkg:…", "repo|wi:…#…" (data-model §0);
+// user/runner/label keys carry no repo.
+func refRepo(key string) string {
+	for _, prefix := range []string{"user:", "runner:", "lab:"} {
+		if strings.HasPrefix(key, prefix) {
+			return ""
+		}
+	}
+	if i := strings.IndexByte(key, '|'); i > 0 {
+		return key[:i]
+	}
+	return ""
 }
 
 // queryPointID renders a point ID (UUID or numeric) for the response.
@@ -1014,24 +1334,75 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 		}
 		cov = marks
 	}
+	// Node/edge families per internal/graph + the store.graphIndexFields index
+	// list: properties mirror the builder payloads, indexed is the indexed
+	// subset (datetime fields index as datetime; body/title/description and
+	// generation/indexed_at stay unindexed).
 	return nil, graphSchemaResponse{
-		NodeTypes: []nodeTypeSpec{{
-			Name:       string(graph.NodeDefinition),
-			Properties: []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path", "signature", "commit_sha"},
-			Indexed:    []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path"},
-		}},
+		NodeTypes: []nodeTypeSpec{
+			{
+				Name:       string(graph.NodeDefinition),
+				Properties: []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path", "signature", "commit_sha"},
+				Indexed:    []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path"},
+			},
+			{
+				Name:       string(graph.KindUser),
+				Properties: []string{"node_key", "vcs_user_id", "vcs_host", "login", "name", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "vcs_user_id", "login", "name", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindNote),
+				Properties: []string{"node_key", "note_id", "parent_key", "author_key", "system", "body", "created_at", "updated_at", "last_seen_at", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "parent_key", "author_key", "created_at", "updated_at", "last_seen_at", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindWorkItem),
+				Properties: []string{"node_key", "item_id", "item_type", "state", "title", "updated_at", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "item_id", "item_type", "state", "updated_at", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindMilestone),
+				Properties: []string{"node_key", "ms_id", "title", "state", "due_date", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "ms_id", "state", "due_date", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindLabel),
+				Properties: []string{"node_key", "label_key", "name", "scope", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "label_key", "name", "scope", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindRunner),
+				Properties: []string{"node_key", "runner_id", "vcs_host", "description", "state", "runner_type", "tags", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "runner_id", "runner_type", "tags", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+		},
 		EdgeTypes: []edgeTypeSpec{
 			{Name: string(graph.EdgeImports), From: "file", To: "package"},
 			{Name: string(graph.EdgeDefines), From: "file", To: "symbol"},
+			{Name: string(graph.EdgeAuthored), From: "work_item", To: "user"},
+			{Name: string(graph.EdgeCommented), From: "note", To: "user"},
+			{Name: string(graph.EdgeAssignedTo), From: "work_item", To: "user"},
+			{Name: string(graph.EdgeLabelled), From: "work_item", To: "label"},
+			{Name: string(graph.EdgeInMilestone), From: "work_item", To: "milestone"},
+			{Name: string(graph.EdgeExecutedBy), From: "ci", To: "runner"},
 		},
 		EntityTypes: []entityTypeSpec{
 			{Name: string(graph.KindMrFile), Description: "per-file MR/PR diffs (search_pull_requests file_path)"},
-			{Name: string(graph.KindCi), Description: "declared — extraction not implemented yet"},
-			{Name: string(graph.KindVuln), Description: "declared — extraction not implemented yet"},
+			{Name: string(graph.KindCi), Description: "CI failure points (pipeline/job) — implemented"},
+			{Name: string(graph.KindVuln), Description: "vulnerabilities — implemented, gated on provider API/role"},
 		},
 		QueryDSL: queryDSL{
-			Version:   ver,
-			Operators: []string{"match", "match_text", "in", "range", "is_null"},
+			Version: ver,
+			Modes: []string{
+				string(graph.ModeTraversal), string(graph.ModeAggregation),
+				string(graph.ModePathFinding), string(graph.ModeNeighbors),
+			},
+			// Aggregation + path operators are declared next to the filter
+			// operators (contracts/mcp-tools.md, T017).
+			Operators: []string{
+				"match", "match_text", "in", "range", "is_null",
+				"count", "sum", "avg", "min", "max", "group_by", "sort", "shortest",
+			},
 		},
 		CoveragePerRepo: cov,
 	}, nil

@@ -19,7 +19,7 @@ var allEnv = []string{
 	"WORKER_GC_INTERVAL", "WORKER_GC_DRY_RUN", "WORKER_DISCOVERY_MIN_INTERVAL",
 	"WORKER_CONCURRENCY", "MIRRORS_DIR",
 	"HISTORY_MAX_COMMITS", "MAX_FILE_BYTES", "CI_WINDOW",
-	"MCP_TRANSPORT", "MCP_ADDR",
+	"MCP_TRANSPORT", "MCP_ADDR", "MCP_AUTHZ_ENABLED",
 	"NATS_URL", "NATS_INSTANCE_ID",
 }
 
@@ -81,6 +81,10 @@ func TestLoadValid(t *testing.T) {
 				}
 				if cfg.MCP.Transport != "stdio" || cfg.MCP.Addr != ":8080" {
 					t.Errorf("default mcp: %+v", cfg.MCP)
+				}
+				// T041: the authz flag is an explicit no-op punt, off by default.
+				if cfg.MCP.AuthzEnabled {
+					t.Error("AuthzEnabled = true, want the false no-op default")
 				}
 				// T108/T117: empty NATS_URL — the refresh mode is off (default instance).
 				if cfg.NATS.URL != "" || cfg.NATS.InstanceID != NATSDefaultInstance {
@@ -307,6 +311,21 @@ func TestLoadValid(t *testing.T) {
 			check: func(t *testing.T, cfg *Config) {
 				if cfg.Worker.DiscoveryMinInterval != 10*time.Minute {
 					t.Errorf("DiscoveryMinInterval = %v, want 10m", cfg.Worker.DiscoveryMinInterval)
+				}
+			},
+		},
+		{
+			// T041: the flag parses, but it filters nothing — a no-op punt.
+			name: "mcp: authz flag is parsed and a no-op",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":     "1",
+				"GITLAB_TOKEN":        "t",
+				"EMBEDDINGS_PROVIDER": "ollama",
+				"MCP_AUTHZ_ENABLED":   "true",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				if !cfg.MCP.AuthzEnabled {
+					t.Error("MCP_AUTHZ_ENABLED=true was not loaded")
 				}
 			},
 		},

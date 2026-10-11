@@ -1,6 +1,10 @@
 package store
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/qdrant/go-client/qdrant"
+)
 
 // TestGraphMatchAnyChunking pins the pure MatchAny helpers ScrollAll relies
 // on: the empty-list short-circuit and the <=1000-per-request chunking.
@@ -43,5 +47,66 @@ func TestGraphMatchAnyChunking(t *testing.T) {
 	small := chunkStrings([]string{"x", "y", "z"}, maxMatchAny)
 	if len(small) != 1 || len(small[0]) != 3 {
 		t.Fatalf("small input: want one 3-element chunk, got %v", small)
+	}
+}
+
+func containsField(fields []string, want string) bool {
+	for _, f := range fields {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestGraphIndexFieldsOrbitParity pins the T004 index declaration: the
+// canonical key/type fields, the new node-family fields and their datetime
+// classification, with body/title deliberately unindexed.
+func TestGraphIndexFieldsOrbitParity(t *testing.T) {
+	for _, f := range []string{
+		"node_key", "from_key", "to_key", "from_type", "to_type",
+		"vcs_user_id", "login", "name", "parent_key", "author_key",
+		"item_id", "item_type", "ms_id", "label_key", "scope",
+		"runner_id", "runner_type", "tags",
+		"created_at", "updated_at", "due_date", "last_seen_at",
+	} {
+		if !containsField(graphIndexFields, f) {
+			t.Errorf("graphIndexFields misses %q", f)
+		}
+	}
+	for _, f := range []string{"body", "title"} {
+		if containsField(graphIndexFields, f) || graphOnDiskIndexFields[f] {
+			t.Errorf("%q must never be indexed (bodies stay unindexed)", f)
+		}
+	}
+	for _, f := range []string{"created_at", "updated_at", "due_date", "last_seen_at"} {
+		if !graphDatetimeIndexFields[f] {
+			t.Errorf("%q must be classified as datetime", f)
+		}
+	}
+	for _, f := range []string{"node_key", "from_key", "to_key", "parent_key"} {
+		if !graphOnDiskIndexFields[f] {
+			t.Errorf("%q must be indexed on disk", f)
+		}
+	}
+}
+
+// TestFacetValueKey pins the facet value rendering: keyword facets arrive as
+// strings, integer/datetime facets as integers, bool facets as bools.
+func TestFacetValueKey(t *testing.T) {
+	for _, tc := range []struct {
+		v    *qdrant.FacetValue
+		want string
+	}{
+		{qdrant.NewFacetValue("imports"), "imports"},
+		{&qdrant.FacetValue{Variant: &qdrant.FacetValue_IntegerValue{IntegerValue: 42}}, "42"},
+		{&qdrant.FacetValue{Variant: &qdrant.FacetValue_IntegerValue{IntegerValue: -1}}, "-1"},
+		{&qdrant.FacetValue{Variant: &qdrant.FacetValue_BoolValue{BoolValue: true}}, "true"},
+		{&qdrant.FacetValue{Variant: &qdrant.FacetValue_BoolValue{BoolValue: false}}, "false"},
+		{&qdrant.FacetValue{}, ""},
+	} {
+		if got := facetValueKey(tc.v); got != tc.want {
+			t.Errorf("facetValueKey(%v) = %q, want %q", tc.v, got, tc.want)
+		}
 	}
 }

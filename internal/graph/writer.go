@@ -52,8 +52,11 @@ func symbolName(d chunk.GraphDefinition) string {
 }
 
 // DefinitionPoints builds the definition nodes (kind=node,
-// node_type=definition) of one file's extracted definitions. Pure: no client,
-// no I/O.
+// node_type=definition) of one file's extracted definitions. node_key is the
+// file's canonical ref (RefFile), not a per-symbol key: a file IS its
+// definition nodes (R1), so this is the key file endpoints of imports/defines
+// edges resolve to by node_key in path/neighbors (T007/T014). The key is
+// additive; the deterministic ID is unchanged. Pure: no client, no I/O.
 func DefinitionPoints(meta Meta, defs []chunk.GraphDefinition) []*qdrant.PointStruct {
 	ns := Namespace(meta.SchemaVer)
 	out := make([]*qdrant.PointStruct, 0, len(defs))
@@ -64,6 +67,7 @@ func DefinitionPoints(meta Meta, defs []chunk.GraphDefinition) []*qdrant.PointSt
 			Payload: valueMap(map[string]any{
 				"kind":        string(KindNode),
 				"node_type":   string(NodeDefinition),
+				"node_key":    RefFile(meta.Repo, d.FilePath),
 				"symbol":      sym,
 				"symbol_text": sym, // text index (search_definitions match.text)
 				"symbol_kind": d.Kind,
@@ -85,9 +89,19 @@ func DefinitionPoints(meta Meta, defs []chunk.GraphDefinition) []*qdrant.PointSt
 	return out
 }
 
+// defRef is the repo-scoped canonical key of a declared symbol — the payload
+// counterpart of `def:<pkg>.<name>[#recv]` (symbolName). ids.go has no Ref*
+// helper for definitions, so the spelling lives here; no node carries a def:
+// node_key (definition nodes carry their file ref), so a defines target
+// resolves as a pseudo-node, like package keys do (§7.3).
+func defRef(repo, pkg, sym string) string { return repo + "|def:" + pkg + "." + sym }
+
 // DefinePoints builds the defines edges (kind=edge, edge_type=defines) from a
 // file to each symbol it declares. The symbol spelling matches
-// DefinitionPoints exactly, so to_symbol joins back to the node. Pure.
+// DefinitionPoints exactly, so to_symbol joins back to the node. from_key/
+// to_key are the canonical endpoint refs (T007): the declaring file and the
+// symbol; the legacy from_file/to_symbol fields stay for backward
+// compatibility, and the deterministic ID is unchanged. Pure.
 func DefinePoints(meta Meta, defs []chunk.GraphDefinition) []*qdrant.PointStruct {
 	ns := Namespace(meta.SchemaVer)
 	out := make([]*qdrant.PointStruct, 0, len(defs))
@@ -98,6 +112,10 @@ func DefinePoints(meta Meta, defs []chunk.GraphDefinition) []*qdrant.PointStruct
 			Payload: valueMap(map[string]any{
 				"kind":       string(KindEdge),
 				"edge_type":  string(EdgeDefines),
+				"from_key":   RefFile(meta.Repo, d.FilePath),
+				"from_type":  "file",
+				"to_key":     defRef(meta.Repo, d.Package, sym),
+				"to_type":    "symbol",
 				"from_file":  d.FilePath,
 				"to_symbol":  sym,
 				"repo":       meta.Repo,
@@ -149,7 +167,10 @@ func isMajorVersion(seg string) bool {
 // edge_type=imports) of one file. from_package/to_package are repo-namespaced
 // (PkgKey) so same-named packages ("utils", "main") never collide across
 // repositories; to_package_name carries the bare package name of the imported
-// path (PackageName), the spelling definition nodes use. external marks imports
+// path (PackageName), the spelling definition nodes use. from_key/to_key are
+// the canonical endpoint refs (T007) — the importing file and the imported
+// package (full path, the same granularity as to_package) — kept alongside
+// the legacy fields; the deterministic ID is unchanged. external marks imports
 // outside the indexed repository set and is classified by the caller: nil means
 // nothing is external. Pure: no client, no I/O.
 func ImportPoints(meta Meta, f FileGraph, isExternal func(string) bool) []*qdrant.PointStruct {
@@ -163,6 +184,10 @@ func ImportPoints(meta Meta, f FileGraph, isExternal func(string) bool) []*qdran
 			Payload: valueMap(map[string]any{
 				"kind":            string(KindEdge),
 				"edge_type":       string(EdgeImports),
+				"from_key":        RefFile(meta.Repo, f.Path),
+				"from_type":       "file",
+				"to_key":          RefPkg(meta.Repo, imp.Path),
+				"to_type":         "package",
 				"from_file":       f.Path,
 				"from_package":    from,
 				"to_package":      to,
@@ -184,9 +209,12 @@ func ImportPoints(meta Meta, f FileGraph, isExternal func(string) bool) []*qdran
 const KindCoverage Kind = "coverage"
 
 // CoveragePoint builds the per-repo coverage marker (T057): how far the graph
-// scan of one repository has got. The ID is deterministic (NodeID over the
-// KeyCoverage canonical key) — a completed pass upserts the same point again,
-// last writer wins. Pure: no client, no I/O.
+// scan of one repository has got. The ID is deterministic and deliberately
+// schema-version-stable (T048): Sweep skips kind=coverage, so a
+// WORKER_GRAPH_SCHEMA_VER bump must rewrite the same point instead of
+// orphaning the old one — a completed pass upserts the same point again, last
+// writer wins; schema_ver stays informational in the payload. Pure: no client,
+// no I/O.
 func CoveragePoint(meta Meta, indexedCommit string) *qdrant.PointStruct {
 	payload := valueMap(map[string]any{
 		"kind":           string(KindCoverage),
@@ -202,7 +230,7 @@ func CoveragePoint(meta Meta, indexedCommit string) *qdrant.PointStruct {
 	// scalar-only by design. Go is the only language with a resolver today.
 	payload["languages_with_resolvers"] = qdrant.NewValueFromList(qdrant.NewValueString("go"))
 	return &qdrant.PointStruct{
-		Id:      qdrant.NewID(NodeID(Namespace(meta.SchemaVer), meta.Repo, meta.Branch, KindCoverage, KeyCoverage(meta.Repo)).String()),
+		Id:      qdrant.NewID(NodeID(CoverageNamespace(), meta.Repo, meta.Branch, KindCoverage, KeyCoverage(meta.Repo)).String()),
 		Payload: payload,
 	}
 }

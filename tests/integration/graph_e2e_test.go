@@ -21,6 +21,21 @@ import (
 // the live index is operator-supplied, and a scenario with an unset input skips
 // cleanly.
 //
+// The US1 parity modes of query_graph (T016) get their own scenarios:
+// mode=aggregation groups the repo's MR/PR points by their populated status
+// column (SC001_Aggregation), mode=path_finding follows a live import edge of
+// GRAPH_E2E_FILE (SC002_Path), mode=neighbors lists the 1-hop peers of its
+// canonical file node_key in both directions (SC003_Neighbors). They need no
+// new fixture envs.
+//
+// The people/planning domains (SC-004/SC-005) get their own scenarios:
+// SC004_UserNote finds a user by login and the notes of one parent as nodes
+// (entity=user|note), then traverses commented (note → author) and authored
+// (work_item → author) through mode=neighbors; SC005_Planning finds a work
+// item, its milestone and its labels as nodes by canonical node_key
+// (entity=work_item|milestone|label), then walks assigned_to/authored out and
+// in_milestone/labelled back.
+//
 // Env:
 //
 //	QDRANT_URL, EMBEDDINGS_BASE_URL   live stack (same gate as the other e2e tests)
@@ -35,6 +50,11 @@ import (
 //	GRAPH_E2E_PR_STATE                canonical state of >=1 MR/PR of the repo (SC-003)
 //	GRAPH_E2E_ISSUE_LABEL/_AUTHOR/_MILESTONE  optional: pin those issue filters
 //	GRAPH_E2E_VULN_FINDINGS           "1": the fixture's security API is available (SC-008 security)
+//	GRAPH_E2E_RUNNERS                 "1": the fixture's runner API/role is available (SC-008 runner)
+//	GRAPH_E2E_RUNNER_KEY              optional: canonical runner ref, e.g. "runner:gitlab.com#12" (SC-008 runner)
+//	GRAPH_E2E_LOGIN                   a login of an indexed user (SC-004)
+//	GRAPH_E2E_NOTE_PARENT            canonical parent ref of indexed notes, e.g. "repo|wi:issue#3" (SC-004)
+//	GRAPH_E2E_WORK_ITEM_KEY          canonical work_item ref, e.g. "repo|wi:issue#1" (SC-005)
 //
 // Example:
 //
@@ -43,6 +63,8 @@ import (
 //	GRAPH_E2E_FILE=internal/worker/refresh.go GRAPH_E2E_PACKAGE=internal/worker \
 //	GRAPH_E2E_FOREIGN_REPO=gorizond/other GRAPH_E2E_MR_FILE=internal/mcp/tools.go \
 //	GRAPH_E2E_ISSUE_STATE=open GRAPH_E2E_PR_STATE=merged GRAPH_E2E_ISSUE_LABEL=bug \
+//	GRAPH_E2E_LOGIN=alice GRAPH_E2E_NOTE_PARENT='gorizond/vcs-rag|wi:issue#3' \
+//	GRAPH_E2E_WORK_ITEM_KEY='gorizond/vcs-rag|wi:issue#1' \
 //	go test -tags e2e ./tests/integration -run TestE2E_Graph -v -count=1
 func TestE2E_Graph_SC001(t *testing.T) {
 	proc := startGraphMCP(t)
@@ -358,6 +380,419 @@ func TestE2E_Graph_US5(t *testing.T) {
 	t.Logf("read-back: query_graph limit=1 points=%d truncated=%v", len(cut.Results), cut.Truncated)
 }
 
+// TestE2E_Graph_SC001_Aggregation — US1 parity e2e of mode=aggregation
+// (SC-001): an exact grouped count of the fixture repo's MR/PR points by their
+// populated `status` column. The answer is rows of {key,count,value}; with
+// op=count value equals the group count, and every answer carries a coverage
+// notice. Deliberately not grouped by `author`: mr_file points carry no author
+// on this fixture, so a by-author query is a one-empty-group tautology and
+// proves nothing. An empty key is a legitimate row of a sparse column (the
+// points that lack the field group under ""); the scenario accepts and logs
+// it, but demands at least one populated (non-empty-key) group.
+//
+// Env: GRAPH_E2E_REPO (see the file header).
+func TestE2E_Graph_SC001_Aggregation(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+
+	line := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":     "aggregation",
+		"op":       "count",
+		"group_by": "status",
+		"start":    map[string]any{"entity": "mr_file", "filters": map[string]any{"repo": repo}},
+		"limit":    100,
+	})
+	assertNoToolError(t, line)
+	agg := decodeTool[gAggResp](t, line)
+	assertCoverage(t, "query_graph(aggregation)", agg.Coverage, repo)
+	if len(agg.Groups) == 0 {
+		t.Skipf("aggregation(count by status) for %q returned no groups: the fixture index has no MR/PR points", repo)
+	}
+	var total, populated uint64
+	for _, g := range agg.Groups {
+		if g.Count == 0 {
+			t.Errorf("aggregation group %q: count=0", g.Key)
+		}
+		if g.Value != float64(g.Count) {
+			t.Errorf("aggregation group %q: op=count value=%v, want %d", g.Key, g.Value, g.Count)
+		}
+		if g.Key == "" {
+			// Sparse columns legitimately group their unset points under the
+			// empty key: accepted and surfaced, never a failure by itself.
+			t.Logf("empty-key group: %d MR/PR points lack the group column", g.Count)
+			continue
+		}
+		populated++
+		total += g.Count
+	}
+	if populated == 0 {
+		t.Errorf("aggregation(count by status) for %q has no populated group: the group column must be populated on the fixture's MR/PR points", repo)
+	}
+	if agg.Truncated && len(agg.Groups) < 100 {
+		t.Errorf("truncated=true with only %d groups (< limit): an exact facet count is never cut silently", len(agg.Groups))
+	}
+	t.Logf("read-back: aggregation(count by status) groups=%d populated=%d points=%d truncated=%v", len(agg.Groups), populated, total, agg.Truncated)
+}
+
+// TestE2E_Graph_SC002_Path — US1 parity e2e of mode=path_finding (SC-002): the
+// shortest path between the fixture file and one of its live import targets.
+// The target is read back from the graph (a real to_key of an imports edge), so
+// the pair is known-connected: the engine must answer found — a cap may make it
+// inconclusive — never not_found, and never a hard failure. When the fixture
+// file has no indexed import the scenario skips.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_FILE (>=1 outgoing import).
+func TestE2E_Graph_SC002_Path(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	file := graphFixture(t, "GRAPH_E2E_FILE")
+
+	// read one real endpoint from the live index: the file's first import edge.
+	imps := decodeTool[gQueryResp](t, graphCall(t, proc, 2, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"repo": repo, "file_path": file}},
+		"edge":  map[string]any{"type": "imports", "direction": "outgoing"},
+		"limit": 50,
+	}))
+	from, to := graph.RefFile(repo, file), ""
+	for _, h := range imps.Results {
+		if h.Kind == "edge" && h.EdgeType == "imports" && h.ToKey != "" {
+			to = h.ToKey
+			break
+		}
+	}
+	if to == "" {
+		t.Skipf("no import edge from %q in the live graph: GRAPH_E2E_FILE must have >=1 outgoing import", file)
+	}
+
+	line := graphCall(t, proc, 3, "query_graph", map[string]any{
+		"mode":      "path_finding",
+		"from":      from,
+		"to":        to,
+		"type":      "shortest",
+		"max_depth": 3,
+		"rel_types": []string{"imports"},
+	})
+	assertNoToolError(t, line)
+	path := decodeTool[gPathResp](t, line)
+	switch path.Status {
+	case "found", "not_found", "inconclusive":
+	default:
+		t.Fatalf("path_finding status %q outside found|not_found|inconclusive", path.Status)
+	}
+	if path.Status == "not_found" {
+		t.Errorf("path_finding(%s → %s) = not_found although that import edge is indexed: an existing edge is found or, at worst, inconclusive", from, to)
+	}
+	if len(path.Path) > 0 {
+		if path.Path[0] != from || path.Path[len(path.Path)-1] != to {
+			t.Errorf("path endpoints %q → %q, want %q → %q", path.Path[0], path.Path[len(path.Path)-1], from, to)
+		}
+		if len(path.Edges) != len(path.Path)-1 {
+			t.Errorf("path: %d nodes but %d edges (want nodes-1)", len(path.Path), len(path.Edges))
+		}
+		for i, e := range path.Edges {
+			if e.FromKey != path.Path[i] || e.ToKey != path.Path[i+1] {
+				t.Errorf("path edge %d %s → %s breaks the %q → %q chain", i, e.FromKey, e.ToKey, path.Path[i], path.Path[i+1])
+			}
+			if e.EdgeType == "" {
+				t.Errorf("path edge %d without edge_type: %+v", i, e)
+			}
+		}
+	}
+	assertCoverage(t, "query_graph(path_finding)", path.Coverage, repo)
+	t.Logf("read-back: path_finding status=%s nodes=%d edges=%d truncated=%v (%s → %s)", path.Status, len(path.Path), len(path.Edges), path.Truncated, from, to)
+}
+
+// TestE2E_Graph_SC003_Neighbors — US1 parity e2e of mode=neighbors (SC-003):
+// the 1-hop peers of the fixture file's canonical node_key in both directions
+// over the imports+defines relations. The fixture file has >=1 outgoing import
+// — via the canonical from_key or, on an index not yet re-scanned, via the
+// legacy from_file the T051 fallback ORs in — so the peer list is non-empty;
+// every peer is either a resolved stored node or an honest pseudo-node, and
+// the answer carries a coverage notice. Peers of pre-parity edges carry the
+// type their legacy field implies; a peer the engine cannot classify keeps an
+// empty type (honest pseudo-node) and is only counted — at least one typed
+// peer must still appear.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_FILE (>=1 outgoing import).
+func TestE2E_Graph_SC003_Neighbors(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	file := graphFixture(t, "GRAPH_E2E_FILE")
+
+	centre := graph.RefFile(repo, file)
+	line := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":      "neighbors",
+		"node_key":  centre,
+		"direction": "both",
+		"rel_types": []string{"imports", "defines"},
+		"limit":     100,
+	})
+	assertNoToolError(t, line)
+	nb := decodeTool[gNeighborsResp](t, line)
+	assertCoverage(t, "query_graph(neighbors)", nb.Coverage, repo)
+	if len(nb.Neighbors) == 0 {
+		t.Fatalf("neighbors(%q) returned no peers: the fixture file must have >=1 outgoing import (canonical from_key or legacy from_file)", centre)
+	}
+	typed := 0
+	for _, n := range nb.Neighbors {
+		if n.Key == "" || n.Key == centre {
+			t.Errorf("neighbor with empty or self key %q", n.Key)
+		}
+		if len(n.EdgeTypes) == 0 {
+			t.Errorf("neighbor %q: no edge_types", n.Key)
+		}
+		// A pre-parity edge may have no stored endpoint type; the engine
+		// derives one from the legacy field, but an unclassified peer is
+		// still an honest pseudo-node, not a failure — it is only counted.
+		if n.Type != "" {
+			typed++
+		}
+		if n.Resolved {
+			if n.Node == nil {
+				t.Errorf("neighbor %q: resolved but no node payload", n.Key)
+			} else if nk, _ := n.Node["node_key"].(string); nk != n.Key {
+				t.Errorf("neighbor %q: resolved node carries node_key %q", n.Key, nk)
+			}
+		} else if n.Node != nil {
+			t.Errorf("neighbor %q: unresolved but carries a node payload", n.Key)
+		}
+	}
+	if typed == 0 {
+		t.Errorf("neighbors(%q): no peer carries a type — neither canonical to_type nor a recognised legacy endpoint field", centre)
+	}
+	t.Logf("read-back: neighbors(%s) peers=%d typed=%d truncated=%v", centre, len(nb.Neighbors), typed, nb.Truncated)
+}
+
+// TestE2E_Graph_SC004_UserNote — US2 (SC-004): the people/comment domain is
+// queryable. A user is found as a node by login (entity=user), the notes of
+// one parent are listed as nodes by parent_key (entity=note, body capped), and
+// the relation edges are traversed through mode=neighbors: commented from a
+// note to its author, authored from the note's parent (a work item) to its
+// author. Skipped when the fixture index has no matching user/note points; the
+// authored leg skip-notes when the parent carries no authored edge.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_LOGIN + GRAPH_E2E_NOTE_PARENT (see the header).
+func TestE2E_Graph_SC004_UserNote(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	login := graphFixture(t, "GRAPH_E2E_LOGIN")
+	parent := graphFixture(t, "GRAPH_E2E_NOTE_PARENT")
+
+	// 1) find the user node by login.
+	uLine := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":  "traversal",
+		"start": map[string]any{"entity": "user", "filters": map[string]any{"repo": repo, "login": login}},
+		"limit": 10,
+	})
+	assertNoToolError(t, uLine)
+	users := decodeTool[gQueryResp](t, uLine)
+	if len(users.Results) == 0 {
+		t.Skipf("no user node with login %q in %q: the fixture has no US2 user points", login, repo)
+	}
+	for _, h := range users.Results {
+		if h.Kind != "user" || h.Login != login {
+			t.Errorf("user lookup returned %+v, want kind=user login=%q", h, login)
+		}
+		if h.NodeKey == "" || h.VCSUserID == "" {
+			t.Errorf("user node without node_key/vcs_user_id: %+v", h)
+		}
+	}
+	assertCoverage(t, "query_graph(user)", users.Coverage, repo)
+	userKey := users.Results[0].NodeKey
+
+	// 2) the notes of one parent, bodies capped at the note cap.
+	nLine := graphCall(t, proc, 3, "query_graph", map[string]any{
+		"mode":  "traversal",
+		"start": map[string]any{"entity": "note", "filters": map[string]any{"repo": repo, "parent_key": parent}},
+		"limit": 50,
+	})
+	assertNoToolError(t, nLine)
+	notes := decodeTool[gQueryResp](t, nLine)
+	if len(notes.Results) == 0 {
+		t.Skipf("no note nodes for parent %q in %q: the fixture has no US2 note points", parent, repo)
+	}
+	for _, h := range notes.Results {
+		if h.Kind != "note" || h.ParentKey != parent || h.NoteID == "" {
+			t.Errorf("note lookup returned %+v, want kind=note parent_key=%q", h, parent)
+		}
+		if len(h.Body) > graph.MaxNoteBodyBytes {
+			t.Errorf("note %s: body %d bytes > cap %d", h.NoteID, len(h.Body), graph.MaxNoteBodyBytes)
+		}
+	}
+	assertCoverage(t, "query_graph(note)", notes.Coverage, repo)
+	noteKey := notes.Results[0].NodeKey
+	t.Logf("read-back: user=%s notes=%d", userKey, len(notes.Results))
+
+	// 3) commented: the note links to its author.
+	cLine := graphCall(t, proc, 4, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": noteKey, "direction": "outgoing",
+		"rel_types": []string{"commented"}, "filters": map[string]any{"repo": repo}, "limit": 50,
+	})
+	assertNoToolError(t, cLine)
+	commented := decodeTool[gNeighborsResp](t, cLine)
+	authors := 0
+	for _, n := range commented.Neighbors {
+		if n.Type != "user" {
+			t.Errorf("commented neighbour %q: type=%q, want user", n.Key, n.Type)
+		}
+		if !n.Resolved || n.Node == nil {
+			t.Errorf("commented neighbour %q: author node not resolved: %+v", n.Key, n)
+			continue
+		}
+		if nk, _ := n.Node["node_key"].(string); nk != n.Key {
+			t.Errorf("commented neighbour %q: resolved node carries node_key %q", n.Key, nk)
+		}
+		authors++
+	}
+	if authors == 0 {
+		t.Errorf("neighbors(%s, commented) returned no author: the stored note must link to its author (R7)", noteKey)
+	}
+
+	// 4) authored: the parent item links to its author; a parent without
+	// authored users (planning ingest not run) skip-notes honestly.
+	aLine := graphCall(t, proc, 5, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": parent, "direction": "outgoing",
+		"rel_types": []string{"authored"}, "filters": map[string]any{"repo": repo}, "limit": 50,
+	})
+	assertNoToolError(t, aLine)
+	authored := decodeTool[gNeighborsResp](t, aLine)
+	if len(authored.Neighbors) == 0 {
+		t.Logf("skip-note: parent %q has no authored edge in the live graph", parent)
+	} else {
+		for _, n := range authored.Neighbors {
+			if n.Type != "user" || !n.Resolved {
+				t.Errorf("authored neighbour %q: type=%q resolved=%v, want a resolved user", n.Key, n.Type, n.Resolved)
+			}
+		}
+	}
+	t.Logf("read-back: user=%s comments=%d authored=%d", userKey, authors, len(authored.Neighbors))
+}
+
+// TestE2E_Graph_SC005_Planning — US3 (SC-005): the planning domain is
+// queryable. The work item is found as a node by canonical node_key
+// (entity=work_item, with item_id/item_type); its milestone and labels are
+// then found as nodes (entity=milestone|label) and the relation edges are
+// walked through mode=neighbors: assigned_to/authored out of the item to
+// users, in_milestone/labelled back from the milestone/label to the item.
+// Skipped when the fixture index has no such work item; the milestone/label
+// legs skip-note when the fixture item carries none.
+//
+// Env: GRAPH_E2E_REPO + GRAPH_E2E_WORK_ITEM_KEY (see the header).
+func TestE2E_Graph_SC005_Planning(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	wiKey := graphFixture(t, "GRAPH_E2E_WORK_ITEM_KEY")
+
+	// 1) the work item node itself.
+	wiLine := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"mode":  "traversal",
+		"start": map[string]any{"entity": "work_item", "filters": map[string]any{"repo": repo, "node_key": wiKey}},
+		"limit": 5,
+	})
+	assertNoToolError(t, wiLine)
+	wi := decodeTool[gQueryResp](t, wiLine)
+	if len(wi.Results) == 0 {
+		t.Skipf("no work_item node %q in %q: the fixture has no US3 planning points", wiKey, repo)
+	}
+	for _, h := range wi.Results {
+		if h.Kind != "work_item" || h.NodeKey != wiKey || h.ItemID == "" || h.ItemType == "" {
+			t.Errorf("work_item lookup returned %+v, want kind=work_item node_key=%q with item_id/item_type", h, wiKey)
+		}
+	}
+	assertCoverage(t, "query_graph(work_item)", wi.Coverage, repo)
+
+	// 2) assigned_to/authored: the people around the item.
+	pLine := graphCall(t, proc, 3, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": wiKey, "direction": "outgoing",
+		"rel_types": []string{"assigned_to", "authored"}, "filters": map[string]any{"repo": repo}, "limit": 100,
+	})
+	assertNoToolError(t, pLine)
+	people := decodeTool[gNeighborsResp](t, pLine)
+	if len(people.Neighbors) == 0 {
+		t.Logf("skip-note: work item %q has no assigned_to/authored edges in the live graph", wiKey)
+	}
+	for _, n := range people.Neighbors {
+		if n.Type != "user" || !n.Resolved {
+			t.Errorf("people neighbour %q: type=%q resolved=%v, want a resolved user", n.Key, n.Type, n.Resolved)
+		}
+	}
+	t.Logf("read-back: work_item=%s people=%d", wiKey, len(people.Neighbors))
+
+	// 3) milestone/label: the target nodes and the reverse edges.
+	for _, leg := range []struct{ rel, node string }{
+		{"in_milestone", "milestone"},
+		{"labelled", "label"},
+	} {
+		centres := planningPeerKeys(t, proc, 4, wiKey, leg.rel, repo)
+		if len(centres) == 0 {
+			t.Logf("skip-note: work item %q has no %s edge in the live graph", wiKey, leg.rel)
+			continue
+		}
+		centre := centres[0]
+		nLine := graphCall(t, proc, 5, "query_graph", map[string]any{
+			"mode":  "traversal",
+			"start": map[string]any{"entity": leg.node, "filters": map[string]any{"repo": repo, "node_key": centre}},
+			"limit": 5,
+		})
+		assertNoToolError(t, nLine)
+		node := decodeTool[gQueryResp](t, nLine)
+		if len(node.Results) == 0 {
+			t.Errorf("%s %q is an edge target but not a stored node", leg.node, centre)
+			continue
+		}
+		for _, h := range node.Results {
+			if h.Kind != leg.node || h.NodeKey != centre || (h.MsID == "" && h.LabelKey == "") {
+				t.Errorf("%s lookup returned %+v, want kind=%s node_key=%q", leg.node, h, leg.node, centre)
+			}
+		}
+		assertCoverage(t, "query_graph("+leg.node+")", node.Coverage, repo)
+		assertPlanningBackLink(t, proc, 6, centre, wiKey, leg.rel, repo, leg.node)
+	}
+}
+
+// planningPeerKeys returns the canonical keys of the peers reached from centre
+// over one planning relation (mode=neighbors, outgoing).
+func planningPeerKeys(t *testing.T, p *mcpProcess, id int, centre, relType, repo string) []string {
+	t.Helper()
+	line := graphCall(t, p, id, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": centre, "direction": "outgoing",
+		"rel_types": []string{relType}, "filters": map[string]any{"repo": repo}, "limit": 100,
+	})
+	assertNoToolError(t, line)
+	nb := decodeTool[gNeighborsResp](t, line)
+	keys := make([]string, 0, len(nb.Neighbors))
+	for _, n := range nb.Neighbors {
+		keys = append(keys, n.Key)
+	}
+	return keys
+}
+
+// assertPlanningBackLink checks the reverse of a planning edge: the centre (a
+// milestone/label node) must list the work item back over relType, with the
+// peer type the edge carries. node names the centre family in the messages.
+func assertPlanningBackLink(t *testing.T, p *mcpProcess, id int, centre, itemKey, relType, repo, node string) {
+	t.Helper()
+	line := graphCall(t, p, id, "query_graph", map[string]any{
+		"mode": "neighbors", "node_key": centre, "direction": "incoming",
+		"rel_types": []string{relType}, "filters": map[string]any{"repo": repo}, "limit": 100,
+	})
+	assertNoToolError(t, line)
+	back := decodeTool[gNeighborsResp](t, line)
+	found := false
+	for _, n := range back.Neighbors {
+		if n.Type != "work_item" || !n.Resolved {
+			t.Errorf("%s %q: %s neighbour %q: type=%q resolved=%v, want a resolved work_item", node, centre, relType, n.Key, n.Type, n.Resolved)
+		}
+		if n.Key == itemKey {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("%s is not symmetric: work item %q missing among %d items of %s %q", relType, itemKey, len(back.Neighbors), node, centre)
+	}
+	t.Logf("read-back: %s back from %s %q: items=%d", relType, node, centre, len(back.Neighbors))
+}
+
 // TestE2E_Graph_SC008_CI — US4 (SC-008 CI): the ci domain preserves the whole
 // run history, not just failures. query_graph(entity:"ci") with a status filter
 // finds both failed and successful runs; every job row carries job/duration
@@ -506,6 +941,84 @@ func TestE2E_Graph_SC008_Security(t *testing.T) {
 		t.Errorf("definition domain returned nothing for %q while the security domain is off: other domains must keep working", repo)
 	}
 	t.Logf("read-back: security domain unavailable (empty, no error); definitions still answer: %d points", len(other.Results))
+}
+
+// TestE2E_Graph_SC008_Runner — US4 (SC-008 runner): the runner domain is
+// conditional on the provider API/role. When the fixture declares availability
+// (GRAPH_E2E_RUNNERS=1) query_graph(entity:"runner") must return well-formed
+// runner nodes (node_key/runner_id/vcs_host); with GRAPH_E2E_RUNNER_KEY set the
+// exact canonical ref is looked up instead of the whole repo. Otherwise an
+// empty answer is the explicit "domain off" signal — error-free, and the other
+// domains keep answering. The executed_by leg is skip-noted when the fixture
+// carries no such edge (the lane currently ingests runner nodes only).
+//
+// Env: GRAPH_E2E_REPO; optional GRAPH_E2E_RUNNERS=1, GRAPH_E2E_RUNNER_KEY.
+func TestE2E_Graph_SC008_Runner(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	key := os.Getenv("GRAPH_E2E_RUNNER_KEY")
+
+	filters := map[string]any{"repo": repo}
+	if key != "" {
+		filters["node_key"] = key
+	}
+	line := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "runner", "filters": filters},
+		"limit": 100,
+	})
+	assertNoToolError(t, line)
+	resp := decodeTool[gQueryResp](t, line)
+
+	if len(resp.Results) > 0 {
+		for _, h := range resp.Results {
+			if h.Kind != "runner" || h.Repo != repo {
+				t.Errorf("runner query on %q returned a foreign/invalid point: %+v", repo, h)
+			}
+			if h.NodeKey == "" || h.RunnerID == "" || h.VCSHost == "" {
+				t.Errorf("runner node without node_key/runner_id/vcs_host: %+v", h)
+			}
+			if key != "" && h.NodeKey != key {
+				t.Errorf("runner lookup returned node_key %q, want %q", h.NodeKey, key)
+			}
+		}
+		assertCoverage(t, "query_graph(runner)", resp.Coverage, repo)
+
+		// executed_by (optional): the runner's incoming ci edges, when the
+		// fixture wired them; absent is a skip-note, not a failure.
+		runnerKey := resp.Results[0].NodeKey
+		nLine := graphCall(t, proc, 3, "query_graph", map[string]any{
+			"mode": "neighbors", "node_key": runnerKey, "direction": "incoming",
+			"rel_types": []string{"executed_by"}, "filters": map[string]any{"repo": repo}, "limit": 50,
+		})
+		assertNoToolError(t, nLine)
+		executed := decodeTool[gNeighborsResp](t, nLine)
+		if len(executed.Neighbors) == 0 {
+			t.Logf("skip-note: runner %q has no executed_by edge in the live graph", runnerKey)
+		}
+		for _, n := range executed.Neighbors {
+			if n.Type != "ci" {
+				t.Errorf("executed_by neighbour %q: type=%q, want ci", n.Key, n.Type)
+			}
+		}
+		t.Logf("read-back: runner domain available, runners=%d executed_by=%d", len(resp.Results), len(executed.Neighbors))
+		return
+	}
+
+	// The runner domain is unavailable on this instance (403/404 or no
+	// runners): the answer is an explicit empty one — assertNoToolError above
+	// proves it is not an error.
+	if os.Getenv("GRAPH_E2E_RUNNERS") == "1" {
+		t.Fatalf("GRAPH_E2E_RUNNERS=1 but query_graph(entity:runner) returned no runners for %q", repo)
+	}
+	assertCoverage(t, "query_graph(runner, off)", resp.Coverage, repo)
+	other := decodeTool[gQueryResp](t, graphCall(t, proc, 3, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"repo": repo}},
+		"limit": 5,
+	}))
+	if len(other.Results) == 0 {
+		t.Errorf("definition domain returned nothing for %q while the runner domain is off: other domains must keep working", repo)
+	}
+	t.Logf("read-back: runner domain unavailable (empty, no error); definitions still answer: %d points", len(other.Results))
 }
 
 // --- helpers ---
@@ -704,12 +1217,75 @@ type gQueryHit struct {
 	EdgeType  string `json:"edge_type"`
 	FromFile  string `json:"from_file"`
 	ToPackage string `json:"to_package"`
+	ToKey     string `json:"to_key"`
 	Symbol    string `json:"symbol"`
 	FilePath  string `json:"file_path"`
+	// US2/US3 node payloads (SC-004/SC-005).
+	NodeKey   string `json:"node_key"`
+	Login     string `json:"login"`
+	VCSUserID string `json:"vcs_user_id"`
+	NoteID    string `json:"note_id"`
+	ParentKey string `json:"parent_key"`
+	AuthorKey string `json:"author_key"`
+	Body      string `json:"body"`
+	ItemID    string `json:"item_id"`
+	ItemType  string `json:"item_type"`
+	MsID      string `json:"ms_id"`
+	LabelKey  string `json:"label_key"`
+	// US4 runner payload (SC-008 runner).
+	RunnerID   string `json:"runner_id"`
+	VCSHost    string `json:"vcs_host"`
+	RunnerType string `json:"runner_type"`
 }
 
 type gQueryResp struct {
 	Results   []gQueryHit `json:"results"`
+	Coverage  []gCoverage `json:"coverage"`
+	Truncated bool        `json:"truncated"`
+}
+
+// gAggGroup / gAggResp — mode=aggregation rows (T016); value equals count for
+// op=count.
+type gAggGroup struct {
+	Key   string  `json:"key"`
+	Count uint64  `json:"count"`
+	Value float64 `json:"value"`
+}
+
+type gAggResp struct {
+	Groups    []gAggGroup `json:"groups"`
+	Coverage  []gCoverage `json:"coverage"`
+	Truncated bool        `json:"truncated"`
+}
+
+// gPathEdge / gPathResp — mode=path_finding (T016): the status is honest
+// (found|not_found|inconclusive) and the path is the canonical key chain.
+type gPathEdge struct {
+	FromKey  string `json:"from_key"`
+	ToKey    string `json:"to_key"`
+	EdgeType string `json:"edge_type"`
+}
+
+type gPathResp struct {
+	Status    string      `json:"status"`
+	Path      []string    `json:"path"`
+	Edges     []gPathEdge `json:"edges"`
+	Coverage  []gCoverage `json:"coverage"`
+	Truncated bool        `json:"truncated"`
+}
+
+// gNeighbor / gNeighborsResp — mode=neighbors (T016): resolved peers carry
+// their stored node; the rest are pseudo-nodes (resolved:false, no node).
+type gNeighbor struct {
+	Key       string         `json:"key"`
+	Type      string         `json:"type"`
+	Resolved  bool           `json:"resolved"`
+	EdgeTypes []string       `json:"edge_types"`
+	Node      map[string]any `json:"node"`
+}
+
+type gNeighborsResp struct {
+	Neighbors []gNeighbor `json:"neighbors"`
 	Coverage  []gCoverage `json:"coverage"`
 	Truncated bool        `json:"truncated"`
 }

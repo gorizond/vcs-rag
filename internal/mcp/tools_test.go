@@ -1111,3 +1111,187 @@ func TestGraphToolsRegistered(t *testing.T) {
 		}
 	}
 }
+
+// --- T044: query_graph mode-dispatch unit tests (fakes, hermetic) ---
+
+// errAggStore — the aggregation adapter surface (Count/Facet) with injectable
+// errors; the committed fakeAggStore (query_graph_modes_test.go) is happy-path
+// only, so the failure branches are driven from here.
+type errAggStore struct {
+	*fakeGraphReader
+	count    uint64
+	countErr error
+	facet    map[string]uint64
+	facetErr error
+}
+
+func (f *errAggStore) Count(context.Context, *qdrant.Filter) (uint64, error) {
+	return f.count, f.countErr
+}
+
+func (f *errAggStore) Facet(_ context.Context, _ string, _ *qdrant.Filter, _ uint64) (map[string]uint64, error) {
+	return f.facet, f.facetErr
+}
+
+// T044: mode=aggregation dispatch — the fold branch (sum + group_by), the
+// limit cut, the contractual cap refusal, and the store-error mapping.
+func TestQueryGraphAggregationDispatch(t *testing.T) {
+	ctx := context.Background()
+	agg := &errAggStore{
+		fakeGraphReader: &fakeGraphReader{points: []*qdrant.RetrievedPoint{
+			{Payload: qdrant.NewValueMap(map[string]any{"repo": "r1", "duration_ms": 10.0})},
+			{Payload: qdrant.NewValueMap(map[string]any{"repo": "r1", "duration_ms": 25.0})},
+			{Payload: qdrant.NewValueMap(map[string]any{"repo": "r2", "duration_ms": 5.0})},
+		}},
+		count: 7,
+	}
+	tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}, graph: agg}
+	aggIn := queryGraphInput{
+		Mode: "aggregation", Op: "sum", Field: "duration_ms", GroupBy: "repo",
+		Start: queryGraphStart{Entity: "definition", Filters: map[string]any{"repo": "r1"}},
+	}
+
+	// Fold: r1 folds to 35 over 2 points, r2 to 5; default sort is value desc.
+	_, out, err := tl.queryGraph(ctx, nil, aggIn)
+	if err != nil {
+		t.Fatalf("aggregation sum: %v", err)
+	}
+	ar, ok := out.(aggregationResponse)
+	if !ok || len(ar.Groups) != 2 || ar.Truncated {
+		t.Fatalf("out = %T %+v, want two untruncated groups", out, out)
+	}
+	if ar.Groups[0].Key != "r1" || ar.Groups[0].Count != 2 || ar.Groups[0].Value != 35 {
+		t.Errorf("first row = %+v, want r1/2/35", ar.Groups[0])
+	}
+	if ar.Groups[1].Key != "r2" || ar.Groups[1].Value != 5 {
+		t.Errorf("second row = %+v, want r2/5", ar.Groups[1])
+	}
+
+	// The compiled limit cuts the group list and reports truncated.
+	aggIn.Limit = 1
+	_, out, err = tl.queryGraph(ctx, nil, aggIn)
+	if err != nil {
+		t.Fatalf("aggregation limit: %v", err)
+	}
+	if ar, ok := out.(aggregationResponse); !ok || len(ar.Groups) != 1 || !ar.Truncated {
+		t.Fatalf("limit cut = %T %+v, want one truncated group", out, out)
+	}
+
+	// A store failure is a failure (qdrant_unavailable), never a silent empty.
+	agg.countErr = errors.New("count down")
+	_, out, err = tl.queryGraph(ctx, nil, queryGraphInput{
+		Mode: "aggregation", Op: "count",
+		Start: queryGraphStart{Entity: "definition", Filters: map[string]any{"repo": "r1"}},
+	})
+	if err != nil {
+		t.Fatalf("aggregation count error: %v", err)
+	}
+	if te, ok := out.(toolError); !ok || te.Code != codeSearchFailed {
+		t.Fatalf("count error = %T %+v, want %s", out, out, codeSearchFailed)
+	}
+
+	// An exact grouped count over the group cap is refused with the contractual
+	// code (a partial exact count would be a lie).
+	graph.SetAggCaps(0, 1)
+	defer graph.SetAggCaps(0, 0)
+	agg.countErr = nil
+	agg.facet = map[string]uint64{"a": 1, "b": 1}
+	_, out, err = tl.queryGraph(ctx, nil, queryGraphInput{
+		Mode: "aggregation", Op: "count", GroupBy: "repo",
+		Start: queryGraphStart{Entity: "definition", Filters: map[string]any{"repo": "r1"}},
+	})
+	if err != nil {
+		t.Fatalf("aggregation cap: %v", err)
+	}
+	if te, ok := out.(toolError); !ok || te.Code != codeAggCapExceeded {
+		t.Fatalf("cap refusal = %T %+v, want %s", out, out, codeAggCapExceeded)
+	}
+
+	// A facet/store failure keeps the qdrant_unavailable mapping.
+	agg.facetErr = errors.New("facet down")
+	_, out, err = tl.queryGraph(ctx, nil, queryGraphInput{
+		Mode: "aggregation", Op: "count", GroupBy: "repo",
+		Start: queryGraphStart{Entity: "definition", Filters: map[string]any{"repo": "r1"}},
+	})
+	if err != nil {
+		t.Fatalf("aggregation facet error: %v", err)
+	}
+	if te, ok := out.(toolError); !ok || te.Code != codeSearchFailed {
+		t.Fatalf("facet error = %T %+v, want %s", out, out, codeSearchFailed)
+	}
+}
+
+// T044: mode=path_finding dispatch — an exhausted search is the honest
+// not_found (not a failure); a store failure stays qdrant_unavailable.
+func TestQueryGraphPathDispatch(t *testing.T) {
+	ctx := context.Background()
+	a, c := "r|file:a.go", "r|file:c.go"
+	in := queryGraphInput{Mode: "path_finding", From: a, To: c, RelTypes: []string{"imports"}}
+
+	seq := &scriptedGraphReader{responses: [][]*qdrant.RetrievedPoint{{}, {}}}
+	tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}, graph: seq}
+	_, out, err := tl.queryGraph(ctx, nil, in)
+	if err != nil {
+		t.Fatalf("path not_found: %v", err)
+	}
+	pr, ok := out.(pathResponse)
+	if !ok || pr.Status != "not_found" || len(pr.Path) != 0 || len(pr.Edges) != 0 || pr.Truncated {
+		t.Fatalf("empty path = %T %+v, want not_found with an empty path", out, out)
+	}
+
+	tl.graph = &fakeGraphReader{err: errors.New("qdrant down")}
+	_, out, err = tl.queryGraph(ctx, nil, in)
+	if err != nil {
+		t.Fatalf("path store error: %v", err)
+	}
+	if te, ok := out.(toolError); !ok || te.Code != codeSearchFailed {
+		t.Fatalf("store error = %T %+v, want %s", out, out, codeSearchFailed)
+	}
+}
+
+// T044: mode=neighbors dispatch — a peer without a stored node stays an honest
+// pseudo-node; a bad direction is invalid_input before any scan; a store
+// failure keeps qdrant_unavailable.
+func TestQueryGraphNeighborsDispatch(t *testing.T) {
+	ctx := context.Background()
+	centre, peer := "r|file:a.go", "r|pkg:b"
+	edge := &qdrant.RetrievedPoint{Id: qdrant.NewID("11111111-1111-5111-8111-111111111111"),
+		Payload: qdrant.NewValueMap(map[string]any{
+			"kind": "edge", "edge_type": "imports", "from_key": peer, "from_type": "package",
+			"to_key": centre, "to_type": "file",
+		})}
+	gr := &fakeGraphReader{points: []*qdrant.RetrievedPoint{edge}}
+	tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}, graph: gr}
+
+	_, out, err := tl.queryGraph(ctx, nil, queryGraphInput{Mode: "neighbors", NodeKey: centre, Direction: "incoming"})
+	if err != nil {
+		t.Fatalf("neighbors: %v", err)
+	}
+	nr, ok := out.(neighborsResponse)
+	if !ok || len(nr.Neighbors) != 1 {
+		t.Fatalf("out = %T %+v, want one neighbour", out, out)
+	}
+	nb := nr.Neighbors[0]
+	if nb.Key != peer || nb.Type != "package" || nb.Resolved || nb.Node != nil || len(nb.EdgeTypes) != 1 || nb.EdgeTypes[0] != "imports" {
+		t.Errorf("unresolved peer = %+v, want a package pseudo-node with edge_types=[imports]", nb)
+	}
+
+	// Direction validation precedes the store: no scan on a bad direction.
+	scans := len(gr.filters)
+	_, out, err = tl.queryGraph(ctx, nil, queryGraphInput{Mode: "neighbors", NodeKey: centre, Direction: "sideways"})
+	if err != nil {
+		t.Fatalf("neighbors bad direction: %v", err)
+	}
+	if te, ok := out.(toolError); !ok || te.Code != codeInvalidInput || len(gr.filters) != scans {
+		t.Fatalf("bad direction = %T %+v scans=%d, want %s without a scan", out, out, len(gr.filters), codeInvalidInput)
+	}
+
+	tl.graph = &fakeGraphReader{err: errors.New("qdrant down")}
+	_, out, err = tl.queryGraph(ctx, nil, queryGraphInput{Mode: "neighbors", NodeKey: centre})
+	if err != nil {
+		t.Fatalf("neighbors store error: %v", err)
+	}
+	if te, ok := out.(toolError); !ok || te.Code != codeSearchFailed {
+		t.Fatalf("store error = %T %+v, want %s", out, out, codeSearchFailed)
+	}
+}

@@ -25,6 +25,14 @@ func Namespace(schemaVer string) UUID {
 	return uuid5(graphSeed, "schema:"+schemaVer)
 }
 
+// CoverageNamespace is the schema-version-stable namespace of the coverage
+// marker (T048). Sweep intentionally skips kind=coverage, so folding
+// schema_ver in (as Namespace does) would orphan the old marker after a bump —
+// duplicate coverage rows per repo. A fixed dedicated namespace makes every
+// pass upsert the same repo+branch-scoped point; schema_ver stays informational
+// in the payload.
+func CoverageNamespace() UUID { return uuid5(graphSeed, "schema:coverage") }
+
 // String renders the UUID in canonical 8-4-4-4-12 form.
 func (u UUID) String() string {
 	hx := hex.EncodeToString(u[:])
@@ -58,6 +66,28 @@ func KeyCi(level, pipelineID, jobID string) string {
 	return key("ci", level, pipelineID, jobID)
 }
 func KeyVuln(id string) string { return key("vuln", id) }
+
+// Identity keys of the Orbit-parity node families (plan R6), mirroring the
+// helpers above: opaque, NUL-separated uuid5 inputs — NOT the payload keys.
+func KeyUser(host, uid string) string         { return key("user", host, uid) }
+func KeyNote(id string) string                { return key("note", id) }
+func KeyWorkItem(itemType, iid string) string { return key("wi", itemType, iid) }
+func KeyMilestone(id string) string           { return key("ms", id) }
+func KeyLabel(scope, name string) string      { return key("label", scope, name) }
+func KeyRunner(host, id string) string        { return key("runner", host, id) }
+
+// Canonical payload keys (node_key / from_key / to_key, data-model §0/§1–§5).
+// Unlike the opaque identity keys above (uuid5 inputs only), these are the
+// human-readable forms the graph DSL matches on; a node's node_key and the
+// matching edge endpoint key are the same string by construction.
+func RefFile(repo, path string) string              { return repo + "|file:" + path }
+func RefPkg(repo, pkg string) string                { return repo + "|pkg:" + pkg }
+func RefUser(host, uid string) string               { return "user:" + host + "#" + uid }
+func RefNote(repo, id string) string                { return repo + "|note#" + id }
+func RefWorkItem(repo, itemType, iid string) string { return repo + "|wi:" + itemType + "#" + iid }
+func RefMilestone(repo, id string) string           { return repo + "|ms#" + id }
+func RefLabel(scope, name string) string            { return "lab:" + scope + "|" + name }
+func RefRunner(host, id string) string              { return "runner:" + host + "#" + id }
 
 // KeyCoverage is the canonical key of the per-repo coverage marker (T057).
 func KeyCoverage(repo string) string { return key("coverage", repo) }

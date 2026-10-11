@@ -18,6 +18,14 @@ const (
 	KindMrFile Kind = "mr_file"
 	KindCi     Kind = "ci"
 	KindVuln   Kind = "vuln"
+	// Orbit-parity node families (plan R6): user/note/work_item/milestone/
+	// label/runner. They are payload discriminators, like KindCi/KindVuln.
+	KindUser      Kind = "user"
+	KindNote      Kind = "note"
+	KindWorkItem  Kind = "work_item"
+	KindMilestone Kind = "milestone"
+	KindLabel     Kind = "label"
+	KindRunner    Kind = "runner"
 )
 
 // NodeType is the entity type carried by a graph node.
@@ -47,6 +55,14 @@ type EdgeType string
 const (
 	EdgeImports EdgeType = "imports"
 	EdgeDefines EdgeType = "defines"
+	// Orbit-parity relations (plan R7): work-item/note/user/label/milestone/
+	// runner links that the file/package-specific types cannot express.
+	EdgeAuthored    EdgeType = "authored"     // work_item → user
+	EdgeCommented   EdgeType = "commented"    // note → user
+	EdgeAssignedTo  EdgeType = "assigned_to"  // work_item → user
+	EdgeLabelled    EdgeType = "labelled"     // work_item → label
+	EdgeInMilestone EdgeType = "in_milestone" // work_item → milestone
+	EdgeExecutedBy  EdgeType = "executed_by"  // ci → runner
 )
 
 // Direction selects the traversal direction relative to the start entity.
@@ -55,6 +71,17 @@ type Direction string
 const (
 	Outgoing Direction = "outgoing"
 	Incoming Direction = "incoming"
+)
+
+// Mode selects the query family executed by query_graph (DSL `mode`, plan
+// R1–R4). The zero value means traversal, so existing callers are unchanged.
+type Mode string
+
+const (
+	ModeTraversal   Mode = "traversal"
+	ModeAggregation Mode = "aggregation"
+	ModePathFinding Mode = "path_finding"
+	ModeNeighbors   Mode = "neighbors"
 )
 
 // Node is a code-structure entity (definition) in a repository at a revision.
@@ -111,8 +138,11 @@ type Filter struct {
 	Conditions []*qdrant.Condition
 }
 
-// Query is one traversal request: start entity, edge selector, and bounds.
+// Query is one graph request: mode, start entity, selectors, and bounds.
 type Query struct {
+	// Mode selects the query family; empty defaults to ModeTraversal and
+	// preserves the pre-parity behaviour.
+	Mode Mode
 	// StartEntity selects the start-node family; empty defaults to definition.
 	StartEntity Entity
 	Start       Filter
@@ -122,4 +152,22 @@ type Query struct {
 	Direction Direction
 	Hops      int
 	Limit     int
+	// FromKey/ToKey are the canonical endpoint keys (payload node_key,
+	// data-model §0) of a path_finding request.
+	FromKey string
+	ToKey   string
+	// NodeKey is the canonical node_key of the neighbours centre.
+	NodeKey string
+	// RelTypes restricts path_finding/neighbors edges by relation type
+	// (edge_type values). path_finding requires a non-empty list (T010);
+	// neighbors treats an empty list as all relations.
+	RelTypes []string
+	// Aggregation knobs (mode=aggregation, plan §7.1): AggOp is
+	// count|sum|avg|min|max, AggField the target field, GroupBy the group
+	// column, Sort "col" (asc) or "-col" (desc). Plain data: validation and
+	// execution live in dsl.go/aggregate.go.
+	AggOp    string
+	AggField string
+	GroupBy  string
+	Sort     string
 }

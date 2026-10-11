@@ -20,7 +20,26 @@ const (
 // selective indexed predicate. The message carries the contractual token
 // `non_selective_query` (R5, contracts/graph-collection.md) so MCP callers can
 // surface it verbatim. Such a query would be a full-collection scan.
-var ErrNonSelective = errors.New("non_selective_query: at least one selective indexed predicate required (repo|file_path|from_file|to_package|from_package|symbol|mr_id)")
+var ErrNonSelective = errors.New("non_selective_query: at least one selective indexed predicate required (repo|file_path|from_file|to_package|from_package|symbol|mr_id|node_key|from_key|to_key|parent_key)")
+
+// Orbit-parity start entities (T024/T032/T036). Their payload kind
+// discriminator IS the entity name (kind=user, note, work_item, milestone,
+// label, runner), so entityMatch maps them generically. Declared here with the
+// start-entity surface of the DSL.
+const (
+	EntityUser      Entity = "user"
+	EntityNote      Entity = "note"
+	EntityWorkItem  Entity = "work_item"
+	EntityMilestone Entity = "milestone"
+	EntityLabel     Entity = "label"
+	EntityRunner    Entity = "runner"
+)
+
+// ErrRelTypesRequired is returned by Compile for a path_finding query without
+// rel_types: an unrestricted shortest-path search is rejected
+// (contracts/mcp-tools.md, plan R3). Carries the contractual token
+// `rel_types_required` so MCP callers can surface it verbatim.
+var ErrRelTypesRequired = errors.New("rel_types_required: path_finding requires a non-empty rel_types")
 
 // selectiveFields are the payload fields that bound a scan when present in a
 // must chain. `kind`, `branch`, `group_org`, `package`, `status` and friends do
@@ -33,16 +52,25 @@ var selectiveFields = map[string]bool{
 	"from_package": true,
 	"symbol":       true,
 	"mr_id":        true,
+	// Canonical-key endpoints (data-model §0): a node_key/from_key/to_key
+	// condition is an exact lookup, never a full-collection scan.
+	"node_key": true,
+	"from_key": true,
+	"to_key":   true,
+	// parent_key (note → its work item/change request, data-model §2) bounds a
+	// start scan to the notes of one parent — the natural note entry point.
+	"parent_key": true,
 }
 
 // Compiled is the executable form of a Query: exact filters plus clamped
 // bounds. Direction tells Traverse which edge endpoints the frontier keys map
 // to on every hop.
 type Compiled struct {
+	Mode      Mode           // normalized query family (never empty)
 	Start     *qdrant.Filter // exact filter of the start points
 	Edge      *qdrant.Filter // per-hop edge filter before frontier narrowing
 	Direction Direction      // expansion direction (outgoing|incoming)
-	Hops      int            // clamped: 1..3
+	Hops      int            // clamped: 1..3 (path_finding: max depth)
 	Limit     int            // clamped: default 30, max 1000
 	// MatchNone reports that a must-chain MatchAny is empty: the query can
 	// never match, so callers must return no points without a single request.
@@ -54,14 +82,21 @@ type Compiled struct {
 // Validation rules (T035):
 //
 //   - ≥1 selective predicate is required, else ErrNonSelective. Selectivity
-//     comes from the typed Filter fields (repo, file_path, symbol) or from raw
-//     Conditions carrying a selective field in a must chain; `should` and
-//     `must_not` never count — they cannot guarantee a bound.
+//     comes from the typed Filter fields (repo, file_path, symbol), from raw
+//     Conditions carrying a selective field in a must chain, or from the
+//     canonical-key endpoints of the mode (neighbours node_key; path_finding
+//     from+to); `should` and `must_not` never count — they cannot guarantee a
+//     bound.
 //   - An empty MatchAny in a must chain can never match: MatchNone is set and
 //     callers short-circuit to an empty result without scanning. Lists longer
 //     than the store's per-request ceiling are NOT chunked here: ScrollAll
 //     expands them into one request per chunk (R5).
 //   - hops is clamped to 1..3, limit to default 30 / max 1000.
+//   - mode must be traversal|aggregation|path_finding|neighbors (empty
+//     defaults to traversal); path_finding additionally requires a non-empty
+//     rel_types, else ErrRelTypesRequired. This task (T010) only plumbs the
+//     mode: the aggregation/path/neighbors engines are aggregate.go, path.go
+//     and neighbors.go; the selectivity guard above holds for every mode.
 //
 // Start filter = entity discriminator + Start + Filter. Edge filter = kind=edge
 // + pinned edge type + the fields every point kind shares (repo, group_org,
@@ -69,6 +104,15 @@ type Compiled struct {
 // expansion must never leave the repository/branch scope, while start-specific
 // predicates (symbol, file_path, ...) would wrongly exclude edges.
 func Compile(q Query) (Compiled, error) {
+	mode := q.Mode
+	if mode == "" {
+		mode = ModeTraversal
+	}
+	switch mode {
+	case ModeTraversal, ModeAggregation, ModePathFinding, ModeNeighbors:
+	default:
+		return Compiled{}, fmt.Errorf("graph: invalid mode %q (want traversal|aggregation|path_finding|neighbors)", mode)
+	}
 	entity := q.StartEntity
 	if entity == "" {
 		entity = EntityDefinition
@@ -84,11 +128,14 @@ func Compile(q Query) (Compiled, error) {
 	if dir != Outgoing && dir != Incoming {
 		return Compiled{}, fmt.Errorf("graph: invalid direction %q (want outgoing|incoming)", dir)
 	}
-	if q.EdgeType != "" && q.EdgeType != "*" && q.EdgeType != EdgeImports && q.EdgeType != EdgeDefines {
-		return Compiled{}, fmt.Errorf("graph: invalid edge type %q (want imports|defines|*)", q.EdgeType)
+	if q.EdgeType != "" && q.EdgeType != "*" && !knownEdgeType(q.EdgeType) {
+		return Compiled{}, fmt.Errorf("graph: invalid edge type %q (want imports|defines|authored|commented|assigned_to|labelled|in_milestone|executed_by|*)", q.EdgeType)
 	}
-	if !selective(q.Start) && !selective(q.Filter) {
+	if !selective(q.Start) && !selective(q.Filter) && !keyBounded(mode, q) {
 		return Compiled{}, ErrNonSelective
+	}
+	if mode == ModePathFinding && len(q.RelTypes) == 0 {
+		return Compiled{}, ErrRelTypesRequired
 	}
 
 	hops := q.Hops
@@ -105,6 +152,7 @@ func Compile(q Query) (Compiled, error) {
 	}
 
 	c := Compiled{
+		Mode:      mode,
 		Start:     &qdrant.Filter{},
 		Edge:      &qdrant.Filter{},
 		Direction: dir,
@@ -131,6 +179,31 @@ func Compile(q Query) (Compiled, error) {
 	return c, nil
 }
 
+// keyBounded reports whether the mode's canonical-key endpoints bound the
+// query: a neighbours centre node_key, or both endpoints of a path_finding
+// request (data-model §0). Traversal has no key endpoint — its selectivity
+// comes from the filters only, so a stray node_key never widens that guard.
+func keyBounded(mode Mode, q Query) bool {
+	switch mode {
+	case ModeNeighbors:
+		return q.NodeKey != ""
+	case ModePathFinding:
+		return q.FromKey != "" && q.ToKey != ""
+	}
+	return false
+}
+
+// knownEdgeType reports whether et is a declared relation label: the pinned
+// edge-type filter must accept every EdgeType the collection can carry.
+func knownEdgeType(et EdgeType) bool {
+	switch et {
+	case EdgeImports, EdgeDefines, EdgeAuthored, EdgeCommented,
+		EdgeAssignedTo, EdgeLabelled, EdgeInMilestone, EdgeExecutedBy:
+		return true
+	}
+	return false
+}
+
 // entityMatch is the kind discriminator of a start scanner: every entity
 // family maps to the payload kind (and node_type) its points carry.
 func entityMatch(e Entity) ([]*qdrant.Condition, error) {
@@ -144,8 +217,11 @@ func entityMatch(e Entity) ([]*qdrant.Condition, error) {
 		}, nil
 	case EntityMrFile, EntityCi, EntityVuln:
 		return []*qdrant.Condition{qdrant.NewMatch("kind", string(e))}, nil
+	case EntityUser, EntityNote, EntityWorkItem, EntityMilestone, EntityLabel, EntityRunner:
+		// Orbit families carry their own kind discriminator; no node_type.
+		return []*qdrant.Condition{qdrant.NewMatch("kind", string(e))}, nil
 	}
-	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln)", e)
+	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln|user|note|work_item|milestone|label|runner)", e)
 }
 
 // typedConditions maps the typed Filter fields to Qdrant match conditions.
