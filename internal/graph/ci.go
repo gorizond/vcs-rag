@@ -20,7 +20,8 @@ const (
 // deployment rows key on their own pipelineID (the deployment id). status and
 // stage are the values the provider normalized. The deterministic ID keeps the
 // re-upsert each pass idempotent and the point alive for the sweep of its
-// generation. Pure: no client, no I/O.
+// generation; node_key exposes the canonical RefCi form the in_pipeline edge
+// resolves against (F13). Pure: no client, no I/O.
 func CiPoint(meta Meta, level, pipelineID, jobName, stage, status string, durationMS int64, ref, env, commitSHA string) *qdrant.PointStruct {
 	return &qdrant.PointStruct{
 		Id: qdrant.NewID(NodeID(Namespace(meta.SchemaVer), meta.Repo, meta.Branch,
@@ -30,6 +31,7 @@ func CiPoint(meta Meta, level, pipelineID, jobName, stage, status string, durati
 			"ci_level":    level,
 			"pipeline_id": pipelineID,
 			"job_name":    jobName,
+			"node_key":    RefCi(meta.Repo, level, pipelineID, jobName),
 			"stage":       stage,
 			"status":      status,
 			"duration_ms": int(durationMS),

@@ -44,9 +44,10 @@ func reviewEdges(points []*qdrant.PointStruct) map[string][][2]string {
 	return out
 }
 
-// TestMergeRequestPointsEdgesAndSkips — US2/T025: the review nodes and edges,
-// the tip-selection rule and the resolve-or-skip behaviour of has_file and the
-// user joins.
+// TestMergeRequestPointsEdgesAndSkips — US2/T025 + F13: the review nodes and
+// edges, the tip-selection rule and the resolve-or-skip behaviour of has_file
+// (emitted only against a diff-file point that carries its own node_key) and
+// the user joins.
 func TestMergeRequestPointsEdgesAndSkips(t *testing.T) {
 	ctx := context.Background()
 	meta := graph.Meta{Repo: "g/r", VCSType: "gitlab", Branch: "main", SchemaVer: "3", Generation: 7}
@@ -55,16 +56,16 @@ func TestMergeRequestPointsEdgesAndSkips(t *testing.T) {
 	}
 	repo := provider.Repo{Namespace: "g", Path: "r"}
 
-	// (a) no merge head to match: the tip is the first listed version; the
-	// legacy mr_file point carries no node_key, so has_file and the
-	// username-only user joins are skipped, never fabricated.
-	legacy := graph.MrFilePoint(meta, 7, provider.ChangeRequestFile{NewPath: "a.go"}, "", "open")
+	// (a) no merge head to match: the tip is the first listed version; the file
+	// point carries its canonical node_key (F13), so has_file links it, while
+	// the username-only user joins stay skipped, never fabricated.
+	file := graph.MrFilePoint(meta, 7, provider.ChangeRequestFile{NewPath: "a.go"}, "", "open")
 	mrs := []provider.ChangeRequest{{ID: 7, Title: "MR"}}
 	refs := map[int64][]provider.MergeRequestDiffRef{7: {
 		{Version: "42", HeadSHA: "h2", BaseSHA: "b2", StartSHA: "s2"},
 		{Version: "41", HeadSHA: "h1", BaseSHA: "b1", StartSHA: "s1"},
 	}}
-	points := mergeRequestPoints(ctx, deps(mrs, refs), repo, meta, []*qdrant.PointStruct{legacy}, testLogger())
+	points := mergeRequestPoints(ctx, deps(mrs, refs), repo, meta, []*qdrant.PointStruct{file}, testLogger())
 
 	kinds := map[string]int{}
 	for _, p := range points {
@@ -84,36 +85,43 @@ func TestMergeRequestPointsEdgesAndSkips(t *testing.T) {
 	if latest := edges[string(graph.EdgeHasLatestDiff)]; len(latest) != 1 || latest[0][1] != wantTip {
 		t.Errorf("has_latest_diff = %v, want one edge to %q (first version)", latest, wantTip)
 	}
-	if files := edges[string(graph.EdgeHasFile)]; len(files) != 0 {
-		t.Errorf("has_file = %v, want none: the legacy file point has no node_key", files)
+	if files := edges[string(graph.EdgeHasFile)]; len(files) != 1 || files[0][0] != wantTip || files[0][1] != "g/r|mr:7|file:a.go" {
+		t.Errorf("has_file = %v, want one edge %q → the file's node_key", files, wantTip)
 	}
 	if joins := len(edges[string(graph.EdgeMerged)]) + len(edges[string(graph.EdgeReviewer)]); joins != 0 {
 		t.Errorf("user joins = %d, want 0: usernames do not resolve to ids", joins)
 	}
 
-	// (b) the merge commit anchors the tip regardless of list order, and a
-	// file point that exposes its own node_key is linked by has_file.
+	// (b) a legacy diff-file point without a node_key resolves to nothing:
+	// has_file is skipped rather than pointed at an unresolvable endpoint.
+	legacy := &qdrant.PointStruct{
+		Id: qdrant.NewID("legacy-file"),
+		Payload: map[string]*qdrant.Value{
+			"kind":      qdrant.NewValueString(string(graph.KindMrFile)),
+			"mr_id":     qdrant.NewValueInt(7),
+			"file_path": qdrant.NewValueString("a.go"),
+		},
+	}
+	points = mergeRequestPoints(ctx, deps(mrs, refs), repo, meta, []*qdrant.PointStruct{legacy}, testLogger())
+	if files := reviewEdges(points)[string(graph.EdgeHasFile)]; len(files) != 0 {
+		t.Errorf("has_file = %v, want none: the legacy file point has no node_key", files)
+	}
+
+	// (c) the merge commit anchors the tip regardless of list order, and the
+	// has_file edge targets the file's own canonical node_key.
 	mrs = []provider.ChangeRequest{{ID: 8, Merged: true, MergeCommitSHA: "h1", Reviewers: []string{"alice"}}}
 	refs = map[int64][]provider.MergeRequestDiffRef{8: {
 		{Version: "40", HeadSHA: "h0"},
 		{Version: "41", HeadSHA: "h1"},
 	}}
-	keyed := &qdrant.PointStruct{
-		Id: qdrant.NewID("keyed-file"),
-		Payload: map[string]*qdrant.Value{
-			"kind":      qdrant.NewValueString(string(graph.KindMrFile)),
-			"mr_id":     qdrant.NewValueInt(8),
-			"file_path": qdrant.NewValueString("b.go"),
-			"node_key":  qdrant.NewValueString("g/r|mr:8|diff:h1|file:b.go"),
-		},
-	}
+	keyed := graph.MrFilePoint(meta, 8, provider.ChangeRequestFile{NewPath: "b.go"}, "", "open")
 	points = mergeRequestPoints(ctx, deps(mrs, refs), repo, meta, []*qdrant.PointStruct{keyed}, testLogger())
 	edges = reviewEdges(points)
 	wantTip = graph.RefMergeRequestDiff("g/r", "8", "h1")
 	if latest := edges[string(graph.EdgeHasLatestDiff)]; len(latest) != 1 || latest[0][1] != wantTip {
 		t.Errorf("has_latest_diff = %v, want the merge-commit match %q", latest, wantTip)
 	}
-	if files := edges[string(graph.EdgeHasFile)]; len(files) != 1 || files[0][0] != wantTip || files[0][1] != "g/r|mr:8|diff:h1|file:b.go" {
+	if files := edges[string(graph.EdgeHasFile)]; len(files) != 1 || files[0][0] != wantTip || files[0][1] != "g/r|mr:8|file:b.go" {
 		t.Errorf("has_file = %v, want one edge %q → keyed file", files, wantTip)
 	}
 }

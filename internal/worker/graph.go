@@ -294,7 +294,7 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 	// then the users and their notes/comments. Each domain is best-effort and
 	// idempotent (deterministic IDs); the targets tell Sweep which kinds saw a
 	// complete listing and may be generation-swept.
-	planning, items, orbitTargets := workItemPoints(ctx, deps, repo, meta, host, lg)
+	planning, items, orbitTargets := workItemPoints(ctx, deps, repo, meta, host, groupKeys(ownershipPts), lg)
 	targets.WorkItems = orbitTargets.WorkItems
 	targets.Milestones = orbitTargets.Milestones
 	targets.Labels = orbitTargets.Labels
@@ -434,6 +434,16 @@ func reviewPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta g
 		// carries a username, not the provider id RefUser keys on.
 		points = append(points, graph.MergeRequestPoint(meta, cr, ""))
 		points = append(points, graph.InProjectEdge(meta, mrKey, "merge_request", projectKey))
+		// US1/T010: the request's merge commit is a commit node of its own,
+		// and merged_at_commit points at it. An unmerged request (empty
+		// sha) emits neither; the commit kind rides the same
+		// complete-listing gate (targets.Review, gc.go) as the request it
+		// came from.
+		if cr.MergeCommitSHA != "" {
+			cp := graph.CommitPoint(meta, meta.Repo, cr.MergeCommitSHA)
+			points = append(points, cp,
+				graph.MergedAtCommitEdge(meta, mrKey, cp.GetPayload()["node_key"].GetStringValue()))
+		}
 		// merged/reviewer are user joins and need a canonical RefUser
 		// endpoint: the request carries reviewer/author usernames while user
 		// nodes key on the numeric provider id, no username→id lookup exists
@@ -569,15 +579,28 @@ func orbitFail(ctx context.Context, lg *slog.Logger, domain string, err error) {
 // phase. The authored/assigned_to edges resolve users by RefUser(host, id), so
 // they join UserPoint by construction; a labelled edge is written only for a
 // label the successful listing carries (a differently-scoped ref would dangle
-// forever). Deterministic IDs make the re-upsert each pass idempotent.
+// forever). The in_group edges (T020) target only a group node of the same
+// pass (groups, from the ownership step) and only for group-scoped labels.
+// Deterministic IDs make the re-upsert each pass idempotent.
 // ponytail: the three listings are re-fetched every pass; add an updated_at
 // sidecar if the provider API cost of unchanged planning data matters.
-func workItemPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, host string, lg *slog.Logger) ([]*qdrant.PointStruct, []provider.WorkItem, graph.SweepTargets) {
+func workItemPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, host string, groups map[string]bool, lg *slog.Logger) ([]*qdrant.PointStruct, []provider.WorkItem, graph.SweepTargets) {
 	var (
 		pts     []*qdrant.PointStruct
 		items   []provider.WorkItem
 		targets graph.SweepTargets
 	)
+	// in_group (T020): every planning entity of the repository belongs to the
+	// repository's namespace group — the only group identity the normalized
+	// milestone/label/workItem data carries. The edge is written only against
+	// a group node the same pass wrote (groups), mirroring the resolve-or-skip
+	// rule of has_file; a project-scoped label has no group owner at all.
+	groupKey := graph.RefGroup(meta.GroupOrg)
+	inGroup := func(fromKey, fromType string) {
+		if meta.GroupOrg != "" && groups[groupKey] {
+			pts = append(pts, graph.InGroupEdge(meta, fromKey, fromType, groupKey))
+		}
+	}
 	if p, ok := deps.VCS.(provider.WorkItemsProvider); ok {
 		listed, err := p.ListWorkItems(ctx, repo)
 		if err != nil {
@@ -594,6 +617,7 @@ func workItemPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta
 			targets.Milestones = true
 			for _, ms := range listed {
 				pts = append(pts, graph.MilestonePoint(meta, ms))
+				inGroup(graph.RefMilestone(meta.Repo, strconv.Itoa(ms.ID)), "milestone")
 			}
 		}
 	}
@@ -607,11 +631,15 @@ func workItemPoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta
 			for _, l := range listed {
 				labelScope[l.Name] = l.Scope
 				pts = append(pts, graph.LabelPoint(meta, l))
+				if l.Scope == "group" {
+					inGroup(graph.RefLabel(l.Scope, l.Name), "label")
+				}
 			}
 		}
 	}
 	for _, item := range items {
 		pts = append(pts, graph.WorkItemPoint(meta, item))
+		inGroup(graph.RefWorkItem(meta.Repo, item.ItemType, strconv.Itoa(item.ID)), "work_item")
 		if item.AuthorID != "" {
 			pts = append(pts, graph.AuthoredEdge(meta, item, graph.RefUser(host, item.AuthorID)))
 		}
@@ -653,6 +681,13 @@ func userNotePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta
 	}
 	var pts []*qdrant.PointStruct
 	ids := map[string]bool{}
+	// members (T020): an assignee of this repository's work item is a member
+	// of its project by provider semantics (both GitLab and GitHub offer only
+	// users with project access as assignees); authors and commenters are NOT
+	// asserted — they may be outside participants. user→group membership has
+	// no provider source in the pass, so member_of is written for the project
+	// half only.
+	members := map[string]bool{}
 	collect := func(id string) {
 		if id != "" {
 			ids[id] = true
@@ -662,6 +697,9 @@ func userNotePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta
 		collect(item.AuthorID)
 		for _, id := range item.AssigneeIDs {
 			collect(id)
+			if id != "" {
+				members[id] = true
+			}
 		}
 	}
 	// notesComplete: the note set is enumerable only when every parent was
@@ -731,6 +769,13 @@ func userNotePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta
 				continue
 			}
 			pts = append(pts, graph.UserPoint(meta, host, u))
+			// The user node was just written, so the membership edge never
+			// dangles on its source side. The project endpoint mirrors the
+			// in_project edges (RefProject is the repo identity).
+			if members[u.ID] {
+				pts = append(pts, graph.MemberOfEdge(meta,
+					graph.RefUser(host, u.ID), graph.RefProject(meta.Repo), "project"))
+			}
 		}
 	}
 	return pts, userComplete
@@ -1245,4 +1290,20 @@ func ownershipPoints(ctx context.Context, deps RepoDeps, meta graph.Meta, host s
 		lg.Info("graph: ownership nodes fetched", "groups", len(groups), "points", len(points))
 	}
 	return points, complete
+}
+
+// groupKeys indexes the node_keys of the group nodes the ownership step wrote:
+// an in_group edge may only target a group node of the same pass — a group the
+// ownership listing did not carry would resolve nowhere (the resolve-or-skip
+// rule of has_file and the user joins). An empty map (no GroupReader seam, a
+// failed listing) withholds every in_group edge.
+func groupKeys(points []*qdrant.PointStruct) map[string]bool {
+	keys := make(map[string]bool)
+	for _, p := range points {
+		m := p.GetPayload()
+		if m["kind"].GetStringValue() == string(graph.KindGroup) {
+			keys[m["node_key"].GetStringValue()] = true
+		}
+	}
+	return keys
 }

@@ -3,6 +3,7 @@ package graph
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"strconv"
 	"strings"
 )
 
@@ -106,6 +107,29 @@ func RefVulnerabilityScanner(host, id string) string            { return host + 
 func RefFinding(repo, uuid string) string                       { return repo + "|finding:" + uuid }
 func RefSecurityScan(repo, id string) string                    { return repo + "|scan:" + id }
 func RefVulnerabilityOccurrence(repo, uuid string) string       { return repo + "|occurrence:" + uuid }
+
+// F13 literal-parity payload keys (schema v4): the commit node family and the
+// revived canonical keys of the legacy mr_file / ci points. Same contract as
+// above: pure, deterministic strings with no generation; a point's node_key
+// and the matching edge endpoint key are the same string by construction.
+func RefCommit(repo, sha string) string { return repo + "|commit:" + sha }
+
+// RefCi is the per-point canonical key of a ci point: level discriminates the
+// flattened Pipeline/Stage/Job/Deployment/Environment rows; jobID is the
+// optional per-row key part (omitted when the row has none).
+func RefCi(repo, level, pipelineID, jobID string) string {
+	k := repo + "|ci:" + level + ":" + pipelineID
+	if jobID != "" {
+		k += ":" + jobID
+	}
+	return k
+}
+
+// RefMergeRequestDiffFile is the canonical key of a diff-file point, shared by
+// the legacy mr_file kind and the canonical merge_request_diff_file kind.
+func RefMergeRequestDiffFile(repo string, iid int, path string) string {
+	return repo + "|mr:" + strconv.Itoa(iid) + "|file:" + path
+}
 
 // KeyCoverage is the canonical key of the per-repo coverage marker (T057).
 func KeyCoverage(repo string) string { return key("coverage", repo) }

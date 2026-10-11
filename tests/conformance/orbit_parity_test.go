@@ -383,7 +383,7 @@ type edgesResponse struct {
 	} `json:"results"`
 }
 
-// --- static Orbit domain reference table (27 items) ---
+// --- static Orbit domain reference table (28 items) ---
 
 // domainCase is one Orbit domain item mapped to the vcs-rag model. A required
 // element is satisfied by any "a|b" alternative it lists; the row is PASS when
@@ -411,6 +411,7 @@ var orbitDomains = []domainCase{
 	{area: "Core", orbit: "Note", mapping: "node note", required: []string{"note"}},
 	// code
 	{area: "code", orbit: "Branch", mapping: "node branch (contains directory, on_branch file/directory)", required: []string{"branch"}},
+	{area: "code", orbit: "Commit", mapping: "node commit (kind=commit, key repo|commit:<sha>; merged_at_commit merge_request -> commit)", required: []string{"commit"}},
 	{area: "code", orbit: "Definition", mapping: "node definition", required: []string{"definition"}},
 	{area: "code", orbit: "File", mapping: "file = its definition nodes (node_key=repo|file:path); contains directory/file", required: []string{"definition"}},
 	{area: "code", orbit: "Directory", mapping: "node directory (contains directory/file)", required: []string{"directory"}},
@@ -440,8 +441,13 @@ var orbitDomains = []domainCase{
 }
 
 var (
-	requiredNodes    = []string{"definition", "user", "note", "work_item", "milestone", "label", "runner"}
-	requiredEdges    = []string{"imports", "defines", "authored", "commented", "assigned_to", "labelled", "in_milestone", "executed_by"}
+	requiredNodes = []string{"definition", "user", "note", "work_item", "milestone", "label", "runner"}
+	// F13 (schema v4) appends the 9 literal-parity relations: the data-bearing
+	// in_group/member_of pair plus the declared-only (dormant) CI/user joins.
+	requiredEdges = []string{
+		"imports", "defines", "authored", "commented", "assigned_to", "labelled", "in_milestone", "executed_by",
+		"in_group", "member_of", "triggered", "has_head_pipeline", "approved", "updated_by", "last_edited_by", "child_of", "created_for_mr",
+	}
 	requiredEntities = []string{"mr_file", "ci", "vuln"}
 	requiredModes    = []string{"traversal", "aggregation", "path_finding", "neighbors"}
 )
@@ -469,6 +475,7 @@ var dataFamilies = []dataFamily{
 	{canonical: "merge_request"},
 	{canonical: "merge_request_diff"},
 	{canonical: "merge_request_diff_file", aliases: []string{"mr_file"}},
+	{canonical: "commit"},
 	{canonical: "vulnerability", aliases: []string{"vuln"}},
 	{canonical: "finding"},
 	{canonical: "vulnerability_occurrence"},
@@ -796,18 +803,21 @@ func TestOrbitParityConformance(t *testing.T) {
 			"expected code=non_selective_query, got: "+firstNonEmpty(out.errorCode(), out.evidence()))
 	}
 
-	// 11) cross-domain: ci --executed_by--> runner.
-	switch {
-	case !present["executed_by"]:
-		rep.add("cross-domain", "ci -> executed_by -> runner", "edge executed_by", statusGap, "executed_by is not declared by graph_schema")
-	default:
-		best := 0
-		errCode := ""
+	// 11) edge emission: observed by traversal from the source family over the
+	// discovered candidates. has_file and in_pipeline are live on the canonical
+	// node_key the legacy mr_file/ci points now carry (T016); executed_by is
+	// the CI -> runner cross-domain link.
+	observeEdge := func(area, orbit, entity, edge string) {
+		if !present[edge] {
+			rep.add(area, orbit, "edge "+edge, statusGap, edge+" is not declared by graph_schema")
+			return
+		}
+		best, errCode := 0, ""
 		for _, cand := range candidates {
 			out := c.tool(t, "query_graph", map[string]any{
 				"mode":  "traversal",
-				"start": startArgs(cand, "ci"),
-				"edge":  map[string]any{"type": "executed_by", "direction": "outgoing"},
+				"start": startArgs(cand, entity),
+				"edge":  map[string]any{"type": edge, "direction": "outgoing"},
 				"limit": 30,
 			})
 			if code := out.errorCode(); code != "" {
@@ -821,15 +831,18 @@ func TestOrbitParityConformance(t *testing.T) {
 		}
 		switch {
 		case best > 0:
-			rep.add("cross-domain", "ci -> executed_by -> runner", "edge executed_by (traversal)", statusPass,
-				fmt.Sprintf("traversed ci points=%d", best))
+			rep.add(area, orbit, "edge "+edge+" (traversal)", statusPass,
+				fmt.Sprintf("traversed %s points=%d", entity, best))
 		case errCode != "":
-			rep.add("cross-domain", "ci -> executed_by -> runner", "edge executed_by (traversal)", statusGap, "tool error: "+errCode)
+			rep.add(area, orbit, "edge "+edge+" (traversal)", statusGap, "tool error: "+errCode)
 		default:
-			rep.add("cross-domain", "ci -> executed_by -> runner", "edge executed_by (traversal)", statusSkip,
-				"0 executed_by edges across candidates "+strings.Join(candidates, ","))
+			rep.add(area, orbit, "edge "+edge+" (traversal)", statusSkip,
+				"0 "+edge+" edges across candidates "+strings.Join(candidates, ","))
 		}
 	}
+	observeEdge("cross-domain", "ci -> executed_by -> runner", "ci", "executed_by")
+	observeEdge("data", "merge_request_diff -> has_file -> merge_request_diff_file", "merge_request_diff", "has_file")
+	observeEdge("data", "security_scan -> in_pipeline -> ci", "security_scan", "in_pipeline")
 
 	rep.finish()
 	dir := writeReports(t, rep)

@@ -35,6 +35,7 @@ Every point is a flat payload (strings/bools/ints) discriminated by `kind`:
 | `merge_request` | one change request: `node_key` (`repo\|mr:<iid>`), `mr_key`, `iid`, `title`, `state`, `source_branch`, `target_branch`, `merged`, `merge_commit_sha` |
 | `merge_request_diff` | one diff version: `node_key` (`repo\|mr:<iid>\|diff:<rev>`), `mr_key`, `version`, base/start/head SHAs, `state` |
 | `merge_request_diff_file` | one changed file of a diff (canonical `mr_file`): `node_key`, `mr_key`, `mr_id`, `file_path`, `status`, `patch`, `patch_truncated` |
+| `commit` | one merged commit emitted from the change-request listing: `node_key` (`repo\|commit:<sha>`), `sha` — the target of `merged_at_commit` |
 | `vulnerability` | one finding-derived vulnerability (canonical `vuln`): `node_key` (`repo\|vuln:<id>`), `severity`, `state`, `scan_id`, `scanner_key`, `primary_identifier_key`, `location_path` |
 | `security_scan` | one security scan: `node_key` (`repo\|scan:<id>`), `scan_type`, `status`, `pipeline_id` |
 | `finding` | one raw security finding: `node_key` (`repo\|finding:<uuid>`), `severity`, `scan_id`, `scanner_key`, `primary_identifier_key`, `location_path` |
@@ -51,12 +52,17 @@ the same revision is idempotent. Only Go files are scanned today
 (`language=go`); edge endpoints are repo-namespaced package keys, so same-named
 packages (`main`, `utils`) never collide across repositories.
 
-**Canonical-key migration and schema v3**: edges carry the canonical
+**Canonical-key migration and schema versions**: edges carry the canonical
 `from_key`/`to_key` endpoint refs (plus `from_type`/`to_type`) next to the legacy
 kind-specific fields (`from_file`/`to_package`/`to_symbol`, kept for backward
 compatibility), and nodes carry `node_key`. The key-space change bumped
 `WORKER_GRAPH_SCHEMA_VER` `1`→`2`; the Orbit-parity node/edge catalog (structure,
-review and security families) bumped `2`→`3`. The version is folded into the ID
+review and security families) bumped `2`→`3`; the literal-parity completion
+(schema **v4**) added the `commit` node and nine Orbit relations and bumped
+`3`→`4`. v4 also revived the canonical `node_key` of the legacy `mr_file` and
+`ci` points (`repo|mr:<iid>|file:<path>`, `repo|ci:<level>:<pipeline_id>[:<job_id>]`),
+so the `has_file` and `in_pipeline` joins are **live** on the canonical refs.
+The version is folded into the ID
 namespace, so every graph id was re-keyed and a one-time **full graph re-scan**
 is required — see the
 [schema-version bump procedure](reindex.md#graph-schema-version-bump-worker_graph_schema_ver).
@@ -73,7 +79,8 @@ re-keyed by a bump.
   `work_item`, `milestone`, `label` and `runner`; the schema-v3 structure
   family is `group`, `project`, `branch`, `directory`, `file`,
   `imported_symbol`; the review family is `merge_request`,
-  `merge_request_diff`, `merge_request_diff_file` (legacy `mr_file`); the
+  `merge_request_diff`, `merge_request_diff_file` (legacy `mr_file`) and the
+  schema-v4 `commit`; the
   security family is `vulnerability` (legacy `vuln`), `security_scan`, `finding`,
   `vulnerability_occurrence`, `vulnerability_identifier` and
   `vulnerability_scanner`. `ci` is a flattened entity family, not a node/edge
@@ -92,7 +99,17 @@ re-keyed by a bump.
   `in_pipeline` (security_scan→ci), `has_finding`, `occurrence_of`,
   `detected_by`, `has_identifier`, plus the `fixes`, `scans`, `resolved_by`,
   `confirmed_by`, `dismissed_by` and `merged_at_commit` joins the review and
-  security families declare.
+  security families declare. `has_file` and `in_pipeline` are **live**: the
+  legacy `mr_file`/`ci` points carry the canonical `node_key`, and the joins
+  resolve against it (v4). The schema-v4 relations are `in_group`
+  (milestone/label/work_item→group) and `member_of` (user→group/project) — the
+  **data-bearing** pair, filled where the provider listing exposes the
+  membership — plus the **dormant (the "спящие" relations)** `triggered` and
+  `has_head_pipeline` (merge_request→ci), `approved`/`updated_by`/
+  `last_edited_by` (user→merge_request), `child_of` (ci→ci) and
+  `created_for_mr` (ci→merge_request): declared and accepted by the DSL with no
+  provider source yet, and **dormant is not a GAP** — they re-key nothing and
+  their absence from an instance is expected until a source lands.
 - **Semantic deltas vs the GitLab Orbit ontology (FR-027)** — "parity" here
   means literal name compatibility plus functional availability, not an
   identical data model:
@@ -116,7 +133,10 @@ re-keyed by a bump.
   `repo|branch:<name>`, `repo|dir:<path>`, `repo|imsym:<file>|<name>`,
   `repo|mr:<iid>`, `repo|mr:<iid>|diff:<rev>`, `repo|vuln:<id>`,
   `repo|scan:<id>`, `repo|finding:<uuid>`, `repo|occurrence:<uuid>`,
-  `<host>|vid:<external_id>` and `<host>|scanner:<id>`. A node's `node_key` and
+  `<host>|vid:<external_id>` and `<host>|scanner:<id>`, the schema-v4
+  `repo|commit:<sha>`, and the revived canonical keys of the legacy `mr_file`/
+  `ci` points `repo|mr:<iid>|file:<path>` and
+  `repo|ci:<level>:<pipeline_id>[:<job_id>]`. A node's `node_key` and
   the matching edge endpoint `from_key`/`to_key` are the same string by
   construction, so path finding and neighbours join them without a translation
   table.
@@ -126,7 +146,8 @@ re-keyed by a bump.
   `project`, `branch`, `directory`, `imported_symbol`, `merge_request`,
   `merge_request_diff`, `merge_request_diff_file`, `vulnerability`,
   `security_scan`, `finding`, `vulnerability_occurrence`,
-  `vulnerability_identifier` and `vulnerability_scanner`. The SDLC domains are
+  `vulnerability_identifier` and `vulnerability_scanner`, plus the schema-v4
+  `commit`. The SDLC domains are
   **best-effort and gated**: extraction depends on the provider's API/role, an
   unavailable 403/404 scope latches the domain off for the lane and only
   withholds its sweep — it never fails the pass.
@@ -183,14 +204,17 @@ marker keeps `indexed_commit` empty — unknown, not "an empty tree was scanned"
 `milestone`/`label`/`runner`/`group`/`project`/`branch`/`directory`/
 `imported_symbol`/`merge_request`/`merge_request_diff`/
 `merge_request_diff_file`/`vulnerability`/`security_scan`/`finding`/
-`vulnerability_occurrence`/`vulnerability_identifier`/`vulnerability_scanner`)
+`vulnerability_occurrence`/`vulnerability_identifier`/`vulnerability_scanner`/
+`commit`)
 plus filters, an optional edge selector (`type`:
 `imports` | `defines` | `authored` | `commented` | `assigned_to` | `labelled` |
 `in_milestone` | `executed_by` | `contains` | `on_branch` | `has_diff` |
 `has_latest_diff` | `has_file` | `merged` | `reviewer` | `in_project` |
 `in_pipeline` | `has_finding` | `occurrence_of` | `detected_by` |
 `has_identifier` | `fixes` | `scans` | `resolved_by` | `confirmed_by` |
-`dismissed_by` | `merged_at_commit` | `*`; `direction`: `outgoing` |
+`dismissed_by` | `merged_at_commit` | `in_group` | `member_of` | `triggered` |
+`has_head_pipeline` | `approved` | `updated_by` | `last_edited_by` | `child_of` |
+`created_for_mr` | `*`; `direction`: `outgoing` |
 `incoming`), `hops` 1..3 (default 1) and `limit` (default 30, maximum 1000).
 The other query families — `aggregation`, `path_finding` (canonical
 `from`/`to` keys, `rel_types` required) and `neighbors` (`node_key`) — are
@@ -241,7 +265,7 @@ Two deliberate scope cuts keep this layer bounded:
 |----------|---------|---------|
 | `QDRANT_GRAPH_COLLECTION` | `vcs_rag_graph` | payload-only graph collection; instance-scoped, must differ from `QDRANT_COLLECTION` |
 | `WORKER_GRAPH_INTERVAL` | `30m` | graph lane tick ceiling (payload-only pass) |
-| `WORKER_GRAPH_SCHEMA_VER` | `3` | graph schema version; part of the ID (uuid5) namespace. Bumped `1`→`2` for the canonical key-space migration and `2`→`3` for the Orbit-parity node/edge catalog (structure, review and security families) — a bump re-keys every id and requires a full graph re-scan ([reindex](reindex.md#graph-schema-version-bump-worker_graph_schema_ver)) |
+| `WORKER_GRAPH_SCHEMA_VER` | `4` | graph schema version; part of the ID (uuid5) namespace. Bumped `1`→`2` for the canonical key-space migration, `2`→`3` for the Orbit-parity node/edge catalog (structure, review and security families) and `3`→`4` for the literal-parity completion (node `commit`, 9 Orbit relations; live `has_file`/`in_pipeline`) — a bump re-keys every id and requires a full graph re-scan ([reindex](reindex.md#graph-schema-version-bump-worker_graph_schema_ver)) |
 | `WORKER_GRAPH_MAX_REPOS_PER_PASS` | `5` | repositories processed per graph pass |
 | `MCP_AUTHZ_ENABLED` | `false` | reserved **no-op**: per-user authz is punted (no filtering behind the flag) |
 

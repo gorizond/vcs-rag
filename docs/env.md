@@ -58,7 +58,7 @@ explicitly listed project/repo), deduplicated. If only the allowlist is set
 | `WORKER_GC_INTERVAL` | `15m` | Repo/entity GC pass ceiling |
 | `WORKER_GC_DRY_RUN` | `true` | GC kill-switch: `true` — observe-only (`gc would-delete` journal), `false` — real deletions |
 | `WORKER_GRAPH_INTERVAL` | `30m` | Graph lane tick (payload-only graph pass) |
-| `WORKER_GRAPH_SCHEMA_VER` | `3` | Graph schema version; part of the graph uuid5 namespace. Bumped `2`→`3` for the Orbit-parity node/edge catalog (structure, review and security families); earlier `1`→`2` for the edge key-space feature. A bump re-keys every graph id and requires a full graph reindex (see [graph](graph.md) · [reindex](reindex.md)) |
+| `WORKER_GRAPH_SCHEMA_VER` | `4` | Graph schema version; part of the graph uuid5 namespace. Bumped `3`→`4` for the literal-parity completion (node `commit`, 9 Orbit relations); `2`→`3` for the Orbit-parity node/edge catalog (structure, review and security families); earlier `1`→`2` for the edge key-space feature. A bump re-keys every graph id and requires a full graph reindex (see [graph](graph.md) · [reindex](reindex.md)) |
 | `WORKER_GRAPH_MAX_REPOS_PER_PASS` | `5` | Repositories processed per graph pass |
 | `WORKER_DISCOVERY_MIN_INTERVAL` | `0` | Reuse a younger discovery listing without an API call; `0` — list on every pass |
 | `WORKER_CONCURRENCY` | `2` | Ceiling for the AIMD embeddings limiter (the limiter itself scales 1…this) |
