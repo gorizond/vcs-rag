@@ -75,11 +75,12 @@ type Worker struct {
 	GCDryRun       bool          // WORKER_GC_DRY_RUN (default true — the kill-switch)
 	GraphInterval  time.Duration // graph lane tick (WORKER_GRAPH_INTERVAL, default 30m)
 	// GraphSchemaVer is part of the graph uuid5 namespace
-	// (WORKER_GRAPH_SCHEMA_VER, default "3"). Bumped 1→2 for the edge
-	// key-space feature and 2→3 for the Orbit-parity gap catalog (structure,
-	// review, security families): adding node and edge kinds changes the
-	// graph schema, and fresh deterministic ids must not collide with the
-	// previous namespace. A bump re-keys every graph id and therefore
+	// (WORKER_GRAPH_SCHEMA_VER, default "4"). Bumped 1→2 for the edge
+	// key-space feature, 2→3 for the Orbit-parity gap catalog (structure,
+	// review, security families) and 3→4 for the literal-parity completion
+	// (commit node, 9 Orbit relations): adding node and edge kinds changes
+	// the graph schema, and fresh deterministic ids must not collide with
+	// the previous namespace. A bump re-keys every graph id and therefore
 	// requires a full graph reindex (re-scan) — see docs/reindex.md.
 	GraphSchemaVer string
 	// GraphMaxReposPerPass caps repositories processed per graph pass
@@ -304,7 +305,7 @@ func Load() (*Config, error) {
 		GCInterval:           gcInterval,
 		GCDryRun:             gcDryRun,
 		GraphInterval:        graphInterval,
-		GraphSchemaVer:       envDefault("WORKER_GRAPH_SCHEMA_VER", "3"),
+		GraphSchemaVer:       envDefault("WORKER_GRAPH_SCHEMA_VER", "4"),
 		GraphMaxReposPerPass: graphMaxRepos,
 		DiscoveryMinInterval: discoveryMin,
 		Concurrency:          concurrency,

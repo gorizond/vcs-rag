@@ -139,7 +139,7 @@ func Compile(q Query) (Compiled, error) {
 		return Compiled{}, fmt.Errorf("graph: invalid direction %q (want outgoing|incoming)", dir)
 	}
 	if q.EdgeType != "" && q.EdgeType != "*" && !knownEdgeType(q.EdgeType) {
-		return Compiled{}, fmt.Errorf("graph: invalid edge type %q (want imports|defines|authored|commented|assigned_to|labelled|in_milestone|executed_by|contains|on_branch|has_diff|has_latest_diff|has_file|merged|reviewer|in_project|in_pipeline|has_finding|occurrence_of|detected_by|has_identifier|fixes|scans|resolved_by|confirmed_by|dismissed_by|merged_at_commit|*)", q.EdgeType)
+		return Compiled{}, fmt.Errorf("graph: invalid edge type %q (want imports|defines|authored|commented|assigned_to|labelled|in_milestone|executed_by|contains|on_branch|has_diff|has_latest_diff|has_file|merged|reviewer|in_project|in_pipeline|has_finding|occurrence_of|detected_by|has_identifier|fixes|scans|resolved_by|confirmed_by|dismissed_by|merged_at_commit|in_group|member_of|triggered|has_head_pipeline|approved|updated_by|last_edited_by|child_of|created_for_mr|*)", q.EdgeType)
 	}
 	if !selective(q.Start) && !selective(q.Filter) && !keyBounded(mode, q) {
 		return Compiled{}, ErrNonSelective
@@ -213,7 +213,11 @@ func knownEdgeType(et EdgeType) bool {
 		EdgeContains, EdgeOnBranch, EdgeHasDiff, EdgeHasLatestDiff, EdgeHasFile,
 		EdgeMerged, EdgeReviewer, EdgeInProject, EdgeInPipeline, EdgeHasFinding,
 		EdgeOccurrenceOf, EdgeDetectedBy, EdgeHasIdentifier, EdgeFixes, EdgeScans,
-		EdgeResolvedBy, EdgeConfirmedBy, EdgeDismissedBy, EdgeMergedAtCommit:
+		EdgeResolvedBy, EdgeConfirmedBy, EdgeDismissedBy, EdgeMergedAtCommit,
+		// F13 literal-parity relations (schema v4). Dormant relations are
+		// accepted like any other pinned edge type.
+		EdgeInGroup, EdgeMemberOf, EdgeTriggered, EdgeHeadPipeline, EdgeApproved,
+		EdgeUpdatedBy, EdgeLastEditedBy, EdgeChildOf, EdgeCreatedForMr:
 		return true
 	}
 	return false
@@ -239,15 +243,16 @@ func entityMatch(e Entity) ([]*qdrant.Condition, error) {
 		legacy, _ := KindAlias(Kind(e))
 		return []*qdrant.Condition{qdrant.NewMatchKeywords("kind", string(Kind(e)), string(legacy))}, nil
 	case EntityMrFile, EntityCi, EntityVuln,
-		// Orbit + schema-v3 families carry their own kind discriminator
+		// Orbit + schema-v3/v4 families carry their own kind discriminator
 		// (kind = entity name); no node_type.
 		EntityGroup, EntityProject, EntityBranch, EntityDirectory, EntityImportedSymbol,
 		EntityMergeRequest, EntityMergeRequestDiff, EntitySecurityScan, EntityFinding,
 		EntityVulnerabilityOccurrence, EntityVulnerabilityIdentifier, EntityVulnerabilityScanner,
-		EntityUser, EntityNote, EntityWorkItem, EntityMilestone, EntityLabel, EntityRunner:
+		EntityUser, EntityNote, EntityWorkItem, EntityMilestone, EntityLabel, EntityRunner,
+		EntityCommit:
 		return []*qdrant.Condition{qdrant.NewMatch("kind", string(e))}, nil
 	}
-	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln|user|note|work_item|milestone|label|runner|group|project|branch|directory|imported_symbol|merge_request|merge_request_diff|merge_request_diff_file|vulnerability|security_scan|finding|vulnerability_occurrence|vulnerability_identifier|vulnerability_scanner)", e)
+	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln|user|note|work_item|milestone|label|runner|group|project|branch|directory|imported_symbol|merge_request|merge_request_diff|merge_request_diff_file|vulnerability|security_scan|finding|vulnerability_occurrence|vulnerability_identifier|vulnerability_scanner|commit)", e)
 }
 
 // typedConditions maps the typed Filter fields to Qdrant match conditions.

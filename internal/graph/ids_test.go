@@ -74,6 +74,20 @@ func TestRefKeysScoped(t *testing.T) {
 		graph.RefLabel("gorizond", "bug") == graph.RefLabel("other", "bug") {
 		t.Error("RefLabel must be scope-scoped")
 	}
+
+	// F13 (schema v4): the commit / ci / diff-file canonical key formats.
+	if got := graph.RefCommit("org/repo", "abc"); got != "org/repo|commit:abc" {
+		t.Errorf("RefCommit = %q", got)
+	}
+	if got := graph.RefCi("org/repo", "job", "11", "7"); got != "org/repo|ci:job:11:7" {
+		t.Errorf("RefCi (job) = %q", got)
+	}
+	if got := graph.RefCi("org/repo", "deployment", "11", ""); got != "org/repo|ci:deployment:11" {
+		t.Errorf("RefCi (no job part) = %q", got)
+	}
+	if got := graph.RefMergeRequestDiffFile("org/repo", 7, "a/b.go"); got != "org/repo|mr:7|file:a/b.go" {
+		t.Errorf("RefMergeRequestDiffFile = %q", got)
+	}
 }
 
 // TestCompileModeValidation pins the T010 mode plumbing: the enum is accepted

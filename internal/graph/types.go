@@ -44,6 +44,9 @@ const (
 	KindVulnerabilityOccurrence Kind = "vulnerability_occurrence"
 	KindVulnerabilityIdentifier Kind = "vulnerability_identifier"
 	KindVulnerabilityScanner    Kind = "vulnerability_scanner"
+	// F13 literal-parity (schema v4): the commit node family, emitted from the
+	// merge-request listing; merged_at_commit points at these points.
+	KindCommit Kind = "commit"
 )
 
 // KindAlias returns the legacy spelling of a canonical v3 node kind and
@@ -96,6 +99,9 @@ const (
 	EntityVulnerabilityOccurrence Entity = "vulnerability_occurrence"
 	EntityVulnerabilityIdentifier Entity = "vulnerability_identifier"
 	EntityVulnerabilityScanner    Entity = "vulnerability_scanner"
+	// F13 literal-parity (schema v4): the commit start entity (kind=commit),
+	// addressed by the canonical key repo|commit:<sha>.
+	EntityCommit Entity = "commit"
 )
 
 // EdgeType is the relation label carried by a graph edge.
@@ -132,6 +138,20 @@ const (
 	EdgeConfirmedBy    EdgeType = "confirmed_by"     // user → vulnerability
 	EdgeDismissedBy    EdgeType = "dismissed_by"     // user → vulnerability
 	EdgeMergedAtCommit EdgeType = "merged_at_commit" // merge_request → commit
+	// F13 literal-parity relations (schema v4, contracts/graph-schema-additions.md).
+	// in_group/member_of are filled where the provider data allows; the CI and
+	// user-join relations are declared and accepted but dormant (no provider
+	// source) — dormant is not a GAP. CI-targeted relations land on the
+	// flattened ci node (ci_level discriminates Pipeline/Stage/Job/Environment).
+	EdgeInGroup      EdgeType = "in_group"          // milestone/label/work_item → group
+	EdgeMemberOf     EdgeType = "member_of"         // user → group|project
+	EdgeTriggered    EdgeType = "triggered"         // merge_request → ci (dormant)
+	EdgeHeadPipeline EdgeType = "has_head_pipeline" // merge_request → ci (dormant)
+	EdgeApproved     EdgeType = "approved"          // user → merge_request (dormant)
+	EdgeUpdatedBy    EdgeType = "updated_by"        // user → merge_request (dormant)
+	EdgeLastEditedBy EdgeType = "last_edited_by"    // user → merge_request (dormant)
+	EdgeChildOf      EdgeType = "child_of"          // ci → ci (dormant)
+	EdgeCreatedForMr EdgeType = "created_for_mr"    // ci → merge_request (dormant)
 )
 
 // Direction selects the traversal direction relative to the start entity.

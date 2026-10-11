@@ -32,7 +32,9 @@ func clipPatch(patch string) (string, bool) {
 // keeps its ID). truncated is set when the provider flagged the diff (too
 // large/collapsed) or the stored patch was cut to MaxPatchBytes. file_path is
 // the new path of the file — renames join on the current path (OldPath is the
-// fallback for deleted entries without one). Pure: no client, no I/O.
+// fallback for deleted entries without one). node_key exposes the canonical
+// RefMergeRequestDiffFile form the has_file edge resolves against (F13). Pure:
+// no client, no I/O.
 func MrFilePoint(meta Meta, mrID int, file provider.ChangeRequestFile, author, state string) *qdrant.PointStruct {
 	filePath := file.NewPath
 	if filePath == "" {
@@ -46,6 +48,7 @@ func MrFilePoint(meta Meta, mrID int, file provider.ChangeRequestFile, author, s
 			"kind":            string(KindMrFile),
 			"mr_id":           mrID,
 			"file_path":       filePath,
+			"node_key":        RefMergeRequestDiffFile(meta.Repo, mrID, filePath),
 			"status":          file.Status,
 			"author":          author,
 			"state":           state,

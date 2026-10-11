@@ -484,12 +484,13 @@ func registerTools(server *mcp.Server, t *tools) {
 		Name: "graph_schema",
 		Description: "Self-describing graph schema: node types (definition, user, note, work_item, milestone, label, runner and the schema-v3 " +
 			"group, project, branch, directory, file, imported_symbol, merge_request, merge_request_diff, merge_request_diff_file, vulnerability, " +
-			"security_scan, finding, vulnerability_occurrence, vulnerability_identifier, vulnerability_scanner families) with indexed properties, " +
+			"security_scan, finding, vulnerability_occurrence, vulnerability_identifier, vulnerability_scanner families plus the schema-v4 commit) with indexed properties, " +
 			"edge types (imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by and the schema-v3 contains, " +
 			"on_branch, has_diff, has_latest_diff, has_file, merged, reviewer, in_project, in_pipeline, has_finding, occurrence_of, detected_by, " +
-			"has_identifier, fixes, scans, resolved_by, confirmed_by, dismissed_by, merged_at_commit), " +
+			"has_identifier, fixes, scans, resolved_by, confirmed_by, dismissed_by, merged_at_commit, plus the schema-v4 in_group, member_of, " +
+			"triggered, has_head_pipeline, approved, updated_by, last_edited_by, child_of, created_for_mr), " +
 			"entity types (mr_file, ci and vuln stay accepted as legacy aliases of merge_request_diff_file/the flattened CI family/vulnerability), " +
-			"the query DSL version (v3)/modes/operators, and coverage_per_repo (repo, indexed_commit, generation, indexed_at, languages_with_resolvers) " +
+			"the query DSL version (v4)/modes/operators, and coverage_per_repo (repo, indexed_commit, generation, indexed_at, languages_with_resolvers) " +
 			"from the per-repo coverage markers — best-effort, empty when no scan has completed yet. " +
 			"Semantic deltas vs the GitLab Orbit ontology (FR-027): (a) the ci family flattens Orbit's Pipeline/Stage/Job/Deployment/Environment " +
 			"entities into one kind discriminated by ci_level (job|deployment|environment) — there is no separate pipeline/stage node; " +
@@ -1439,6 +1440,13 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 				Properties: []string{"node_key", "mr_key", "mr_id", "file_path", "status", "patch", "patch_truncated", "author", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
 				Indexed:    []string{"node_key", "mr_key", "mr_id", "file_path", "status", "author", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
 			},
+			// F13 (schema v4): commit nodes, emitted from the MR listing
+			// (merged_at_commit points at repo|commit:<sha>).
+			{
+				Name:       string(graph.KindCommit),
+				Properties: []string{"node_key", "sha", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "sha", "repo", "branch", "schema_ver"},
+			},
 			{
 				Name:       string(graph.KindVulnerability),
 				Properties: []string{"node_key", "severity", "state", "scan_id", "scanner_key", "primary_identifier_key", "location_path", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
@@ -1499,6 +1507,20 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 			{Name: string(graph.EdgeConfirmedBy), From: "user", To: "vulnerability"},
 			{Name: string(graph.EdgeDismissedBy), From: "user", To: "vulnerability"},
 			{Name: string(graph.EdgeMergedAtCommit), From: "merge_request", To: "commit"},
+			// F13 literal-parity relations (schema v4): 1:1 people/planning
+			// relations plus the CI-targeted ones on the flattened ci node.
+			// The dormant ones (approved/updated_by/last_edited_by/child_of/
+			// created_for_mr/triggered/has_head_pipeline) are declared and
+			// accepted but not filled — dormant is not a GAP.
+			{Name: string(graph.EdgeInGroup), From: "milestone/label/work_item", To: "group"},
+			{Name: string(graph.EdgeMemberOf), From: "user", To: "group/project"},
+			{Name: string(graph.EdgeTriggered), From: "merge_request", To: "ci"},
+			{Name: string(graph.EdgeHeadPipeline), From: "merge_request", To: "ci"},
+			{Name: string(graph.EdgeApproved), From: "user", To: "merge_request"},
+			{Name: string(graph.EdgeUpdatedBy), From: "user", To: "merge_request"},
+			{Name: string(graph.EdgeLastEditedBy), From: "user", To: "merge_request"},
+			{Name: string(graph.EdgeChildOf), From: "ci", To: "ci"},
+			{Name: string(graph.EdgeCreatedForMr), From: "ci", To: "merge_request"},
 		},
 		EntityTypes: []entityTypeSpec{
 			{Name: string(graph.KindMrFile), Description: "per-file MR/PR diffs (search_pull_requests file_path; legacy alias of merge_request_diff_file)"},
@@ -1520,6 +1542,8 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 			{Name: string(graph.EntityVulnerabilityOccurrence), Description: "vulnerability occurrences (occurrence_of → vulnerability)"},
 			{Name: string(graph.EntityVulnerabilityIdentifier), Description: "vulnerability identifiers (has_identifier)"},
 			{Name: string(graph.EntityVulnerabilityScanner), Description: "vulnerability scanners (detected_by; scans → project)"},
+			// F13 (schema v4): the commit start entity.
+			{Name: string(graph.EntityCommit), Description: "commit nodes (merged_at_commit → commit; GitLab-only, from the MR listing)"},
 		},
 		QueryDSL: queryDSL{
 			Version: ver,

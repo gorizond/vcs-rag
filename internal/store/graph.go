@@ -66,9 +66,10 @@ func (g *GraphStore) EnsureGraphCollection(ctx context.Context) error {
 
 // graphIndexFields are the payload indexes of the graph collection. All are
 // keyword (array payloads such as tags index element-wise) except symbol_text
-// (full-text) and the graphDatetimeIndexFields; commit_sha, patch, signature,
-// generation, and indexed_at are deliberately NOT indexed, and body/title are
-// never indexed (bodies stay unindexed).
+// (full-text) and the graphDatetimeIndexFields; patch, signature, generation,
+// and indexed_at are deliberately NOT indexed, and body/title are never
+// indexed (bodies stay unindexed). commit_sha is indexed as of schema v4
+// (review/commit filters).
 var graphIndexFields = []string{
 	"kind",
 	"node_type",
@@ -146,6 +147,12 @@ var graphIndexFields = []string{
 	"protected",
 	"source_branch",
 	"target_branch",
+	// F13 literal-parity (schema v4): review/commit filter and group fields.
+	"iid",
+	"merged",
+	"merge_commit_sha",
+	"commit_sha",
+	"sha",
 }
 
 // graphDatetimeIndexFields are indexed as FieldTypeDatetime instead of the

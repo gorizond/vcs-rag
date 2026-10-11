@@ -28,9 +28,10 @@ type SweepTargets struct {
 	// instead of deleting them blindly.
 	Security bool
 	// Review gates the change-request sub-family (merge_request,
-	// merge_request_diff, merge_request_diff_file): its ingest is one
-	// best-effort request listing plus per-request diff listings, so a failed
-	// or withheld listing must keep their stale points.
+	// merge_request_diff, merge_request_diff_file, and the commit nodes the
+	// same listing emits): its ingest is one best-effort request listing plus
+	// per-request diff listings, so a failed or withheld listing must keep
+	// their stale points.
 	Review bool
 	// Ownership gates the group/project chain: its ingest is the best-effort
 	// group listing plus the per-group project listings.
@@ -173,6 +174,8 @@ func Sweep(ctx context.Context, gs sweepStore, repo, branch string, generation i
 		{KindMergeRequest, t.Review},
 		{KindMergeRequestDiff, t.Review},
 		{KindMergeRequestDiffFile, t.Review},
+		// F13 (schema v4): commit nodes are emitted from the same MR listing.
+		{KindCommit, t.Review},
 		// Ownership chain: the best-effort group/project listings gate both
 		// kinds.
 		{KindGroup, t.Ownership},
