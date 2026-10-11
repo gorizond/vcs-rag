@@ -92,60 +92,115 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 // repositories from the discovery snapshot, starting at the rotating offset
 // (T015): per-repo lock, failure isolation (FR-014). One generation stamp is
 // shared by every repository of the pass — the sweep of a repository (T016)
-// compares against exactly the generation of its scan.
+// compares against exactly the generation of its scan. The ownership step
+// (US4/T039) is instance-level, so it runs at the pass level, before and
+// independently of the repo loop: a pass that processes no repository (an
+// idle discovery window) still re-emits the group/project points and sweeps
+// them once the pass completes.
 func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs *store.GraphStore, start int, vuln *vulnGate, runners *runnerGate) *summary {
 	sum := newSummary("graph")
-	repos := snap.get()
-	if len(repos) == 0 {
-		return sum
-	}
-	if start > 0 {
-		start %= len(repos)
-		repos = repos[start:]
-	}
-	if max := cfg.Worker.GraphMaxReposPerPass; max > 0 && len(repos) > max {
-		repos = repos[:max]
-	}
 	generation := int(time.Now().Unix())
-	for _, repo := range repos {
-		if ctx.Err() != nil {
-			break
+	// US4/T039: the ownership listing is best-effort (FR-024): a missing
+	// GroupReader seam or a failed listing logs and withholds the instance
+	// sweep, never the pass. A store write error withholds the sweep too —
+	// the stale points are kept rather than deleted without their fresh
+	// replacement. The points are instance-level (scope-free IDs), so
+	// re-emitting them every pass stays idempotent.
+	ownerPts, ownerOK := ownershipPoints(ctx, deps, graph.Meta{
+		VCSType:    deps.VCSType,
+		SchemaVer:  cfg.Worker.GraphSchemaVer,
+		Generation: generation,
+	}, vcsHost(cfg, deps.VCSType), deps.Logger)
+	if len(ownerPts) > 0 {
+		if err := gs.Upsert(ctx, ownerPts); err != nil {
+			deps.Logger.Error("graph: ownership write failed", "err", err)
+			ownerOK = false
+		} else {
+			deps.Logger.Info("graph: ownership points upserted", "points", len(ownerPts))
 		}
-		sum.countRepo(processSafely(ctx, deps.Logger, repo, "graph", func() error {
-			// T110: the per-repo lock is taken at the call site only.
-			return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
-				written, err := processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, vuln, runners)
-				if err == nil {
-					sum.addUpdated(written)
-				}
-				return err
-			})
-		}))
+	}
+	// The group keys are pass-level too: every per-repo step resolves its
+	// in_group edges (milestone/label/work_item → group) against exactly the
+	// groups this pass emitted.
+	groups := groupKeys(ownerPts)
+	repos := snap.get()
+	if len(repos) > 0 {
+		if start > 0 {
+			start %= len(repos)
+			repos = repos[start:]
+		}
+		if max := cfg.Worker.GraphMaxReposPerPass; max > 0 && len(repos) > max {
+			repos = repos[:max]
+		}
+		for _, repo := range repos {
+			if ctx.Err() != nil {
+				break
+			}
+			sum.countRepo(processSafely(ctx, deps.Logger, repo, "graph", func() error {
+				// T110: the per-repo lock is taken at the call site only.
+				return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
+					written, err := processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, groups, vuln, runners)
+					if err == nil {
+						sum.addUpdated(written)
+					}
+					return err
+				})
+			}))
+		}
+	}
+	// The instance-wide ownership sweep (SweepOwnership) runs once per
+	// completed pass — even when no repository was processed — so the stale
+	// group/project points go away on any pass whose ownership listing
+	// completed. A canceled pass never sweeps (T016, the per-repo rule).
+	if ownerOK && ctx.Err() == nil {
+		deleted, err := graph.SweepOwnership(ctx, gs, generation, cfg.Worker.GCDryRun)
+		if err != nil {
+			deps.Logger.Error("graph: ownership sweep failed", "err", err)
+		} else if deleted > 0 {
+			deps.Logger.Info("graph: ownership points swept", "points", deleted)
+		}
 	}
 	return sum
 }
 
 // processGraphRepo is the entry of the refresh composition: an explicit
 // one-repo refresh probes the security domain on its own (a fresh gate), while
-// the graph lane calls processGraphRepoPass with its lane-wide gate.
+// the graph lane calls processGraphRepoPass with its lane-wide gate. The
+// refresh has no pass context, so it runs the instance-level ownership listing
+// itself (best-effort, as before) and threads its group keys into the
+// per-repo step — the same keys the lane pass computes at pass level — so the
+// in_group edges of the refreshed repository keep resolving. The instance-wide
+// ownership sweep stays a pass-level concern (SweepOwnership in graphPass).
 func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int) (int, error) {
-	return processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, &vulnGate{}, &runnerGate{})
+	ownerPts, _ := ownershipPoints(ctx, deps, graph.Meta{
+		VCSType:    deps.VCSType,
+		SchemaVer:  cfg.Worker.GraphSchemaVer,
+		Generation: generation,
+	}, vcsHost(cfg, deps.VCSType), deps.Logger)
+	if len(ownerPts) > 0 {
+		if err := gs.Upsert(ctx, ownerPts); err != nil {
+			return 0, fmt.Errorf("ownership write: %w", err)
+		}
+	}
+	return processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, groupKeys(ownerPts), &vulnGate{}, &runnerGate{})
 }
 
 // processGraphRepoPass extracts the graph of one repository's default branch
 // (T015): mirror → branch snapshot → tree → blob → chunk.Extract → writer. A
 // completed scan writes the coverage marker (T057) and only then sweeps the
 // stale generations of that repo+branch (T016) — a failed or canceled pass
-// never sweeps. The tree/branch structure (US3) and the group/project
-// ownership chain (US4) follow the code graph; then the change-request list
-// feeds both the mr_file diffs and the change-request notes, and the orbit
-// phases (US2/US3) add the planning nodes (work items, milestones, labels) and
-// the users/notes. The runner nodes (US4) come behind their lane-wide gate
-// last. Every orbit and schema-v3 domain is best-effort: a failed or
-// unavailable listing withholds only that domain's sweep (SweepTargets) and
-// never the pass. CPU-only: no embeddings, no commit budget (R13). Lock-free
-// by design: the lane and the refresh composition hold the per-repo lock.
-func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, vuln *vulnGate, runners *runnerGate) (int, error) {
+// never sweeps. The tree/branch structure (US3) follows the code graph; the
+// group/project ownership chain (US4) is instance-level and emitted by the
+// pass, which threads its group keys in (groups) so the in_group edges of the
+// planning nodes resolve. Then the change-request list feeds both the mr_file
+// diffs and the change-request notes, and the orbit phases (US2/US3) add the
+// planning nodes (work items, milestones, labels) and the users/notes. The
+// runner nodes (US4) come behind their lane-wide gate last. Every orbit and
+// schema-v3 domain is best-effort: a failed or unavailable listing withholds
+// only that domain's sweep (SweepTargets) and never the pass. CPU-only: no
+// embeddings, no commit budget (R13). Lock-free by design: the lane and the
+// refresh composition hold the per-repo lock.
+func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, groups map[string]bool, vuln *vulnGate, runners *runnerGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
 	if err != nil {
@@ -216,18 +271,6 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 	}
 	targets.Structure = structureOK
 	host := vcsHost(cfg, deps.VCSType)
-	// US4/T039: the group/project ownership chain. The group listing and the
-	// per-group project listings are best-effort: a failed one is logged and
-	// withholds the ownership sweep (targets.Ownership), never the pass
-	// (FR-024).
-	ownershipPts, ownershipOK := ownershipPoints(ctx, deps, meta, host, lg)
-	if len(ownershipPts) > 0 {
-		if err := gs.Upsert(ctx, ownershipPts); err != nil {
-			return written, fmt.Errorf("ownership write: %w", err)
-		}
-		written += len(ownershipPts)
-	}
-	targets.Ownership = ownershipOK
 	// US2/T025: file diffs of the repository's change requests. A provider
 	// failure fails the repository pass before its coverage marker and sweep
 	// (T016: a failed pass never sweeps); processSafely isolates it (FR-014).
@@ -294,7 +337,7 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 	// then the users and their notes/comments. Each domain is best-effort and
 	// idempotent (deterministic IDs); the targets tell Sweep which kinds saw a
 	// complete listing and may be generation-swept.
-	planning, items, orbitTargets := workItemPoints(ctx, deps, repo, meta, host, groupKeys(ownershipPts), lg)
+	planning, items, orbitTargets := workItemPoints(ctx, deps, repo, meta, host, groups, lg)
 	targets.WorkItems = orbitTargets.WorkItems
 	targets.Milestones = orbitTargets.Milestones
 	targets.Labels = orbitTargets.Labels
@@ -580,7 +623,8 @@ func orbitFail(ctx context.Context, lg *slog.Logger, domain string, err error) {
 // they join UserPoint by construction; a labelled edge is written only for a
 // label the successful listing carries (a differently-scoped ref would dangle
 // forever). The in_group edges (T020) target only a group node of the same
-// pass (groups, from the ownership step) and only for group-scoped labels.
+// pass (groups, the pass-level ownership keys threaded in by the caller) and
+// only for group-scoped labels.
 // Deterministic IDs make the re-upsert each pass idempotent.
 // ponytail: the three listings are re-fetched every pass; add an updated_at
 // sidecar if the provider API cost of unchanged planning data matters.
@@ -1243,15 +1287,18 @@ func treePaths(scanned []graph.FileGraph) (files, dirs []string) {
 	return files, dirs
 }
 
-// ownershipPoints builds the ownership step of one repository (US4/T039): one
-// group node per group of the provider's listing, the parent→child contains
-// edge where the namespace hierarchy names a parent, and per group the project
-// nodes with their group→project contains edge. Projects are listed per group
-// so each carries its namespace context. Best-effort by design (FR-024): a
-// provider without the GroupReader seam or a failed listing is logged and the
-// pass continues; the returned flag reports whether every listing of the step
-// completed — only then may Sweep generation-sweep the group/project kinds
-// (targets.Ownership), so a withheld listing keeps its stale points.
+// ownershipPoints builds the instance-level ownership step of one graph pass
+// (US4/T039): one group node per group of the provider's listing, the
+// parent→child contains edge where the namespace hierarchy names a parent, and
+// per group the project nodes with their group→project contains edge. Projects
+// are listed per group so each carries its namespace context. Best-effort by
+// design (FR-024): a provider without the GroupReader seam or a failed listing
+// is logged and the pass continues; the returned flag reports whether every
+// listing of the step completed — only then may SweepOwnership
+// generation-sweep the group/project kinds, so a withheld listing keeps its
+// stale points. The step is called once per pass from graphPass (and from the
+// refresh entry, which has no pass context): the ownership data is not
+// repo-scoped, so a pass that processes no repository still emits it.
 // Deterministic IDs make the re-upsert each pass idempotent; the step is
 // scope-free (empty repo/branch in every ID and payload) because ownership is
 // instance-level, not repo-level: the same entity emitted from any repo pass
@@ -1302,11 +1349,12 @@ func ownershipPoints(ctx context.Context, deps RepoDeps, meta graph.Meta, host s
 	return points, complete
 }
 
-// groupKeys indexes the node_keys of the group nodes the ownership step wrote:
-// an in_group edge may only target a group node of the same pass — a group the
-// ownership listing did not carry would resolve nowhere (the resolve-or-skip
-// rule of has_file and the user joins). An empty map (no GroupReader seam, a
-// failed listing) withholds every in_group edge.
+// groupKeys indexes the node_keys of the group nodes the pass-level ownership
+// step wrote: an in_group edge may only target a group node of the same pass —
+// a group the ownership listing did not carry would resolve nowhere (the
+// resolve-or-skip rule of has_file and the user joins). The keys are computed
+// once per pass and threaded into the per-repo step. An empty map (no
+// GroupReader seam, a failed listing) withholds every in_group edge.
 func groupKeys(points []*qdrant.PointStruct) map[string]bool {
 	keys := make(map[string]bool)
 	for _, p := range points {

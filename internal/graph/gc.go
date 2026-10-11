@@ -33,9 +33,6 @@ type SweepTargets struct {
 	// per-request diff listings, so a failed or withheld listing must keep
 	// their stale points.
 	Review bool
-	// Ownership gates the group/project chain: its ingest is the best-effort
-	// group listing plus the per-group project listings.
-	Ownership bool
 	// Structure gates the branch nodes: their ingest is the best-effort branch
 	// listing. The file/directory/imported_symbol points of the same family
 	// stay core — the code-graph write step fails the pass on error.
@@ -70,14 +67,13 @@ type sweepStore interface {
 // kinds, but only when their pass listing completed (SweepTargets). Users are
 // host-scoped by construction (node_key RefUser): within one repo+branch every
 // user point comes from the one provider instance the process serves. The same
-// holds for runners (node_key RefRunner). The schema-v3 review/ownership/
-// structure families and the flattened ci / legacy vuln families are gated the
-// same way (t.Review/t.Ownership/t.Structure/t.CI/t.Vuln): their providers list
-// best-effort, so a withheld listing keeps their stale points instead of
-// deleting them blindly. The ownership kinds are additionally swept
-// repo-agnostically: their points are instance-level (empty payload scope), so
-// the per-repo filter never matches them — see the ownership block below the
-// gated loop. Notes are NEVER
+// holds for runners (node_key RefRunner). The schema-v3 review/structure
+// families and the flattened ci / legacy vuln families are gated the same way
+// (t.Review/t.Structure/t.CI/t.Vuln): their providers list best-effort, so a
+// withheld listing keeps their stale points instead of deleting them blindly.
+// The group/project ownership kinds are NOT swept here: they are instance-level
+// (scope-free IDs and payload), so no repo filter matches them — they are swept
+// by SweepOwnership once per completed pass. Notes are NEVER
 // generation-swept (R9): a live note the pass did not re-list must survive, so
 // they are cascade-deleted only when their parent is being removed — a stale
 // work item (gated by its complete listing) or a change request whose file
@@ -144,7 +140,7 @@ func Sweep(ctx context.Context, gs sweepStore, repo, branch string, generation i
 	// error, so a pass that reaches the sweep always saw them fully —
 	// node/edge/mr_file plus the code-graph-derived structure nodes
 	// (file/directory) and imported_symbol. The best-effort families (ci,
-	// vuln, review, ownership, structure, security, orbit) ride their
+	// vuln, review, structure, security, orbit) ride their
 	// SweepTargets flag below. mr_file stays: legacy points coexist with the
 	// canonical merge_request_diff_file kind until the reindex.
 	for _, kind := range []Kind{
@@ -179,11 +175,6 @@ func Sweep(ctx context.Context, gs sweepStore, repo, branch string, generation i
 		{KindMergeRequestDiffFile, t.Review},
 		// F13 (schema v4): commit nodes are emitted from the same MR listing.
 		{KindCommit, t.Review},
-		// Ownership chain: the best-effort group/project listings gate both
-		// kinds. This per-repo pass clears the pre-fix duplicate points that
-		// carry the scanning repo; the scope-free points are swept below.
-		{KindGroup, t.Ownership},
-		{KindProject, t.Ownership},
 		// Structure: the best-effort branch listing gates the branch nodes
 		// (file/directory/imported_symbol stay core above).
 		{KindBranch, t.Structure},
@@ -205,19 +196,25 @@ func Sweep(ctx context.Context, gs sweepStore, repo, branch string, generation i
 		}
 		deleted += n
 	}
-	// Ownership is instance-level: the group/project points are built with an
-	// empty scope, so the per-repo loop above never matches them. When the
-	// group listings completed (t.Ownership), sweep them by kind + generation
-	// alone — a group/project that disappeared from the listing goes away
-	// regardless of which repo pass last wrote it.
-	if t.Ownership {
-		for _, kind := range []Kind{KindGroup, KindProject} {
-			n, err := sweepInstanceKind(ctx, gs, kind, generation, dryRun)
-			if err != nil {
-				return deleted, err
-			}
-			deleted += n
+	return deleted, nil
+}
+
+// SweepOwnership deletes the stale instance-level ownership points (KindGroup
+// and KindProject) of the whole instance by kind + generation alone — the
+// ownership points are written with an empty payload scope, so no repo/branch
+// filter matches them (sweepInstanceKind). The caller runs it once per
+// completed graph pass, even a pass that processed no repository, and only
+// when the pass's ownership listing completed: a failed or canceled pass keeps
+// the stale points (FR-024/T016), exactly like the per-repo sweep rule. The
+// per-repo Sweep never touches these kinds.
+func SweepOwnership(ctx context.Context, gs sweepStore, generation int, dryRun bool) (int, error) {
+	deleted := 0
+	for _, kind := range []Kind{KindGroup, KindProject} {
+		n, err := sweepInstanceKind(ctx, gs, kind, generation, dryRun)
+		if err != nil {
+			return deleted, err
 		}
+		deleted += n
 	}
 	return deleted, nil
 }
@@ -232,7 +229,7 @@ func sweepKind(ctx context.Context, gs sweepStore, kind Kind, repo, branch strin
 // sweepInstanceKind counts and deletes (dry-run: only reports) the stale points
 // of one kind across the whole instance (no repo/branch scope): the ownership
 // kinds are written with an empty scope, so the per-repo filter never matches
-// them.
+// them. Called by SweepOwnership.
 func sweepInstanceKind(ctx context.Context, gs sweepStore, kind Kind, generation int, dryRun bool) (int, error) {
 	return sweepStale(ctx, gs, kind, staleInstanceKindFilter(kind, generation), generation, dryRun)
 }

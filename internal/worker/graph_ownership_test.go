@@ -91,3 +91,94 @@ func TestOwnershipPointsScopeIndependent(t *testing.T) {
 		t.Fatal("schema version must stay part of the point ID")
 	}
 }
+
+// planningStub serves the pass-level ownership listing plus the planning
+// families of one repository, all against one fixed neutral fixture: the
+// instance-level group example-org with project example-org/r, and a milestone,
+// a group-scoped label and a work item of that repository. The embedded nil
+// VCSProvider panics on any other method, proving the resolution test calls
+// only the GroupReader and planning seams.
+type planningStub struct {
+	provider.VCSProvider
+}
+
+func (s *planningStub) ListGroups(context.Context) ([]provider.Group, error) {
+	return []provider.Group{
+		{ID: "1", FullPath: "example-org", Path: "example-org", Name: "example-org"},
+	}, nil
+}
+
+func (s *planningStub) ListGroupProjects(context.Context, string) ([]provider.Project, error) {
+	return []provider.Project{
+		{ID: "10", FullPath: "example-org/r", Path: "r", Name: "r", NamespaceKind: "group"},
+	}, nil
+}
+
+func (s *planningStub) ListMilestones(context.Context, provider.Repo) ([]provider.Milestone, error) {
+	return []provider.Milestone{{ID: 3, Title: "v1"}}, nil
+}
+
+func (s *planningStub) ListLabels(context.Context, provider.Repo) ([]provider.Label, error) {
+	return []provider.Label{{Name: "area", Scope: "group"}}, nil
+}
+
+func (s *planningStub) ListWorkItems(context.Context, provider.Repo) ([]provider.WorkItem, error) {
+	return []provider.WorkItem{{ID: 7, ItemType: "issue", Title: "fix"}}, nil
+}
+
+// TestInGroupResolvesAgainstPassLevelKeys — the ownership step is pass-level,
+// so the per-repo step receives the group keys of the whole pass (exactly the
+// map graphPass computes from the pass-level listing and threads in), not its
+// own listing. The planning entities of the repository resolve their in_group
+// edges against those keys; with the keys withheld (no completed ownership
+// listing) the resolve-or-skip rule emits none instead of dangling an
+// endpoint.
+func TestInGroupResolvesAgainstPassLevelKeys(t *testing.T) {
+	deps := RepoDeps{VCSType: "gitlab", VCS: &planningStub{}, Logger: testLogger()}
+	pass := graph.Meta{VCSType: "gitlab", SchemaVer: "4", Generation: 42}
+	repo := provider.Repo{Namespace: "example-org", Path: "r"}
+	meta := pass
+	meta.Repo, meta.GroupOrg, meta.Branch = "example-org/r", "example-org", "main"
+
+	ownerPts, ok := ownershipPoints(context.Background(), deps, pass, "gitlab.example", deps.Logger)
+	if !ok || len(ownerPts) == 0 {
+		t.Fatalf("ownershipPoints: (%d,%v), want a completed non-empty listing", len(ownerPts), ok)
+	}
+	keys := groupKeys(ownerPts)
+	groupKey := graph.RefGroup(meta.GroupOrg)
+	if !keys[groupKey] {
+		t.Fatalf("pass-level keys miss %q: %v", groupKey, keys)
+	}
+
+	pts, _, _ := workItemPoints(context.Background(), deps, repo, meta, "gitlab.example", keys, deps.Logger)
+	want := map[string]string{
+		"milestone": graph.RefMilestone(meta.Repo, "3"),
+		"label":     graph.RefLabel("group", "area"),
+		"work_item": graph.RefWorkItem(meta.Repo, "issue", "7"),
+	}
+	got := map[string]string{}
+	for _, p := range pts {
+		m := p.GetPayload()
+		if m["kind"].GetStringValue() != string(graph.KindEdge) || m["edge_type"].GetStringValue() != string(graph.EdgeInGroup) {
+			continue
+		}
+		if to := m["to_key"].GetStringValue(); to != groupKey {
+			t.Fatalf("in_group edge targets %q, want %q", to, groupKey)
+		}
+		got[m["from_type"].GetStringValue()] = m["from_key"].GetStringValue()
+	}
+	for fromType, fromKey := range want {
+		if got[fromType] != fromKey {
+			t.Fatalf("in_group %s→group: got %q, want %q (all: %v)", fromType, got[fromType], fromKey, got)
+		}
+	}
+
+	// Negative control: without the pass-level keys every in_group edge is
+	// withheld.
+	pts, _, _ = workItemPoints(context.Background(), deps, repo, meta, "gitlab.example", nil, deps.Logger)
+	for _, p := range pts {
+		if m := p.GetPayload(); m["edge_type"].GetStringValue() == string(graph.EdgeInGroup) {
+			t.Fatalf("in_group edge emitted without pass-level keys: %v", m)
+		}
+	}
+}
