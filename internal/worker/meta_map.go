@@ -13,28 +13,40 @@ const ciTailLines = 50
 // metaItem is a ready metadata point: ID, payload and text for embedding.
 type metaItem struct {
 	ID      string
-	Payload map[string]any
-	Text    string
+	Payload map[string]any // full upsert payload (includes the F3 fields)
+	// MetaPayload — the F3 subset (author/assignees/reviewers/labels/milestone/
+	// state), written via set_payload to points that are NOT re-embedded (T029).
+	MetaPayload map[string]any
+	Text        string
 }
 
 // mapIssue maps an issue to a type=issue point (data-model §5).
 func mapIssue(vcsType, groupOrg, repo string, iss provider.Issue) metaItem {
 	text := titleBody(iss.Title, iss.Body)
+	meta := store.EntityMeta{
+		Author: iss.Author, Assignees: iss.Assignees, Labels: iss.Labels,
+		Milestone: iss.Milestone, State: iss.State,
+	}
 	return metaItem{
-		ID:      store.IssueID(vcsType, repo, iss.ID),
-		Payload: store.IssuePayload(vcsType, groupOrg, repo, iss.State, text, iss.ID),
-		Text:    text,
+		ID:          store.IssueID(vcsType, repo, iss.ID),
+		Payload:     store.IssuePayload(vcsType, groupOrg, repo, text, iss.ID, meta),
+		MetaPayload: meta.Payload(),
+		Text:        text,
 	}
 }
 
 // mapChangeRequest maps an MR/PR to a type=pull_request point (data-model §4).
 func mapChangeRequest(vcsType, groupOrg, repo string, cr provider.ChangeRequest) metaItem {
 	text := titleBody(cr.Title, cr.Body)
+	meta := store.EntityMeta{
+		Author: cr.Author, Assignees: cr.Assignees, Reviewers: cr.Reviewers,
+		Labels: cr.Labels, Milestone: cr.Milestone, State: cr.State,
+	}
 	return metaItem{
-		ID: store.PullRequestID(vcsType, repo, cr.ID),
-		Payload: store.PullRequestPayload(vcsType, groupOrg, repo,
-			cr.SourceBranch, cr.TargetBranch, cr.State, text, cr.ID),
-		Text: text,
+		ID:          store.PullRequestID(vcsType, repo, cr.ID),
+		Payload:     store.PullRequestPayload(vcsType, groupOrg, repo, cr.SourceBranch, cr.TargetBranch, text, cr.ID, meta),
+		MetaPayload: meta.Payload(),
+		Text:        text,
 	}
 }
 

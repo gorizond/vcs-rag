@@ -64,23 +64,36 @@ func TestCodePayload(t *testing.T) {
 }
 
 func TestOtherPayloads(t *testing.T) {
-	pr := PullRequestPayload("gitlab", "grp", "repo", "feat", "main", "opened", "text", 42)
+	meta := EntityMeta{
+		Author: "alice", Assignees: []string{"bob"}, Reviewers: []string{"carol"},
+		Labels: []string{"bug"}, Milestone: "v1", State: "opened",
+	}
+	pr := PullRequestPayload("gitlab", "grp", "repo", "feat", "main", "text", 42, meta)
 	wantPR := map[string]any{
 		"vcs_type": "gitlab", "group_org": "grp", "repo": "repo", "type": "pull_request",
 		"pr_id": int64(42), "source_branch": "feat", "target_branch": "main",
 		"state": "opened", "text": "text",
+		"author": "alice", "assignees": []string{"bob"}, "reviewers": []string{"carol"},
+		"labels": []string{"bug"}, "milestone": "v1",
 	}
 	if !reflect.DeepEqual(pr, wantPR) {
 		t.Errorf("PullRequestPayload = %v, want %v", pr, wantPR)
 	}
 
-	issue := IssuePayload("github", "org", "repo", "closed", "text", 7)
+	issue := IssuePayload("github", "org", "repo", "text", 7, EntityMeta{Author: "dave", Labels: []string{"p1"}, State: "closed"})
 	wantIssue := map[string]any{
 		"vcs_type": "github", "group_org": "org", "repo": "repo", "type": "issue",
 		"issue_id": int64(7), "state": "closed", "text": "text",
+		"author": "dave", "assignees": []string(nil), "reviewers": []string(nil),
+		"labels": []string{"p1"}, "milestone": "",
 	}
 	if !reflect.DeepEqual(issue, wantIssue) {
 		t.Errorf("IssuePayload = %v, want %v", issue, wantIssue)
+	}
+
+	// EntityMeta.Payload is the F3 subset handed to set_payload — every key is present.
+	if p := (EntityMeta{State: "open"}).Payload(); len(p) != 6 || p["state"] != "open" || p["author"] != "" {
+		t.Errorf("EntityMeta.Payload = %v", p)
 	}
 
 	ci := CIFailurePayload("gitlab", "grp", "repo", "100", "1000", "build", "main", "sha1", "log")

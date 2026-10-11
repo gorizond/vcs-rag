@@ -80,3 +80,32 @@ func (s *Store) Upsert(ctx context.Context, points []Point) error {
 	}
 	return nil
 }
+
+// PayloadValues converts a payload map into Qdrant values (the upsert
+// value-building: sanitize + NewValueMap) — the input of SetPayload.
+func PayloadValues(payload map[string]any) map[string]*qdrant.Value {
+	return qdrant.NewValueMap(sanitizePayload(payload))
+}
+
+// SetPayload merges payload fields into existing points without touching their
+// vectors (F3/T029): a re-upsert would re-embed the batch and break the LM
+// budget, so additive fields of already-embedded points go through here.
+func (s *Store) SetPayload(ctx context.Context, ids []string, payload map[string]*qdrant.Value) error {
+	if len(ids) == 0 || len(payload) == 0 {
+		return nil
+	}
+	ptIDs := make([]*qdrant.PointId, 0, len(ids))
+	for _, id := range ids {
+		ptIDs = append(ptIDs, qdrant.NewID(id))
+	}
+	_, err := s.client.SetPayload(ctx, &qdrant.SetPayloadPoints{
+		CollectionName: s.collection,
+		Wait:           qdrant.PtrOf(true),
+		Payload:        payload,
+		PointsSelector: qdrant.NewPointsSelector(ptIDs...),
+	})
+	if err != nil {
+		return fmt.Errorf("qdrant: set payload: %w", err)
+	}
+	return nil
+}

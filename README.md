@@ -73,10 +73,13 @@ flowchart LR
   NATS -.-> KV
 ```
 
-The background lanes (discovery → mirror → index → metadata, plus the GC lane)
-keep the index fresh; the MCP server only reads Qdrant and, with NATS, can pull
-one repository on demand ([refresh flow](docs/refresh.md)) or refresh it
-automatically before a repo-scoped search (Auto freshness below).
+The background lanes (discovery → mirror → index → metadata, plus the GC and
+graph lanes) keep the index fresh; the MCP server only reads Qdrant and, with
+NATS, can pull one repository on demand ([refresh flow](docs/refresh.md)) or
+refresh it automatically before a repo-scoped search (Auto freshness below).
+The graph lane writes a separate payload-only collection — definition nodes,
+import/defines edges and SDLC entities, no vectors
+([graph layer](docs/graph.md)).
 
 ## Key environment variables
 
@@ -306,10 +309,26 @@ the JSON file.
 
 **Gotcha:** clients cache the tool list at connect time — after upgrading the
 server image (a new version adds tools), **restart the client**; a plain
-reconnect may keep the old list. Every client should show the tools
-`search_code`, `search_pull_requests`, `search_issues`, `search_ci_failures`,
-`index_status` (and `refresh_repo` with `NATS_URL` set); calling `index_status`
-is the quickest connectivity check.
+reconnect may keep the old list. The complete list is the tool table below;
+calling `index_status` is the quickest connectivity check.
+
+**Tools.** The search tools plus the graph tools (which read the separate
+payload-only graph collection, [`docs/graph.md`](docs/graph.md)) and the
+worker/NATS tools:
+
+| Tool | Purpose |
+|------|---------|
+| `search_code` | semantic code search |
+| `search_pull_requests` | semantic MR/PR search; optional `state` (open/merged/closed/locked/draft), `label`, `author`, `milestone` filters. With `file_path`: exact lookup of the MRs/PRs that changed the file, each with its per-file diff chunks (`file_path`, `status`, `patch`, `patch_truncated`); repo is required and `query` is not used in this mode |
+| `search_issues` | semantic issue search; same `state`/`label`/`author`/`milestone` filters |
+| `search_ci_failures` | semantic search over failed CI job logs |
+| `search_definitions` | symbol definitions from the graph; `mode=auto` (default) tries name matching first, then falls back to the semantic code search; `name` matches the symbol exactly or as a full-text token (no substring/prefix) |
+| `get_imports` | direct 1-hop package imports of a file or package (`direction=outgoing` default: what the input imports) |
+| `get_dependents` | direct 1-hop importers (`direction=incoming` default). **Package-level, not symbol-level**: the dependents of file X are the importers of X's package(s), not symbol referencers |
+| `query_graph` | structured N-hop traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`) + filters, optional edge selector (`imports`/`defines`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
+| `graph_schema` | self-describing graph schema: node/edge/entity types, query DSL version/operators, per-repo coverage markers |
+| `index_status` | worker indexing status (below) |
+| `refresh_repo` | on-demand refresh of one repository (registered only with `NATS_URL` set) |
 
 ## Indexing status (`index_status`)
 
@@ -407,7 +426,8 @@ docker run --rm ghcr.io/gorizond/vcs-rag:0.0.1 -version   # → vcs-rag v0.0.1
 
 - All environment variables — [`docs/env.md`](docs/env.md).
 - Refresh semantics — [`docs/refresh.md`](docs/refresh.md); garbage collection —
-  [`docs/gc.md`](docs/gc.md); changing the embeddings model/dimension —
+  [`docs/gc.md`](docs/gc.md); the graph collection, mark-and-sweep GC and query
+  DSL — [`docs/graph.md`](docs/graph.md); changing the embeddings model/dimension —
   [`docs/reindex.md`](docs/reindex.md).
 - Validation SC-001…SC-009 and the performance baseline — `tests/integration/final-validation.md`,
   `tests/integration/perf-baseline.md`.

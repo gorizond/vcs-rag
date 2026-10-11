@@ -7,7 +7,7 @@ local `.env` or the orchestrator's secret store — never in the repository.
 
 The quickstart uses [`.env.example`](../.env.example); the compose stacks read
 the same names from `.env`. See also: [refresh](refresh.md) ·
-[GC](gc.md) · [reindex](reindex.md).
+[GC](gc.md) · [graph](graph.md) · [reindex](reindex.md).
 
 ## VCS provider (exactly one flavor)
 
@@ -39,6 +39,7 @@ Setting both flavors at once is a configuration error — keep exactly one.
 | `QDRANT_URL` | `http://localhost:6334` | Qdrant gRPC endpoint |
 | `QDRANT_API_KEY` | *(empty)* | API key for Qdrant Cloud / secured instances. **Secret** |
 | `QDRANT_COLLECTION` | `vcs_rag` | Collection name; one collection per instance (see multi-instance notes in the README) |
+| `QDRANT_GRAPH_COLLECTION` | `vcs_rag_graph` | Payload-only graph collection; **instance-scoped** (unique per deployment, several contours may share one Qdrant). Must differ from `QDRANT_COLLECTION` — the service refuses to start otherwise |
 
 ## Worker
 
@@ -49,6 +50,9 @@ Setting both flavors at once is a configuration error — keep exactly one.
 | `WORKER_MIRROR_INTERVAL` | `WORKER_INTERVAL` | Mirror (git fetch) pass ceiling |
 | `WORKER_GC_INTERVAL` | `15m` | Repo/entity GC pass ceiling |
 | `WORKER_GC_DRY_RUN` | `true` | GC kill-switch: `true` — observe-only (`gc would-delete` journal), `false` — real deletions |
+| `WORKER_GRAPH_INTERVAL` | `30m` | Graph lane tick (payload-only graph pass) |
+| `WORKER_GRAPH_SCHEMA_VER` | `1` | Graph schema version; part of the graph uuid5 namespace |
+| `WORKER_GRAPH_MAX_REPOS_PER_PASS` | `5` | Repositories processed per graph pass |
 | `WORKER_DISCOVERY_MIN_INTERVAL` | `0` | Reuse a younger discovery listing without an API call; `0` — list on every pass |
 | `WORKER_CONCURRENCY` | `2` | Ceiling for the AIMD embeddings limiter (the limiter itself scales 1…this) |
 | `MIRRORS_DIR` | `./mirrors` | Bare mirrors + `*.state.json` sidecars + `.gc_registry.json` |

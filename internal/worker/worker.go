@@ -15,8 +15,8 @@ import (
 
 // Run assembles and starts the worker: provider → embeddings → store;
 // the collection dimension and indexes are checked BEFORE the first write
-// (FR-009, fail-fast), then the discovery/mirror/index lanes run in parallel.
-// Blocks until context cancellation.
+// (FR-009, fail-fast), then the discovery/mirror/index/graph lanes run in
+// parallel. Blocks until context cancellation.
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	// FR-014: a second worker on the same MirrorsDir will not start.
 	release, err := AcquireLock(cfg.Worker.MirrorsDir)
@@ -45,6 +45,11 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	if err := st.EnsureIndexes(ctx); err != nil {
 		return err
 	}
+
+	// T010: the graph store shares the vector client but owns its payload-only
+	// collection (instance-scoped QDRANT_GRAPH_COLLECTION); the graph lane
+	// bootstraps it fail-soft — a failure disables only that lane.
+	graphSt := store.NewGraphStore(st, cfg.Qdrant.GraphCollection)
 
 	// T074: private repositories — auth env for network git operations;
 	// the token never reaches the clone URL or the mirror config.
@@ -80,18 +85,20 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 7)
+	errCh := make(chan error, 8)
 	run := func(fn func() error) {
 		defer wg.Done()
 		errCh <- fn()
 	}
-	wg.Add(5)
+	wg.Add(6)
 	go run(func() error { return runDiscovery(ctx, vcs, cfg, logger, snap) })
 	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
 	go run(func() error { return runIndex(ctx, cfg, deps, snap, statusRep) })
 	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
 	// T140: repo-GC — discovery is the source of truth; dry-run by default.
 	go run(func() error { return runGC(ctx, cfg, deps, snap) })
+	// T010: the SDLC graph lane — CPU-only, its own pacer/lock, no LM budget (R13).
+	go run(func() error { return runGraph(ctx, cfg, deps, snap, graphSt) })
 	if statusRep != nil {
 		wg.Add(1)
 		go run(func() error { return statusRep.run(ctx) })

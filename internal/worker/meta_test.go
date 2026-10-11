@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qdrant/go-client/qdrant"
+
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/embed"
 	"github.com/gorizond/vcs-rag/internal/gitengine"
@@ -24,17 +26,28 @@ import (
 
 func TestMapIssue(t *testing.T) {
 	it := mapIssue("github", "org", "myrepo", provider.Issue{
-		ID: 7, Title: "Header", Body: "Body", State: "opened",
+		ID: 7, Title: "Header", Body: "Body", State: "open",
+		Author: "alice", Assignees: []string{"bob"}, Labels: []string{"bug"}, Milestone: "v1",
 	})
 	if it.ID != "79eb2957-ed8a-592d-99e5-4b0b5e1cda64" {
 		t.Errorf("ID = %q", it.ID)
 	}
 	want := map[string]any{
 		"vcs_type": "github", "group_org": "org", "repo": "myrepo", "type": "issue",
-		"issue_id": int64(7), "state": "opened", "text": "Header\n\nBody",
+		"issue_id": int64(7), "state": "open", "text": "Header\n\nBody",
+		"author": "alice", "assignees": []string{"bob"}, "reviewers": []string(nil),
+		"labels": []string{"bug"}, "milestone": "v1",
 	}
 	if !reflect.DeepEqual(it.Payload, want) {
 		t.Errorf("payload = %v, want %v", it.Payload, want)
+	}
+	// MetaPayload is the F3 subset (set_payload on unchanged points, T029).
+	wantMeta := map[string]any{
+		"author": "alice", "assignees": []string{"bob"}, "reviewers": []string(nil),
+		"labels": []string{"bug"}, "milestone": "v1", "state": "open",
+	}
+	if !reflect.DeepEqual(it.MetaPayload, wantMeta) {
+		t.Errorf("meta payload = %v, want %v", it.MetaPayload, wantMeta)
 	}
 	if it.Text != "Header\n\nBody" {
 		t.Errorf("text = %q", it.Text)
@@ -51,6 +64,8 @@ func TestMapChangeRequest(t *testing.T) {
 	it := mapChangeRequest("gitlab", "grp", "myrepo", provider.ChangeRequest{
 		ID: 42, Title: "PR header", Body: "PR body", State: "opened",
 		SourceBranch: "feat", TargetBranch: "main",
+		Author: "carol", Assignees: []string{"dave"}, Reviewers: []string{"erin"},
+		Labels: []string{"review"}, Milestone: "v2",
 	})
 	if it.ID != "bd8787b5-9878-55f0-a044-7f60c392e290" {
 		t.Errorf("ID = %q", it.ID)
@@ -59,6 +74,8 @@ func TestMapChangeRequest(t *testing.T) {
 		"vcs_type": "gitlab", "group_org": "grp", "repo": "myrepo", "type": "pull_request",
 		"pr_id": int64(42), "source_branch": "feat", "target_branch": "main",
 		"state": "opened", "text": "PR header\n\nPR body",
+		"author": "carol", "assignees": []string{"dave"}, "reviewers": []string{"erin"},
+		"labels": []string{"review"}, "milestone": "v2",
 	}
 	if !reflect.DeepEqual(it.Payload, want) {
 		t.Errorf("payload = %v, want %v", it.Payload, want)
@@ -148,10 +165,23 @@ type countingStore struct {
 	deletes    [][2]string
 	deletedIDs []string
 	existing   []store.ScoredPoint
+	payloads   []payloadCall
+}
+
+// payloadCall — one SetPayload call (T029).
+type payloadCall struct {
+	ids     []string
+	payload map[string]*qdrant.Value
 }
 
 func (c *countingStore) Upsert(_ context.Context, points []store.Point) error {
 	c.upserts = append(c.upserts, points)
+	return nil
+}
+
+// SetPayload records the F3 payload-only updates (T029).
+func (c *countingStore) SetPayload(_ context.Context, ids []string, payload map[string]*qdrant.Value) error {
+	c.payloads = append(c.payloads, payloadCall{ids: ids, payload: payload})
 	return nil
 }
 
@@ -262,6 +292,63 @@ func TestMetadataIncrementalIssuesPRs(t *testing.T) {
 	}
 	if saved.Meta["mr:2"] != t0.Add(time.Second).Unix() {
 		t.Errorf("state mr:2 = %d, want %d", saved.Meta["mr:2"], t0.Add(time.Second).Unix())
+	}
+}
+
+// T029/F3: the budget invariant — a pass that re-embeds nothing must still
+// refresh the additive fields, and it does so via set_payload only.
+func TestMetadataF3SetPayloadOnly(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Unix(1000, 0)
+	repo := provider.Repo{ID: "1", Namespace: "g", Path: "r"}
+	vcs := &fake.Provider{
+		Repos: []provider.Repo{repo},
+		Issues: map[string][]provider.Issue{
+			"1": {{ID: 1, Title: "Issue", UpdatedAt: t0, Author: "alice", State: "open"}},
+		},
+		ChangeRequests: map[string][]provider.ChangeRequest{
+			"1": {{ID: 2, Title: "PR", UpdatedAt: t0, Author: "bob", State: "merged"}},
+		},
+	}
+	emb := &countingEmbed{}
+	deps := newMetaDeps(t, vcs, emb, testLogger())
+	st := &countingStore{}
+
+	// first pass: both points are new — embedded and upserted with the F3
+	// fields in the upsert payload; set_payload is not called.
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if emb.texts != 2 || len(st.points()) != 2 || len(st.payloads) != 0 {
+		t.Fatalf("first pass: texts=%d points=%d set_payload=%d, want 2/2/0",
+			emb.texts, len(st.points()), len(st.payloads))
+	}
+
+	// second pass: nothing changed — no re-embed, no re-upsert; both points get
+	// the F3 fields via set_payload.
+	if err := processMetadataOnce(ctx, deps, repo, st); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if emb.texts != 2 || len(st.points()) != 2 {
+		t.Errorf("second pass re-embedded: texts=%d points=%d", emb.texts, len(st.points()))
+	}
+	if len(st.payloads) != 2 {
+		t.Fatalf("second pass set_payload = %d, want 2", len(st.payloads))
+	}
+	states := map[string]string{}
+	for _, call := range st.payloads {
+		if len(call.ids) != 1 {
+			t.Errorf("set_payload ids = %v, want one point", call.ids)
+			continue
+		}
+		if _, ok := call.payload["author"]; !ok {
+			t.Errorf("set_payload misses the F3 fields: %v", call.payload)
+		}
+		states[call.ids[0]] = call.payload["state"].GetStringValue()
+	}
+	if states[store.IssueID("gitlab", "r", 1)] != "open" ||
+		states[store.PullRequestID("gitlab", "r", 2)] != "merged" {
+		t.Errorf("set_payload states = %v", states)
 	}
 }
 

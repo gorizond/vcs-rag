@@ -96,3 +96,49 @@ func TestBuildFilterRepos(t *testing.T) {
 		t.Errorf("should[0] repo = %s=%q", k, v)
 	}
 }
+
+// T032: F3 filters — state/author/milestone are Match conditions; array fields
+// use Match for one value and Match-any for several (ANY semantics); empty
+// lists add no condition.
+func TestBuildFilterMetadata(t *testing.T) {
+	flt := buildFilter(Filter{
+		Type: "issue", State: "open", Author: "alice", Milestone: "v1",
+		Labels: []string{"bug"}, Assignees: []string{"bob"}, Reviewers: []string{"carol", "dave"},
+	})
+	if flt == nil || flt.GetMinShould() != nil {
+		t.Fatalf("filter = %+v", flt)
+	}
+	got := map[string]string{}
+	for _, c := range flt.GetMust() {
+		k, v := fieldKeyword(c)
+		got[k] = v
+	}
+	for k, want := range map[string]string{
+		"type": "issue", "state": "open", "author": "alice", "milestone": "v1",
+		"labels": "bug", "assignees": "bob",
+	} {
+		if got[k] != want {
+			t.Errorf("%s = %q, want %q", k, got[k], want)
+		}
+	}
+	// several reviewers: match-any, not a keyword match.
+	var reviewers *qdrant.Condition
+	for _, c := range flt.GetMust() {
+		if c.GetField().GetKey() == "reviewers" {
+			reviewers = c
+		}
+	}
+	if reviewers == nil {
+		t.Fatal("no reviewers condition")
+	}
+	keywords := reviewers.GetField().GetMatch().GetKeywords()
+	if keywords == nil || len(keywords.GetStrings()) != 2 {
+		t.Errorf("reviewers match = %+v, want match-any of 2", reviewers.GetField().GetMatch())
+	}
+
+	// empty arrays and empty strings add nothing.
+	empty := buildFilter(Filter{Type: "issue"})
+	if len(empty.GetMust()) != 1 || empty.GetMust()[0].GetField().GetKey() != "type" {
+		t.Errorf("empty metadata leaked into must: %+v", empty.GetMust())
+	}
+}

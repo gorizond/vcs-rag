@@ -21,13 +21,20 @@ type RepoRef struct {
 // Filter — payload search filter; empty fields do not participate
 // (must conditions on payload indexes, no full scan).
 type Filter struct {
-	VCSType  string
-	GroupOrg string
-	Repo     string    // one repository (short form as stored); raw passthrough when unresolved
-	RepoRefs []RepoRef // T133-fix: resolved pairs; 1 — direct pair, 2+ — OR (pairs win over GroupOrg/Repo)
-	Branch   string
-	Type     string
-	State    string
+	VCSType   string
+	GroupOrg  string
+	Repo      string    // one repository (short form as stored); raw passthrough when unresolved
+	RepoRefs  []RepoRef // T133-fix: resolved pairs; 1 — direct pair, 2+ — OR (pairs win over GroupOrg/Repo)
+	Branch    string
+	Type      string
+	State     string // canonical open|merged|closed|locked|draft (F3)
+	Author    string
+	Milestone string
+	// Array fields (F3): one value — Match (Qdrant matches any array element),
+	// several — MatchAny (ANY semantics); empty — no condition.
+	Labels    []string
+	Assignees []string
+	Reviewers []string
 }
 
 // ScoredPoint — a vector search result.
@@ -48,6 +55,17 @@ func buildFilter(f Filter) *qdrant.Filter {
 			must = append(must, qdrant.NewMatch(key, value))
 		}
 	}
+	// addAny — arrays (F3): Match for one value (any element), MatchAny for
+	// several; an empty list is no condition.
+	addAny := func(key string, values []string) {
+		switch len(values) {
+		case 0:
+		case 1:
+			must = append(must, qdrant.NewMatch(key, values[0]))
+		default:
+			must = append(must, qdrant.NewMatchKeywords(key, values...))
+		}
+	}
 	add("vcs_type", f.VCSType)
 	switch len(f.RepoRefs) {
 	case 0:
@@ -60,6 +78,11 @@ func buildFilter(f Filter) *qdrant.Filter {
 	add("branch", f.Branch)
 	add("type", f.Type)
 	add("state", f.State)
+	add("author", f.Author)
+	add("milestone", f.Milestone)
+	addAny("labels", f.Labels)
+	addAny("assignees", f.Assignees)
+	addAny("reviewers", f.Reviewers)
 
 	var flt *qdrant.Filter
 	if len(must) > 0 {
