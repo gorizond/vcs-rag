@@ -74,7 +74,10 @@ type sweepStore interface {
 // structure families and the flattened ci / legacy vuln families are gated the
 // same way (t.Review/t.Ownership/t.Structure/t.CI/t.Vuln): their providers list
 // best-effort, so a withheld listing keeps their stale points instead of
-// deleting them blindly. Notes are NEVER
+// deleting them blindly. The ownership kinds are additionally swept
+// repo-agnostically: their points are instance-level (empty payload scope), so
+// the per-repo filter never matches them — see the ownership block below the
+// gated loop. Notes are NEVER
 // generation-swept (R9): a live note the pass did not re-list must survive, so
 // they are cascade-deleted only when their parent is being removed — a stale
 // work item (gated by its complete listing) or a change request whose file
@@ -177,7 +180,8 @@ func Sweep(ctx context.Context, gs sweepStore, repo, branch string, generation i
 		// F13 (schema v4): commit nodes are emitted from the same MR listing.
 		{KindCommit, t.Review},
 		// Ownership chain: the best-effort group/project listings gate both
-		// kinds.
+		// kinds. This per-repo pass clears the pre-fix duplicate points that
+		// carry the scanning repo; the scope-free points are swept below.
 		{KindGroup, t.Ownership},
 		{KindProject, t.Ownership},
 		// Structure: the best-effort branch listing gates the branch nodes
@@ -201,13 +205,41 @@ func Sweep(ctx context.Context, gs sweepStore, repo, branch string, generation i
 		}
 		deleted += n
 	}
+	// Ownership is instance-level: the group/project points are built with an
+	// empty scope, so the per-repo loop above never matches them. When the
+	// group listings completed (t.Ownership), sweep them by kind + generation
+	// alone — a group/project that disappeared from the listing goes away
+	// regardless of which repo pass last wrote it.
+	if t.Ownership {
+		for _, kind := range []Kind{KindGroup, KindProject} {
+			n, err := sweepInstanceKind(ctx, gs, kind, generation, dryRun)
+			if err != nil {
+				return deleted, err
+			}
+			deleted += n
+		}
+	}
 	return deleted, nil
 }
 
 // sweepKind counts and deletes (dry-run: only reports) the stale points of one
-// kind.
+// kind of one repo+branch.
 func sweepKind(ctx context.Context, gs sweepStore, kind Kind, repo, branch string, generation int, dryRun bool) (int, error) {
-	flt := staleKindFilter(kind, repo, branch, generation)
+	return sweepStale(ctx, gs, kind, staleKindFilter(kind, repo, branch, generation), generation, dryRun,
+		"repo", repo, "branch", branch)
+}
+
+// sweepInstanceKind counts and deletes (dry-run: only reports) the stale points
+// of one kind across the whole instance (no repo/branch scope): the ownership
+// kinds are written with an empty scope, so the per-repo filter never matches
+// them.
+func sweepInstanceKind(ctx context.Context, gs sweepStore, kind Kind, generation int, dryRun bool) (int, error) {
+	return sweepStale(ctx, gs, kind, staleInstanceKindFilter(kind, generation), generation, dryRun)
+}
+
+// sweepStale is the shared count/delete/report body of sweepKind and
+// sweepInstanceKind; logAttrs carry the optional scope of the selection.
+func sweepStale(ctx context.Context, gs sweepStore, kind Kind, flt *qdrant.Filter, generation int, dryRun bool, logAttrs ...any) (int, error) {
 	n, err := gs.CountByFilter(ctx, flt)
 	if err != nil {
 		return 0, fmt.Errorf("graph gc: count %s: %w", kind, err)
@@ -215,18 +247,16 @@ func sweepKind(ctx context.Context, gs sweepStore, kind Kind, repo, branch strin
 	if n == 0 {
 		return 0, nil
 	}
+	attrs := append([]any{"kind", kind}, logAttrs...)
+	attrs = append(attrs, "generation_below", generation, "points", n)
 	if dryRun {
-		slog.Info("gc would-delete",
-			"kind", kind, "repo", repo, "branch", branch,
-			"generation_below", generation, "points", n)
+		slog.Info("gc would-delete", attrs...)
 		return int(n), nil
 	}
 	if err := gs.DeleteByFilter(ctx, flt); err != nil {
 		return 0, fmt.Errorf("graph gc: delete %s: %w", kind, err)
 	}
-	slog.Info("gc deleted",
-		"kind", kind, "repo", repo, "branch", branch,
-		"generation_below", generation, "points", n)
+	slog.Info("gc deleted", attrs...)
 	return int(n), nil
 }
 
@@ -360,6 +390,17 @@ func staleKindFilter(kind Kind, repo, branch string, generation int) *qdrant.Fil
 		qdrant.NewMatch("kind", string(kind)),
 		qdrant.NewMatch("repo", repo),
 		qdrant.NewMatch("branch", branch),
+		qdrant.NewRange("generation", &qdrant.Range{Lt: qdrant.PtrOf(float64(generation))}),
+	}}
+}
+
+// staleInstanceKindFilter selects one kind's points of the whole instance with
+// generation < current — no repo/branch scope: the ownership kinds are
+// instance-level and carry repo=""/branch="", so the per-repo filter never
+// matches them.
+func staleInstanceKindFilter(kind Kind, generation int) *qdrant.Filter {
+	return &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatch("kind", string(kind)),
 		qdrant.NewRange("generation", &qdrant.Range{Lt: qdrant.PtrOf(float64(generation))}),
 	}}
 }
