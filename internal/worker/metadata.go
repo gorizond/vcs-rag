@@ -3,11 +3,14 @@ package worker
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/qdrant/go-client/qdrant"
 
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/embed"
@@ -92,6 +95,8 @@ type metaStore interface {
 	ScrollCIFailures(ctx context.Context, repo string, limit uint32) ([]store.ScoredPoint, error)
 	DeleteCIFailure(ctx context.Context, repo, pipelineID, jobID string) error
 	DeleteByIDs(ctx context.Context, ids []string) error // T140 entity reconcile
+	// SetPayload — the F3 payload-only update of already-embedded points (T029).
+	SetPayload(ctx context.Context, ids []string, payload map[string]*qdrant.Value) error
 }
 
 // Entity-reconcile parameters (T140).
@@ -245,6 +250,10 @@ func processMetadataOnce(ctx context.Context, deps RepoDeps, repo provider.Repo,
 			return fmt.Errorf("state: %w", err)
 		}
 	}
+	// T029/F3: points that were not re-embedded get the additive payload fields
+	// via set_payload — no vectors, no LM spend. Runs after the checkpoint so a
+	// failed payload write can never cause a re-embed of the batch next pass.
+	refreshMetaPayload(ctx, st, cands, pending, lg)
 
 	// --- CI: failed jobs of the current window; a job is indexed once ---
 	pipelines, err := deps.VCS.ListPipelines(ctx, repo)
@@ -420,6 +429,32 @@ func upsertItems(ctx context.Context, emb embed.Provider, st metaStore, items []
 		points[i] = store.Point{ID: it.ID, Vector: vecs[i], Payload: it.Payload}
 	}
 	return st.Upsert(ctx, points)
+}
+
+// refreshMetaPayload writes the F3 fields (T029) of the candidates that were
+// NOT re-embedded this pass — the pending ones already carry them in the
+// upsert payload. Payload-only by design: a re-upsert would re-embed the
+// batch and break the LM budget. Failures are logged, not fatal: the next
+// pass retries, and the state checkpoint already prevents a re-embed.
+// ponytail: one SetPayload RPC per unchanged entity per pass; batch via
+// UpdateBatchPoints if the write volume ever matters.
+func refreshMetaPayload(ctx context.Context, st metaStore, cands, pending []metaCandidate, lg *slog.Logger) {
+	if len(pending) == len(cands) {
+		return
+	}
+	reembedded := make(map[string]bool, len(pending))
+	for _, c := range pending {
+		reembedded[c.key] = true
+	}
+	for _, c := range cands {
+		if reembedded[c.key] || len(c.item.MetaPayload) == 0 {
+			continue
+		}
+		if err := st.SetPayload(ctx, []string{c.item.ID}, store.PayloadValues(c.item.MetaPayload)); err != nil {
+			lg.Warn("F3 set_payload failed", "id", c.item.ID, "err", err)
+			return // likely a backend outage — do not hammer the rest
+		}
+	}
 }
 
 // pruneCIFailures deletes repository ci points missing from the current

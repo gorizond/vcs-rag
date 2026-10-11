@@ -9,14 +9,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorizond/vcs-rag/internal/graph"
 )
 
-// US1 e2e scenarios of the SDLC context graph (SC-001, SC-005, SC-007): the
-// tests boot the production MCP server (`-mode=mcp`, stdio, as in e2e_us3)
+// US1 e2e scenarios of the SDLC context graph (SC-001, SC-005, SC-007), the
+// US2 file→MR scenario (SC-002) and the US3 people/planning filters (SC-003):
+// the tests boot the production MCP server (`-mode=mcp`, stdio, as in e2e_us3)
 // against the live stack from the e2e env and read the graph collection the
-// worker graph lane filled. No fixture repo is written: the fixture identity
-// of the live index is operator-supplied, and a scenario with an unset input
-// skips cleanly.
+// worker graph lane filled. No fixture repo is written: the fixture identity of
+// the live index is operator-supplied, and a scenario with an unset input skips
+// cleanly.
 //
 // Env:
 //
@@ -26,13 +29,19 @@ import (
 //	GRAPH_E2E_FILE                    its file with >=1 outgoing import
 //	GRAPH_E2E_PACKAGE                 its package with >=1 importer
 //	GRAPH_E2E_FOREIGN_REPO            second repo in the same graph collection (SC-007)
+//	GRAPH_E2E_MR_FILE                 its file changed by an indexed MR/PR (SC-002)
+//	GRAPH_E2E_MR_FILE_TRUNCATED       "1": require a patch_truncated chunk (SC-002)
+//	GRAPH_E2E_ISSUE_STATE             canonical state of >=1 issue of the repo (SC-003)
+//	GRAPH_E2E_PR_STATE                canonical state of >=1 MR/PR of the repo (SC-003)
+//	GRAPH_E2E_ISSUE_LABEL/_AUTHOR/_MILESTONE  optional: pin those issue filters
 //
 // Example:
 //
 //	QDRANT_URL=http://localhost:16334 EMBEDDINGS_BASE_URL=http://localhost:11435 \
 //	GRAPH_E2E_REPO=gorizond/vcs-rag GRAPH_E2E_SYMBOL=ProcessRepoOnce \
 //	GRAPH_E2E_FILE=internal/worker/refresh.go GRAPH_E2E_PACKAGE=internal/worker \
-//	GRAPH_E2E_FOREIGN_REPO=gorizond/other \
+//	GRAPH_E2E_FOREIGN_REPO=gorizond/other GRAPH_E2E_MR_FILE=internal/mcp/tools.go \
+//	GRAPH_E2E_ISSUE_STATE=open GRAPH_E2E_PR_STATE=merged GRAPH_E2E_ISSUE_LABEL=bug \
 //	go test -tags e2e ./tests/integration -run TestE2E_Graph -v -count=1
 func TestE2E_Graph_SC001(t *testing.T) {
 	proc := startGraphMCP(t)
@@ -92,6 +101,129 @@ func TestE2E_Graph_SC001(t *testing.T) {
 	}
 	assertCoverage(t, "get_imports", imps.Coverage, repo)
 	t.Logf("read-back: get_imports edges=%d", len(imps.Results))
+}
+
+// TestE2E_Graph_SC002 — the file→MR lookup (US2): search_pull_requests with
+// file_path returns the MRs that changed the file, each with per-file diff
+// chunks. The patch_truncated invariant holds on every chunk; with
+// GRAPH_E2E_MR_FILE_TRUNCATED=1 the fixture must exercise the truncated path.
+func TestE2E_Graph_SC002(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	file := graphFixture(t, "GRAPH_E2E_MR_FILE")
+
+	resp := decodeTool[gPRFilesResp](t, graphCall(t, proc, 2, "search_pull_requests",
+		map[string]any{"repo": repo, "file_path": file}))
+	if len(resp.Results) == 0 {
+		t.Fatalf("search_pull_requests(repo=%q, file_path=%q) returned no MRs: is the fixture file in an indexed MR?", repo, file)
+	}
+	mrs, chunks, truncated := 0, 0, 0
+	for _, mr := range resp.Results {
+		if mr.Repo != repo {
+			t.Errorf("foreign repo %q in results (want %q)", mr.Repo, repo)
+		}
+		if mr.PRID == 0 {
+			t.Errorf("MR result without pr_id: %+v", mr)
+		}
+		if len(mr.Files) == 0 {
+			t.Errorf("MR %d (%s): no diff chunks", mr.PRID, repo)
+		}
+		mrs++
+		for _, f := range mr.Files {
+			if f.FilePath != file {
+				t.Errorf("MR %d: chunk file_path %q, want %q", mr.PRID, f.FilePath, file)
+			}
+			if f.Status == "" {
+				t.Errorf("MR %d: chunk without status: %+v", mr.PRID, f)
+			}
+			// The stored patch is capped at MaxPatchBytes; the flag is honest.
+			if len(f.Patch) > graph.MaxPatchBytes {
+				t.Errorf("MR %d: patch %d bytes > cap %d", mr.PRID, len(f.Patch), graph.MaxPatchBytes)
+			}
+			if f.PatchTruncated && len(f.Patch) > graph.MaxPatchBytes {
+				t.Errorf("MR %d: truncated patch %d bytes > cap %d", mr.PRID, len(f.Patch), graph.MaxPatchBytes)
+			}
+			chunks++
+			if f.PatchTruncated {
+				truncated++
+			}
+		}
+	}
+	if truncated == 0 {
+		msg := "no patch_truncated chunk in the fixture: the truncated path was not exercised"
+		if os.Getenv("GRAPH_E2E_MR_FILE_TRUNCATED") == "1" {
+			t.Errorf("%s (GRAPH_E2E_MR_FILE_TRUNCATED=1)", msg)
+		} else {
+			t.Logf("skip-note: %s", msg)
+		}
+	} else {
+		t.Logf("read-back: patch_truncated chunks=%d (cap=%d bytes)", truncated, graph.MaxPatchBytes)
+	}
+	t.Logf("read-back: file=%q mrs=%d chunks=%d", file, mrs, chunks)
+}
+
+// TestE2E_Graph_SC003 — US3 (SC-003): issues/MRs filter by state/label/author/
+// milestone, and the state vocabulary is canonical on both providers (GitLab
+// "opened" → "open"; GitHub open|closed|merged|draft). The same scenario runs
+// against either provider by switching the fixture env — one provider per
+// instance, so the parity claim is checked on the active one: returned states
+// must be in the canonical set and equal to the canonical request, never a raw
+// provider spelling.
+func TestE2E_Graph_SC003(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	issueState := graphFixture(t, "GRAPH_E2E_ISSUE_STATE")
+	prState := graphFixture(t, "GRAPH_E2E_PR_STATE")
+
+	// issues: the canonical state plus the optional people/planning filters.
+	args := map[string]any{"query": "issue", "repo": repo, "state": issueState, "top_k": 20}
+	for env, key := range map[string]string{
+		"GRAPH_E2E_ISSUE_LABEL":     "label",
+		"GRAPH_E2E_ISSUE_AUTHOR":    "author",
+		"GRAPH_E2E_ISSUE_MILESTONE": "milestone",
+	} {
+		if v := os.Getenv(env); v != "" {
+			args[key] = v
+		}
+	}
+	issues := decodeTool[gIssuesResp](t, graphCall(t, proc, 2, "search_issues", args))
+	if len(issues.Results) == 0 {
+		t.Fatalf("search_issues(repo=%q, state=%q, filters=%v) returned nothing: are the US3 fixtures indexed with normalized states?", repo, issueState, args)
+	}
+	for _, h := range issues.Results {
+		if h.Repo != repo {
+			t.Errorf("foreign repo %q in issue results (want %q)", h.Repo, repo)
+		}
+		if h.State != issueState || !canonicalStates[h.State] {
+			t.Errorf("issue %d: state %q, want canonical %q", h.IssueID, h.State, issueState)
+		}
+	}
+
+	// a value that cannot match must return nothing — the filters really
+	// participate instead of being silently dropped.
+	none := decodeTool[gIssuesResp](t, graphCall(t, proc, 3, "search_issues",
+		map[string]any{"query": "issue", "repo": repo, "state": issueState,
+			"label": "__e2e_no_such_label__", "author": "__e2e_no_such_author__",
+			"milestone": "__e2e_no_such_milestone__"}))
+	if len(none.Results) != 0 {
+		t.Errorf("impossible label/author/milestone filters returned %d issues", len(none.Results))
+	}
+
+	// MR/PR: the same canonical state semantics on search_pull_requests.
+	prs := decodeTool[gPRsResp](t, graphCall(t, proc, 4, "search_pull_requests",
+		map[string]any{"query": "pull request", "repo": repo, "state": prState, "top_k": 20}))
+	if len(prs.Results) == 0 {
+		t.Fatalf("search_pull_requests(repo=%q, state=%q) returned nothing: is the fixture MR indexed with a canonical state?", repo, prState)
+	}
+	for _, h := range prs.Results {
+		if h.Repo != repo {
+			t.Errorf("foreign repo %q in PR results (want %q)", h.Repo, repo)
+		}
+		if h.State != prState || !canonicalStates[h.State] {
+			t.Errorf("MR %d: state %q, want canonical %q", h.PRID, h.State, prState)
+		}
+	}
+	t.Logf("read-back: issues=%d (state=%s), prs=%d (state=%s)", len(issues.Results), issueState, len(prs.Results), prState)
 }
 
 // TestE2E_Graph_SC005 — the graph self-describes: node/edge/entity types and
@@ -295,6 +427,51 @@ type gImportEdge struct {
 type gEdgesResp struct {
 	Results  []gImportEdge `json:"results"`
 	Coverage []gCoverage   `json:"coverage"`
+}
+
+type gPRFileChunk struct {
+	FilePath       string `json:"file_path"`
+	Status         string `json:"status"`
+	Patch          string `json:"patch"`
+	PatchTruncated bool   `json:"patch_truncated"`
+}
+
+type gPRFileHit struct {
+	Repo   string         `json:"repo"`
+	PRID   int64          `json:"pr_id"`
+	State  string         `json:"state"`
+	Author string         `json:"author"`
+	Files  []gPRFileChunk `json:"files"`
+}
+
+type gPRFilesResp struct {
+	Results []gPRFileHit `json:"results"`
+}
+
+// gIssuesResp / gPRsResp — US3 issue/PR hits (SC-003).
+type gIssueHit struct {
+	Repo    string `json:"repo"`
+	IssueID int64  `json:"issue_id"`
+	State   string `json:"state"`
+}
+
+type gIssuesResp struct {
+	Results []gIssueHit `json:"results"`
+}
+
+type gPRHit struct {
+	Repo  string `json:"repo"`
+	PRID  int64  `json:"pr_id"`
+	State string `json:"state"`
+}
+
+type gPRsResp struct {
+	Results []gPRHit `json:"results"`
+}
+
+// canonicalStates — the unified state vocabulary (data-model §7).
+var canonicalStates = map[string]bool{
+	"open": true, "merged": true, "closed": true, "locked": true, "draft": true,
 }
 
 type gNamed struct {

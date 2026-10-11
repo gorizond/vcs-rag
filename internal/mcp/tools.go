@@ -88,11 +88,15 @@ type searchCodeInput struct {
 }
 
 type metadataQueryInput struct {
-	Query    string `json:"query" jsonschema:"search query text"`
-	Repo     string `json:"repo,omitempty" jsonschema:"repository path, or a unique short form (e.g. \"nats\", \"secrets/runner\")"`
-	GroupOrg string `json:"group_org,omitempty" jsonschema:"GitLab group or GitHub organization"`
-	State    string `json:"state,omitempty" jsonschema:"state: opened | closed | merged"`
-	TopK     int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
+	Query     string `json:"query" jsonschema:"search query text"`
+	Repo      string `json:"repo,omitempty" jsonschema:"repository path, or a unique short form (e.g. \"nats\", \"secrets/runner\")"`
+	GroupOrg  string `json:"group_org,omitempty" jsonschema:"GitLab group or GitHub organization"`
+	State     string `json:"state,omitempty" jsonschema:"canonical state: open | merged | closed | locked | draft"`
+	Label     string `json:"label,omitempty" jsonschema:"filter: the issue/MR carries this label"`
+	Author    string `json:"author,omitempty" jsonschema:"filter: author login"`
+	Milestone string `json:"milestone,omitempty" jsonschema:"filter: milestone title"`
+	FilePath  string `json:"file_path,omitempty" jsonschema:"search_pull_requests only: exact lookup of the MRs/PRs that changed this file path (repo required; query and top_k are not used)"`
+	TopK      int    `json:"top_k,omitempty" jsonschema:"how many results to return (default 5, maximum 20)"`
 }
 
 type ciFailuresInput struct {
@@ -307,12 +311,17 @@ func registerTools(server *mcp.Server, t *tools) {
 		Description: "Semantic search over indexed code. The result object is {\"results\": [hits]}.",
 	}, t.searchCode)
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "search_pull_requests",
-		Description: "Semantic search over pull/merge requests. The result object is {\"results\": [hits]}.",
+		Name: "search_pull_requests",
+		Description: "Semantic search over pull/merge requests. The result object is {\"results\": [hits]}. " +
+			"Optional filters: state (canonical open|merged|closed|locked|draft), label, author, milestone. " +
+			"With file_path set, switches to an exact graph lookup instead: the MRs/PRs that changed that file, " +
+			"each with its per-file diff chunks (file_path, status, patch, patch_truncated); repo is required " +
+			"and query is not used in that mode.",
 	}, t.searchPRs)
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "search_issues",
-		Description: "Semantic search over issues (indexing — US4/FR-012). The result object is {\"results\": [hits]}.",
+		Name: "search_issues",
+		Description: "Semantic search over issues (indexing — US4/FR-012). The result object is {\"results\": [hits]}. " +
+			"Optional filters: state (canonical open|merged|closed|locked|draft), label, author, milestone.",
 	}, t.searchIssues)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_ci_failures",
@@ -399,16 +408,33 @@ func (t *tools) searchCode(ctx context.Context, _ *mcp.CallToolRequest, in searc
 	return nil, resultsResponse[codeHit]{Results: hits}, nil
 }
 
-// searchPRs — MR/PR search (T071).
+// metadataFilter builds the shared issue/PR filter (T031): optional canonical
+// state, label, author and milestone — absent fields do not participate.
+func metadataFilter(in metadataQueryInput, typ string) store.Filter {
+	f := store.Filter{
+		GroupOrg: in.GroupOrg, Type: typ, State: in.State,
+		Author: in.Author, Milestone: in.Milestone,
+	}
+	if in.Label != "" {
+		f.Labels = []string{in.Label}
+	}
+	return f
+}
+
+// searchPRs — MR/PR search (T071). With file_path the semantic search is
+// replaced by the exact mr_file lookup (T026/SC-002).
 func (t *tools) searchPRs(ctx context.Context, _ *mcp.CallToolRequest, in metadataQueryInput) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
 
+	if filePath := strings.TrimSpace(in.FilePath); filePath != "" {
+		return t.searchPRsByFile(ctx, in, filePath)
+	}
 	vec, err := t.queryVector(ctx, in.Query)
 	if err != nil {
 		return nil, errorResult(ctx, codeEmbedFailed, err), nil
 	}
-	f := store.Filter{GroupOrg: in.GroupOrg, Type: "pull_request", State: in.State}
+	f := metadataFilter(in, "pull_request")
 	t.applyRepoFilter(ctx, &f, in.Repo, in.GroupOrg)
 	points, err := t.searcher.Search(ctx, vec, f, clampTopK(in.TopK))
 	if err != nil {
@@ -430,6 +456,88 @@ func (t *tools) searchPRs(ctx context.Context, _ *mcp.CallToolRequest, in metada
 	return nil, resultsResponse[prHit]{Results: hits}, nil
 }
 
+// prFileHit — one MR/PR that changed the requested file, with its per-file
+// diff chunks (the file_path mode of search_pull_requests, T026/SC-002).
+type prFileHit struct {
+	VCSType string        `json:"vcs_type"`
+	Repo    string        `json:"repo"`
+	PRID    int64         `json:"pr_id"`
+	State   string        `json:"state"`
+	Author  string        `json:"author,omitempty"`
+	Files   []prFileChunk `json:"files"`
+}
+
+// prFileChunk — one stored mr_file point: the diff of one file of the MR.
+type prFileChunk struct {
+	FilePath       string `json:"file_path"`
+	Status         string `json:"status"`
+	Patch          string `json:"patch"`
+	PatchTruncated bool   `json:"patch_truncated"`
+}
+
+// searchPRsByFile — the exact file lookup of search_pull_requests: mr_file
+// points of repo+file_path grouped per MR, each with its diff chunk. The
+// lookup is exact by design, so no embedding is computed and the query is not
+// used (R2 honesty: this is not a semantic match).
+func (t *tools) searchPRsByFile(ctx context.Context, in metadataQueryInput, filePath string) (*mcp.CallToolResult, any, error) {
+	if t.graph == nil {
+		return nil, errorResult(ctx, codeSearchFailed, errGraphStore), nil
+	}
+	repos := t.graphRepos(ctx, in.Repo)
+	if len(repos) == 0 {
+		return nil, toolError{Code: codeInvalidInput, Message: "repo is required: mr_file points are namespaced by repository"}, nil
+	}
+	f := &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatch("kind", string(graph.KindMrFile)),
+		repoKeyword(repos),
+		qdrant.NewMatch("file_path", filePath),
+	}}
+	if in.State != "" {
+		f.Must = append(f.Must, qdrant.NewMatch("state", in.State))
+	}
+	pts, err := t.graph.ScrollAll(ctx, f, graphPageSize)
+	if err != nil {
+		return nil, errorResult(ctx, codeSearchFailed, err), nil
+	}
+	byMR := make(map[string]*prFileHit, len(pts))
+	var order []string
+	for _, p := range pts {
+		m := payloadMap(p)
+		key := fmt.Sprintf("%s#%d", payloadString(m, "repo"), payloadInt64(m, "mr_id"))
+		h := byMR[key]
+		if h == nil {
+			h = &prFileHit{
+				VCSType: payloadString(m, "vcs_type"),
+				Repo:    payloadString(m, "repo"),
+				PRID:    payloadInt64(m, "mr_id"),
+				State:   payloadString(m, "state"),
+				Author:  payloadString(m, "author"),
+			}
+			byMR[key] = h
+			order = append(order, key)
+		}
+		h.Files = append(h.Files, prFileChunk{
+			FilePath:       payloadString(m, "file_path"),
+			Status:         payloadString(m, "status"),
+			Patch:          payloadString(m, "patch"),
+			PatchTruncated: payloadBool(m, "patch_truncated"),
+		})
+	}
+	hits := make([]prFileHit, 0, len(order))
+	for _, key := range order {
+		h := byMR[key]
+		sort.SliceStable(h.Files, func(i, j int) bool { return h.Files[i].FilePath < h.Files[j].FilePath })
+		hits = append(hits, *h)
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].Repo != hits[j].Repo {
+			return hits[i].Repo < hits[j].Repo
+		}
+		return hits[i].PRID < hits[j].PRID
+	})
+	return nil, resultsResponse[prFileHit]{Results: hits}, nil
+}
+
 // searchIssues — issue search (T072).
 func (t *tools) searchIssues(ctx context.Context, _ *mcp.CallToolRequest, in metadataQueryInput) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
@@ -439,7 +547,7 @@ func (t *tools) searchIssues(ctx context.Context, _ *mcp.CallToolRequest, in met
 	if err != nil {
 		return nil, errorResult(ctx, codeEmbedFailed, err), nil
 	}
-	f := store.Filter{GroupOrg: in.GroupOrg, Type: "issue", State: in.State}
+	f := metadataFilter(in, "issue")
 	t.applyRepoFilter(ctx, &f, in.Repo, in.GroupOrg)
 	points, err := t.searcher.Search(ctx, vec, f, clampTopK(in.TopK))
 	if err != nil {
@@ -647,7 +755,7 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 			{Name: string(graph.EdgeDefines), From: "file", To: "symbol"},
 		},
 		EntityTypes: []entityTypeSpec{
-			{Name: string(graph.KindMrFile), Description: "declared — extraction not implemented yet"},
+			{Name: string(graph.KindMrFile), Description: "per-file MR/PR diffs (search_pull_requests file_path)"},
 			{Name: string(graph.KindCi), Description: "declared — extraction not implemented yet"},
 			{Name: string(graph.KindVuln), Description: "declared — extraction not implemented yet"},
 		},

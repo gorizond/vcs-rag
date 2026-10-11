@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/qdrant/go-client/qdrant"
+
 	"github.com/gorizond/vcs-rag/internal/store"
 )
 
@@ -225,6 +227,43 @@ func TestSearchPRsIssuesCIFilters(t *testing.T) {
 	}
 }
 
+// T031: the optional state/label/author/milestone filters reach the store
+// filter of search_issues and search_pull_requests; absent fields stay empty.
+func TestMetadataQueryFilters(t *testing.T) {
+	in := metadataQueryInput{Query: "x", State: "open", Label: "bug", Author: "alice", Milestone: "v1"}
+
+	ms := &mockSearcher{}
+	tl := &tools{embedder: &mockEmbedder{}, searcher: ms}
+	if _, _, err := tl.searchIssues(context.Background(), nil, in); err != nil {
+		t.Fatal(err)
+	}
+	f := ms.gotFilter
+	if f.Type != "issue" || f.State != "open" || f.Author != "alice" || f.Milestone != "v1" ||
+		len(f.Labels) != 1 || f.Labels[0] != "bug" {
+		t.Errorf("searchIssues filter = %+v", f)
+	}
+
+	ms = &mockSearcher{}
+	tl.searcher = ms
+	if _, _, err := tl.searchPRs(context.Background(), nil, in); err != nil {
+		t.Fatal(err)
+	}
+	if f := ms.gotFilter; f.Type != "pull_request" || f.State != "open" ||
+		f.Author != "alice" || f.Milestone != "v1" || len(f.Labels) != 1 {
+		t.Errorf("searchPRs filter = %+v", f)
+	}
+
+	// absent filters add nothing (backward compatible).
+	ms = &mockSearcher{}
+	tl.searcher = ms
+	if _, _, err := tl.searchIssues(context.Background(), nil, metadataQueryInput{Query: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if f := ms.gotFilter; f.State != "" || f.Author != "" || f.Milestone != "" || f.Labels != nil {
+		t.Errorf("absent filters leaked: %+v", f)
+	}
+}
+
 // T148: an empty result is the object {"results": []}, never an empty array.
 func TestEmptyResultIsEmptyResults(t *testing.T) {
 	tl := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}}
@@ -435,5 +474,75 @@ func TestIndexStatusUnavailable(t *testing.T) {
 				t.Errorf("unavailable response leaked status fields: %s", js)
 			}
 		})
+	}
+}
+
+// fakeGraphReader — a mock mcp.GraphReader (the payload-only graph surface).
+type fakeGraphReader struct {
+	gotFilter *qdrant.Filter
+	points    []*qdrant.RetrievedPoint
+	err       error
+}
+
+func (f *fakeGraphReader) ScrollAll(_ context.Context, flt *qdrant.Filter, _ uint32) ([]*qdrant.RetrievedPoint, error) {
+	f.gotFilter = flt
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.points, nil
+}
+
+// T026/SC-002: search_pull_requests(file_path) is the exact mr_file lookup —
+// filtered by repo+file_path, MRs grouped with their diff chunks. The query is
+// not embedded in this mode.
+func TestSearchPRsFilePathLookup(t *testing.T) {
+	graph := &fakeGraphReader{points: []*qdrant.RetrievedPoint{
+		{Payload: qdrant.NewValueMap(map[string]any{
+			"repo": "acme/demo", "vcs_type": "gitlab", "mr_id": 7, "state": "opened",
+			"file_path": "a.go", "status": "modified", "patch": "@@ diff @@", "patch_truncated": false,
+		})},
+		{Payload: qdrant.NewValueMap(map[string]any{
+			"repo": "acme/demo", "vcs_type": "gitlab", "mr_id": 9, "state": "merged",
+			"file_path": "a.go", "status": "renamed", "patch": "@@ big @@", "patch_truncated": true,
+		})},
+	}}
+	emb := &mockEmbedder{}
+	tl := &tools{embedder: emb, searcher: &mockSearcher{}, graph: graph}
+
+	_, out, err := tl.searchPRs(context.Background(), nil, metadataQueryInput{Query: "ignored", Repo: "acme/demo", FilePath: "a.go"})
+	if err != nil {
+		t.Fatalf("searchPRs(file_path): %v", err)
+	}
+	if emb.calls != 0 {
+		t.Errorf("file_path lookup embedded %d texts, want 0", emb.calls)
+	}
+	if graph.gotFilter == nil || len(graph.gotFilter.Must) != 3 {
+		t.Fatalf("filter = %+v, want kind+repo+file_path", graph.gotFilter)
+	}
+	resp, ok := out.(resultsResponse[prFileHit])
+	if !ok || len(resp.Results) != 2 {
+		t.Fatalf("out = %T %+v", out, out)
+	}
+	if resp.Results[0].PRID != 7 || resp.Results[0].Files[0].Patch != "@@ diff @@" {
+		t.Errorf("first MR = %+v", resp.Results[0])
+	}
+	if resp.Results[1].PRID != 9 || !resp.Results[1].Files[0].PatchTruncated {
+		t.Errorf("second MR = %+v", resp.Results[1])
+	}
+	js := marshalJSON(out)
+	for _, want := range []string{`"pr_id":7`, `"file_path":"a.go"`, `"patch":"@@ diff @@"`, `"patch_truncated":true`} {
+		if !strings.Contains(js, want) {
+			t.Errorf("JSON does not contain %s: %s", want, js)
+		}
+	}
+
+	// repo is required: without it the lookup cannot be repo-scoped.
+	tl2 := &tools{embedder: &mockEmbedder{}, searcher: &mockSearcher{}, graph: graph}
+	_, out, err = tl2.searchPRs(context.Background(), nil, metadataQueryInput{Query: "x", FilePath: "a.go"})
+	if err != nil {
+		t.Fatalf("searchPRs(no repo): %v", err)
+	}
+	if te, ok := out.(toolError); !ok || te.Code != codeInvalidInput {
+		t.Fatalf("no-repo lookup = %T %+v, want invalid_input", out, out)
 	}
 }

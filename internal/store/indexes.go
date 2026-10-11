@@ -9,8 +9,9 @@ import (
 
 // indexFields — keyword payload indexes. The first five are the contract
 // (data-model §3/QueryFilter); commit_sha and file_path are the extension
-// for prune/file deletion (noted in the phase report).
-var indexFields = []string{"vcs_type", "group_org", "repo", "type", "branch", "commit_sha", "file_path"}
+// for prune/file deletion (noted in the phase report); state (F3) is the
+// must-match filter of issues/MRs (data-model §7).
+var indexFields = []string{"vcs_type", "group_org", "repo", "type", "branch", "commit_sha", "file_path", "state"}
 
 // EnsureIndexes creates keyword indexes (idempotent — a repeated call
 // for an existing index is harmless).

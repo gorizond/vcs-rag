@@ -29,6 +29,36 @@ func timeOrZero(t *time.Time) time.Time {
 	return *t
 }
 
+// milestoneTitle — the milestone title or "" (nil-safe).
+func milestoneTitle(m *gitlab.Milestone) string {
+	if m == nil {
+		return ""
+	}
+	return m.Title
+}
+
+// issueUsernames — the logins of issue assignees (nil-safe).
+func issueUsernames(users []*gitlab.IssueAssignee) []string {
+	out := make([]string, 0, len(users))
+	for _, u := range users {
+		if u != nil {
+			out = append(out, u.Username)
+		}
+	}
+	return out
+}
+
+// usernames — the logins of MR assignees/reviewers (nil-safe).
+func usernames(users []*gitlab.BasicUser) []string {
+	out := make([]string, 0, len(users))
+	for _, u := range users {
+		if u != nil {
+			out = append(out, u.Username)
+		}
+	}
+	return out
+}
+
 // ListIssues returns the project issues (all pages).
 func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider.Issue, error) {
 	pid := repoFullPath(repo)
@@ -40,13 +70,21 @@ func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider
 			return nil, fmt.Errorf("gitlab: issues %s: %w", pid, err)
 		}
 		for _, iss := range issues {
+			var author string
+			if iss.Author != nil {
+				author = iss.Author.Username
+			}
 			out = append(out, provider.Issue{
 				ID:        iss.IID,
 				Title:     iss.Title,
 				Body:      iss.Description,
-				State:     iss.State,
+				State:     provider.NormalizeState(iss.State),
 				URL:       iss.WebURL,
 				UpdatedAt: timeOrZero(iss.UpdatedAt),
+				Author:    author,
+				Assignees: issueUsernames(iss.Assignees),
+				Labels:    []string(iss.Labels),
+				Milestone: milestoneTitle(iss.Milestone),
 			})
 		}
 		if resp.NextPage == 0 {
@@ -68,15 +106,24 @@ func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]
 			return nil, fmt.Errorf("gitlab: merge requests %s: %w", pid, err)
 		}
 		for _, mr := range mrs {
+			var author string
+			if mr.Author != nil {
+				author = mr.Author.Username
+			}
 			out = append(out, provider.ChangeRequest{
 				ID:           mr.IID,
 				Title:        mr.Title,
 				Body:         mr.Description,
-				State:        mr.State,
+				State:        provider.NormalizeState(mr.State),
 				SourceBranch: mr.SourceBranch,
 				TargetBranch: mr.TargetBranch,
 				URL:          mr.WebURL,
 				UpdatedAt:    timeOrZero(mr.UpdatedAt),
+				Author:       author,
+				Assignees:    usernames(mr.Assignees),
+				Reviewers:    usernames(mr.Reviewers),
+				Labels:       []string(mr.Labels),
+				Milestone:    milestoneTitle(mr.Milestone),
 			})
 		}
 		if resp.NextPage == 0 {

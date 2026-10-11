@@ -161,6 +161,19 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 	if err != nil {
 		return 0, fmt.Errorf("graph write: %w", err)
 	}
+	// US2/T025: file diffs of the repository's change requests. A provider
+	// failure fails the repository pass before its coverage marker and sweep
+	// (T016: a failed pass never sweeps); processSafely isolates it (FR-014).
+	diffPoints, err := mrFilePoints(ctx, deps, repo, meta, lg)
+	if err != nil {
+		return written, err
+	}
+	if len(diffPoints) > 0 {
+		if err := gs.Upsert(ctx, diffPoints); err != nil {
+			return written, fmt.Errorf("mr_file write: %w", err)
+		}
+	}
+	written += len(diffPoints)
 	// T057: the coverage marker of the completed scan, upserted again every
 	// pass (deterministic ID, last writer wins).
 	if err := gs.Upsert(ctx, []*qdrant.PointStruct{graph.CoveragePoint(meta, tip)}); err != nil {
@@ -176,6 +189,40 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 	}
 	lg.Info("graph scan done", "branch", branch, "files", len(scanned), "points", written, "swept", deleted)
 	return written, nil
+}
+
+// mrFilePoints builds the mr_file points of one repository (US2/T025): every
+// MR/PR and the diffs of its files, read through the optional
+// ChangeRequestDiffProvider seam. A provider without diff support yields nil —
+// the phase is skipped. Deterministic IDs make the re-upsert each pass
+// idempotent and keep the points of the current generation alive for the sweep.
+// ponytail: diffs are re-fetched every pass; add an updated_at sidecar if the
+// provider API cost of unchanged MRs matters.
+func mrFilePoints(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, lg *slog.Logger) ([]*qdrant.PointStruct, error) {
+	diffProvider, ok := deps.VCS.(provider.ChangeRequestDiffProvider)
+	if !ok {
+		return nil, nil
+	}
+	crs, err := deps.VCS.ListChangeRequests(ctx, repo)
+	if err != nil {
+		return nil, fmt.Errorf("MR/PR list: %w", err)
+	}
+	var points []*qdrant.PointStruct
+	for _, cr := range crs {
+		files, err := diffProvider.ListChangeRequestDiffs(ctx, repo, int(cr.ID))
+		if err != nil {
+			return nil, fmt.Errorf("MR/PR %d diffs: %w", cr.ID, err)
+		}
+		for _, f := range files {
+			// author is owned by the metadata lane (US3): the normalized
+			// ChangeRequest carries no author yet.
+			points = append(points, graph.MrFilePoint(meta, int(cr.ID), f, "", cr.State))
+		}
+	}
+	if len(points) > 0 {
+		lg.Info("graph: mr_file diffs fetched", "mrs", len(crs), "files", len(points))
+	}
+	return points, nil
 }
 
 // repoModulePath reads the root go.mod module path of the scanned tree ("" —

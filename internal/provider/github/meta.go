@@ -18,6 +18,41 @@ import (
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
+// logins — the logins of users (nil-safe).
+func logins(users []*gh.User) []string {
+	out := make([]string, 0, len(users))
+	for _, u := range users {
+		if u != nil {
+			out = append(out, u.GetLogin())
+		}
+	}
+	return out
+}
+
+// labelNames — the names of labels (nil-safe).
+func labelNames(labels []*gh.Label) []string {
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		if l != nil {
+			out = append(out, l.GetName())
+		}
+	}
+	return out
+}
+
+// prState — the canonical state of a PR (data-model §7): merged/draft override
+// the raw open|closed; merged_at covers list responses without the merged flag.
+func prState(pr *gh.PullRequest) string {
+	switch {
+	case pr.GetMerged() || !pr.GetMergedAt().IsZero():
+		return "merged"
+	case pr.GetDraft():
+		return "draft"
+	default:
+		return provider.NormalizeState(pr.GetState())
+	}
+}
+
 // ListIssues returns the repository issues (all pages).
 func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider.Issue, error) {
 	opt := &gh.IssueListByRepoOptions{State: "all", ListOptions: gh.ListOptions{PerPage: 100}}
@@ -32,9 +67,13 @@ func (c *Client) ListIssues(ctx context.Context, repo provider.Repo) ([]provider
 				ID:        int64(iss.GetNumber()),
 				Title:     iss.GetTitle(),
 				Body:      iss.GetBody(),
-				State:     iss.GetState(),
+				State:     provider.NormalizeState(iss.GetState()),
 				URL:       iss.GetHTMLURL(),
 				UpdatedAt: iss.GetUpdatedAt().Time,
+				Author:    iss.GetUser().GetLogin(),
+				Assignees: logins(iss.Assignees),
+				Labels:    labelNames(iss.Labels),
+				Milestone: iss.GetMilestone().GetTitle(),
 			})
 		}
 		if resp.NextPage == 0 {
@@ -59,11 +98,16 @@ func (c *Client) ListChangeRequests(ctx context.Context, repo provider.Repo) ([]
 				ID:           int64(pr.GetNumber()),
 				Title:        pr.GetTitle(),
 				Body:         pr.GetBody(),
-				State:        pr.GetState(),
+				State:        prState(pr),
 				SourceBranch: pr.GetHead().GetRef(),
 				TargetBranch: pr.GetBase().GetRef(),
 				URL:          pr.GetHTMLURL(),
 				UpdatedAt:    pr.GetUpdatedAt().Time,
+				Author:       pr.GetUser().GetLogin(),
+				Assignees:    logins(pr.Assignees),
+				Reviewers:    logins(pr.RequestedReviewers),
+				Labels:       labelNames(pr.Labels),
+				Milestone:    pr.GetMilestone().GetTitle(),
 			})
 		}
 		if resp.NextPage == 0 {

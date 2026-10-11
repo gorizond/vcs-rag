@@ -44,6 +44,16 @@ type Repo struct {
 	DefaultBranch string
 }
 
+// NormalizeState maps a raw provider state onto the canonical vocabulary
+// open|merged|closed|locked|draft (data-model §7, F3): GitLab says "opened",
+// GitHub's merged/draft are derived by its provider (needs PR flags).
+func NormalizeState(state string) string {
+	if state == "opened" {
+		return "open"
+	}
+	return state
+}
+
 // Issue is an issue/task (GitLab issue = GitHub issue).
 type Issue struct {
 	ID        int64
@@ -52,6 +62,11 @@ type Issue struct {
 	State     string
 	URL       string
 	UpdatedAt time.Time
+	// F3 people/planning fields (additive; data-model §7).
+	Author    string
+	Assignees []string
+	Labels    []string
+	Milestone string
 }
 
 // ChangeRequest — MR (GitLab) / PR (GitHub).
@@ -64,6 +79,12 @@ type ChangeRequest struct {
 	TargetBranch string
 	URL          string
 	UpdatedAt    time.Time
+	// F3 people/planning fields (additive; data-model §7).
+	Author    string
+	Assignees []string
+	Reviewers []string
+	Labels    []string
+	Milestone string
 }
 
 // Pipeline is a CI pipeline with jobs.
