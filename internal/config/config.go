@@ -107,6 +107,12 @@ type MCP struct {
 	// GraphPathMaxDepth caps path traversal depth
 	// (MCP_GRAPH_PATH_MAX_DEPTH, default 3, clamped to ≤3).
 	GraphPathMaxDepth int
+	// AuthzEnabled is an explicit no-op punt (T041): per-user authorization
+	// is NOT implemented — the graph has no ACL and nothing reads this flag.
+	// It exists so the reserved name parses and the punt stays visible; the
+	// graph is served to a trusted loopback consumer, with instance isolation
+	// as the only boundary (docs/graph.md). MCP_AUTHZ_ENABLED, default false.
+	AuthzEnabled bool
 }
 
 // ConfigError is a configuration error listing the variable names that must be
@@ -339,12 +345,19 @@ func Load() (*Config, error) {
 	if pathMaxDepth > 3 {
 		pathMaxDepth = 3
 	}
+	// T041: explicit no-op punt — parsed so the reserved name is visible in
+	// config errors, but no filtering is implemented behind it.
+	authzEnabled, err := envBool("MCP_AUTHZ_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
 	cfg.MCP = MCP{
 		Transport:          transport,
 		Addr:               envDefault("MCP_ADDR", ":8080"),
 		GraphAggMaxScanned: aggMaxScanned,
 		GraphAggMaxGroups:  aggMaxGroups,
 		GraphPathMaxDepth:  pathMaxDepth,
+		AuthzEnabled:       authzEnabled,
 	}
 
 	return cfg, nil

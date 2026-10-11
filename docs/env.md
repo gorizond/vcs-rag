@@ -83,3 +83,4 @@ explicitly listed project/repo), deduplicated. If only the allowlist is set
 | `MCP_GRAPH_AGG_MAX_SCANNED` | `50000` | Cap on payload points scanned per aggregation request; over the cap the result is marked `truncated` (honest status), never silently partial |
 | `MCP_GRAPH_AGG_MAX_GROUPS` | `10000` | Cap on distinct groups per aggregation request; over the cap the result is marked `truncated`/refused |
 | `MCP_GRAPH_PATH_MAX_DEPTH` | `3` | Cap on path-traversal depth; values above `3` are clamped to `3` (contract bound) |
+| `MCP_AUTHZ_ENABLED` | `false` | Reserved **no-op punt** (T041): per-user authorization is not implemented — nothing filters by this flag. The graph has no ACL and is served to a trusted loopback consumer; the boundary is instance isolation, not per-user rules (see [graph](graph.md#authz-and-freshness-scope)) |

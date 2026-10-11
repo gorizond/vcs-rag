@@ -60,10 +60,12 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	// cap, consecutive passes still cover every repository over time.
 	start := 0
 	// T048: the security-domain availability is probed once per lane and
-	// latches off on 403/404, never failing the pass.
+	// latches off on 403/404, never failing the pass. T037: the runner domain
+	// (conditional by API/role) latches off the same way.
 	vuln := &vulnGate{}
+	runners := &runnerGate{}
 	for {
-		sum := graphPass(ctx, cfg, deps, snap, gs, start, vuln)
+		sum := graphPass(ctx, cfg, deps, snap, gs, start, vuln, runners)
 		start += int(sum.repos.Load())
 		// Written points are the real-work signal: with none the lane backs
 		// off to its ceiling instead of spinning.
@@ -90,7 +92,7 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 // (T015): per-repo lock, failure isolation (FR-014). One generation stamp is
 // shared by every repository of the pass — the sweep of a repository (T016)
 // compares against exactly the generation of its scan.
-func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs *store.GraphStore, start int, vuln *vulnGate) *summary {
+func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs *store.GraphStore, start int, vuln *vulnGate, runners *runnerGate) *summary {
 	sum := newSummary("graph")
 	repos := snap.get()
 	if len(repos) == 0 {
@@ -111,7 +113,7 @@ func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *sna
 		sum.countRepo(processSafely(ctx, deps.Logger, repo, "graph", func() error {
 			// T110: the per-repo lock is taken at the call site only.
 			return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
-				written, err := processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, vuln)
+				written, err := processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, vuln, runners)
 				if err == nil {
 					sum.addUpdated(written)
 				}
@@ -126,7 +128,7 @@ func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *sna
 // one-repo refresh probes the security domain on its own (a fresh gate), while
 // the graph lane calls processGraphRepoPass with its lane-wide gate.
 func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int) (int, error) {
-	return processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, &vulnGate{})
+	return processGraphRepoPass(ctx, cfg, deps, gs, repo, generation, &vulnGate{}, &runnerGate{})
 }
 
 // processGraphRepoPass extracts the graph of one repository's default branch
@@ -136,11 +138,12 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 // never sweeps. The orbit phases (US2/US3) run after the code graph: the
 // change-request list feeds both the mr_file diffs and the change-request
 // notes, then the planning nodes (work items, milestones, labels) and the
-// users/notes. Every orbit domain is best-effort: a failed or unavailable
-// listing withholds only that domain's sweep (SweepTargets) and never the
-// pass. CPU-only: no embeddings, no commit budget (R13). Lock-free by design:
-// the lane and the refresh composition hold the per-repo lock.
-func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, vuln *vulnGate) (int, error) {
+// users/notes. The runner nodes (US4) come behind their lane-wide gate last.
+// Every orbit domain is best-effort: a failed or unavailable listing withholds
+// only that domain's sweep (SweepTargets) and never the pass. CPU-only: no
+// embeddings, no commit budget (R13). Lock-free by design: the lane and the
+// refresh composition hold the per-repo lock.
+func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, vuln *vulnGate, runners *runnerGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
 	if err != nil {
@@ -241,6 +244,19 @@ func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps
 		}
 		written += len(orbitPts)
 	}
+	// US4/T037: the runner nodes behind the lane-wide availability gate. The
+	// domain is conditional by design (GitLab needs Maintainer+; GitHub needs
+	// Actions read) — an unavailable provider is skipped, logged once, and
+	// never fails the pass; only its sweep stays withheld. A store write error
+	// is a graph-store problem, not a provider one, and fails the pass.
+	runnerPts, runnersOK := runners.ingest(ctx, deps, repo, meta, host, lg)
+	if len(runnerPts) > 0 {
+		if err := gs.Upsert(ctx, runnerPts); err != nil {
+			return written, fmt.Errorf("runner write: %w", err)
+		}
+		written += len(runnerPts)
+	}
+	targets.Runners = runnersOK
 	// T057: the coverage marker of the completed scan, upserted again every
 	// pass (deterministic ID, last writer wins).
 	if err := gs.Upsert(ctx, []*qdrant.PointStruct{graph.CoveragePoint(meta, tip)}); err != nil {
@@ -625,6 +641,56 @@ func (g *vulnGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Repo
 		lg.Info("graph: vuln findings fetched", "findings", len(points))
 	}
 	return points
+}
+
+// runnerGate latches the availability of the runner domain for one graph lane
+// (US4/T037), mirroring vulnGate: the first call probes; a typed
+// provider.ErrDomainUnavailable (403/404, missing role/scope) turns the domain
+// off for the process and is logged once; transient provider errors are logged
+// and left to the next repo/pass. ok reports whether the listing of this repo
+// completed — only then may Sweep generation-sweep runner nodes; a latched-off
+// or failed domain keeps its stale points instead of deleting them blindly.
+type runnerGate struct {
+	mu  sync.Mutex
+	off bool
+}
+
+// ingest reads the runners of one repository and returns their node points.
+// It returns nil,false when the provider has no runner support, the domain is
+// off or the call failed — never an error.
+func (g *runnerGate) ingest(ctx context.Context, deps RepoDeps, repo provider.Repo, meta graph.Meta, host string, lg *slog.Logger) ([]*qdrant.PointStruct, bool) {
+	rp, ok := deps.VCS.(provider.RunnersProvider)
+	if !ok {
+		return nil, false
+	}
+	g.mu.Lock()
+	off := g.off
+	g.mu.Unlock()
+	if off {
+		return nil, false
+	}
+	runners, err := rp.ListRunners(ctx, repo)
+	if err != nil {
+		if errors.Is(err, provider.ErrDomainUnavailable) {
+			g.mu.Lock()
+			g.off = true
+			g.mu.Unlock()
+			lg.Info("graph: runner domain unavailable, runner ingest off", "err", err)
+			return nil, false
+		}
+		if ctx.Err() == nil {
+			lg.Warn("graph: runners fetch failed, repo skipped", "err", err)
+		}
+		return nil, false
+	}
+	points := make([]*qdrant.PointStruct, 0, len(runners))
+	for _, r := range runners {
+		points = append(points, graph.RunnerPoint(meta, host, r))
+	}
+	if len(points) > 0 {
+		lg.Info("graph: runners fetched", "runners", len(points))
+	}
+	return points, true
 }
 
 // repoModulePath reads the root go.mod module path of the scanned tree ("" —

@@ -78,8 +78,10 @@ graph lanes) keep the index fresh; the MCP server only reads Qdrant and, with
 NATS, can pull one repository on demand ([refresh flow](docs/refresh.md)) or
 refresh it automatically before a repo-scoped search (Auto freshness below).
 The graph lane writes a separate payload-only collection — definition nodes,
-import/defines edges and SDLC entities, no vectors
-([graph layer](docs/graph.md)).
+import/defines edges and the SDLC node families (user, note, work_item,
+milestone, label, runner) with their relations, no vectors
+([graph layer](docs/graph.md)). Real-time CDC is a non-goal — freshness comes
+from the periodic lanes (or an on-demand refresh).
 
 ## Key environment variables
 
@@ -98,7 +100,7 @@ explicitly listed project/repo), deduplicated. If only the allowlist is set
 (no group/org), index just those; an entry that cannot be fetched (404/403)
 is logged as a WARN and skipped.
 
-The complete reference — all 32 variables with defaults and secrets — is in
+The complete reference — all 39 variables with defaults and secrets — is in
 [`docs/env.md`](docs/env.md).
 
 Switching GitLab ↔ GitHub is env-only: the core does not change (both providers
@@ -330,7 +332,7 @@ worker/NATS tools:
 | `search_definitions` | symbol definitions from the graph; `mode=auto` (default) tries name matching first, then falls back to the semantic code search; `name` matches the symbol exactly or as a full-text token (no substring/prefix) |
 | `get_imports` | direct 1-hop package imports of a file or package (`direction=outgoing` default: what the input imports) |
 | `get_dependents` | direct 1-hop importers (`direction=incoming` default). **Package-level, not symbol-level**: the dependents of file X are the importers of X's package(s), not symbol referencers |
-| `query_graph` | graph query family (`mode` = `traversal` default / `aggregation` / `path_finding` / `neighbors`, see below); traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`) + filters, optional edge selector (`imports`/`defines`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
+| `query_graph` | graph query family (`mode` = `traversal` default / `aggregation` / `path_finding` / `neighbors`, see below); traversal: start entity (`definition`/`file`/`mr_file`/`ci`/`vuln`/`user`/`note`/`work_item`/`milestone`/`label`/`runner`) + filters, optional edge selector (`imports`/`defines`/`authored`/`commented`/`assigned_to`/`labelled`/`in_milestone`/`executed_by`/`*`), hops 1–3, limit ≤1000. Requires at least one selective predicate, else `non_selective_query`; caps set `truncated: true` |
 | `graph_schema` | self-describing graph schema: node/edge/entity types, query DSL version/operators, per-repo coverage markers |
 | `index_status` | worker indexing status (below) |
 | `refresh_repo` | on-demand refresh of one repository (registered only with `NATS_URL` set) |
@@ -340,7 +342,9 @@ worker/NATS tools:
 `mode` selects the query family — `traversal` (default, above), `aggregation`,
 `path_finding` or `neighbors` (all four are declared by
 `graph_schema` → `query_dsl.modes`). Canonical keys identify a graph point:
-`repo|file:<path>`, `repo|pkg:<package>` and the SDLC forms; see the
+`repo|file:<path>`, `repo|pkg:<package>`, `user:<host>#<id>`,
+`repo|note#<id>`, `repo|wi:<type>#<iid>`, `repo|ms#<id>`,
+`lab:<scope>|<name>`, `runner:<host>#<id>`; see the
 [query DSL](docs/graph.md#query-dsl-query_graph). Every mode carries the
 coverage notice and `truncated`.
 
@@ -407,6 +411,10 @@ The published value lives in `worker_status_<instance id>` (key `status`, TTL
 
 - **Loopback by default**: the compose stacks publish Qdrant, NATS and MCP on
   `127.0.0.1`; the MCP server has no built-in authentication.
+- **The graph has no per-user ACL**: per-user authorization is an explicit
+  punt — `MCP_AUTHZ_ENABLED` is a reserved no-op and nothing filters results by
+  user; the query tools serve the instance's whole graph to a trusted loopback
+  consumer ([graph layer](docs/graph.md#authz-and-freshness-scope)).
 - For remote clients expose only the MCP endpoint through a reverse proxy with
   **TLS and auth** (e.g. an ingress with basic auth / an OIDC proxy); keep
   Qdrant and NATS private.

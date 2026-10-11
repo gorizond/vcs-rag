@@ -21,6 +21,7 @@ type SweepTargets struct {
 	WorkItems  bool
 	Milestones bool
 	Labels     bool
+	Runners    bool
 }
 
 // Sweep deletes stale-generation points of one repository+branch, one kind at
@@ -29,10 +30,11 @@ type SweepTargets struct {
 // than the current one; points of the current generation are never touched.
 //
 // Orbit kinds follow their own rules (T027; data-model §9): users/labels/
-// milestones/work_items are generation-swept exactly like the core kinds, but
-// only when their pass listing completed (SweepTargets). Users are host-scoped
-// by construction (node_key RefUser): within one repo+branch every user point
-// comes from the one provider instance the process serves. Notes are NEVER
+// milestones/work_items/runners are generation-swept exactly like the core
+// kinds, but only when their pass listing completed (SweepTargets). Users are
+// host-scoped by construction (node_key RefUser): within one repo+branch every
+// user point comes from the one provider instance the process serves. The same
+// holds for runners (node_key RefRunner). Notes are NEVER
 // generation-swept (R9): a live note the pass did not re-list must survive, so
 // they are cascade-deleted only when their parent is being removed — a stale
 // work item (gated by its complete listing) or a change request whose file
@@ -93,6 +95,7 @@ func Sweep(ctx context.Context, gs *store.GraphStore, repo, branch string, gener
 		{KindUser, t.Users},
 		{KindMilestone, t.Milestones},
 		{KindLabel, t.Labels},
+		{KindRunner, t.Runners},
 	} {
 		if !gated.ok {
 			continue

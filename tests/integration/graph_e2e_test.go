@@ -49,6 +49,8 @@ import (
 //	GRAPH_E2E_PR_STATE                canonical state of >=1 MR/PR of the repo (SC-003)
 //	GRAPH_E2E_ISSUE_LABEL/_AUTHOR/_MILESTONE  optional: pin those issue filters
 //	GRAPH_E2E_VULN_FINDINGS           "1": the fixture's security API is available (SC-008 security)
+//	GRAPH_E2E_RUNNERS                 "1": the fixture's runner API/role is available (SC-008 runner)
+//	GRAPH_E2E_RUNNER_KEY              optional: canonical runner ref, e.g. "runner:gitlab.com#12" (SC-008 runner)
 //	GRAPH_E2E_LOGIN                   a login of an indexed user (SC-004)
 //	GRAPH_E2E_NOTE_PARENT            canonical parent ref of indexed notes, e.g. "repo|wi:issue#3" (SC-004)
 //	GRAPH_E2E_WORK_ITEM_KEY          canonical work_item ref, e.g. "repo|wi:issue#1" (SC-005)
@@ -917,6 +919,84 @@ func TestE2E_Graph_SC008_Security(t *testing.T) {
 	t.Logf("read-back: security domain unavailable (empty, no error); definitions still answer: %d points", len(other.Results))
 }
 
+// TestE2E_Graph_SC008_Runner — US4 (SC-008 runner): the runner domain is
+// conditional on the provider API/role. When the fixture declares availability
+// (GRAPH_E2E_RUNNERS=1) query_graph(entity:"runner") must return well-formed
+// runner nodes (node_key/runner_id/vcs_host); with GRAPH_E2E_RUNNER_KEY set the
+// exact canonical ref is looked up instead of the whole repo. Otherwise an
+// empty answer is the explicit "domain off" signal — error-free, and the other
+// domains keep answering. The executed_by leg is skip-noted when the fixture
+// carries no such edge (the lane currently ingests runner nodes only).
+//
+// Env: GRAPH_E2E_REPO; optional GRAPH_E2E_RUNNERS=1, GRAPH_E2E_RUNNER_KEY.
+func TestE2E_Graph_SC008_Runner(t *testing.T) {
+	proc := startGraphMCP(t)
+	repo := graphFixture(t, "GRAPH_E2E_REPO")
+	key := os.Getenv("GRAPH_E2E_RUNNER_KEY")
+
+	filters := map[string]any{"repo": repo}
+	if key != "" {
+		filters["node_key"] = key
+	}
+	line := graphCall(t, proc, 2, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "runner", "filters": filters},
+		"limit": 100,
+	})
+	assertNoToolError(t, line)
+	resp := decodeTool[gQueryResp](t, line)
+
+	if len(resp.Results) > 0 {
+		for _, h := range resp.Results {
+			if h.Kind != "runner" || h.Repo != repo {
+				t.Errorf("runner query on %q returned a foreign/invalid point: %+v", repo, h)
+			}
+			if h.NodeKey == "" || h.RunnerID == "" || h.VCSHost == "" {
+				t.Errorf("runner node without node_key/runner_id/vcs_host: %+v", h)
+			}
+			if key != "" && h.NodeKey != key {
+				t.Errorf("runner lookup returned node_key %q, want %q", h.NodeKey, key)
+			}
+		}
+		assertCoverage(t, "query_graph(runner)", resp.Coverage, repo)
+
+		// executed_by (optional): the runner's incoming ci edges, when the
+		// fixture wired them; absent is a skip-note, not a failure.
+		runnerKey := resp.Results[0].NodeKey
+		nLine := graphCall(t, proc, 3, "query_graph", map[string]any{
+			"mode": "neighbors", "node_key": runnerKey, "direction": "incoming",
+			"rel_types": []string{"executed_by"}, "filters": map[string]any{"repo": repo}, "limit": 50,
+		})
+		assertNoToolError(t, nLine)
+		executed := decodeTool[gNeighborsResp](t, nLine)
+		if len(executed.Neighbors) == 0 {
+			t.Logf("skip-note: runner %q has no executed_by edge in the live graph", runnerKey)
+		}
+		for _, n := range executed.Neighbors {
+			if n.Type != "ci" {
+				t.Errorf("executed_by neighbour %q: type=%q, want ci", n.Key, n.Type)
+			}
+		}
+		t.Logf("read-back: runner domain available, runners=%d executed_by=%d", len(resp.Results), len(executed.Neighbors))
+		return
+	}
+
+	// The runner domain is unavailable on this instance (403/404 or no
+	// runners): the answer is an explicit empty one — assertNoToolError above
+	// proves it is not an error.
+	if os.Getenv("GRAPH_E2E_RUNNERS") == "1" {
+		t.Fatalf("GRAPH_E2E_RUNNERS=1 but query_graph(entity:runner) returned no runners for %q", repo)
+	}
+	assertCoverage(t, "query_graph(runner, off)", resp.Coverage, repo)
+	other := decodeTool[gQueryResp](t, graphCall(t, proc, 3, "query_graph", map[string]any{
+		"start": map[string]any{"entity": "definition", "filters": map[string]any{"repo": repo}},
+		"limit": 5,
+	}))
+	if len(other.Results) == 0 {
+		t.Errorf("definition domain returned nothing for %q while the runner domain is off: other domains must keep working", repo)
+	}
+	t.Logf("read-back: runner domain unavailable (empty, no error); definitions still answer: %d points", len(other.Results))
+}
+
 // --- helpers ---
 
 // startGraphMCP builds the binary, starts the production MCP server over stdio
@@ -1128,6 +1208,10 @@ type gQueryHit struct {
 	ItemType  string `json:"item_type"`
 	MsID      string `json:"ms_id"`
 	LabelKey  string `json:"label_key"`
+	// US4 runner payload (SC-008 runner).
+	RunnerID   string `json:"runner_id"`
+	VCSHost    string `json:"vcs_host"`
+	RunnerType string `json:"runner_type"`
 }
 
 type gQueryResp struct {

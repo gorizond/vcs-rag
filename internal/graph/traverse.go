@@ -36,10 +36,11 @@ type Result struct {
 // Traverse runs the iterative N-hop walk of a Query over sc (T038):
 //
 //   - start scan: Compiled.Start; the frontier keys are derived from the start
-//     points (file paths, bare package names, symbols — see frontierKeys);
+//     points (canonical refs, file paths, bare package names, symbols — see
+//     frontierKeys);
 //   - each hop scans edges matching the frontier on the direction-relevant
-//     endpoint fields, collects them, and derives the next frontier from the
-//     scanned points;
+//     endpoint fields (canonical from_key/to_key plus the legacy spellings),
+//     collects them, and derives the next frontier from the scanned points;
 //   - caps: frontier ≤10000 keys/hop, edges ≤20000 scanned/hop, results ≤
 //     Limit — any cut sets Truncated. Points are deduplicated by ID across all
 //     scans.
@@ -105,13 +106,18 @@ func Traverse(ctx context.Context, sc Scroller, q Query, coverage Coverage) (Res
 	return res, nil
 }
 
-// frontier is the typed expansion state of one traversal step. File paths and
+// frontier is the typed expansion state of one traversal step. Canonical
+// endpoint refs (node_key on nodes, from_key/to_key on edges — the same string
+// by construction) are one family of their own: the orbit edge families
+// (authored/commented/assigned_to/labelled/in_milestone/executed_by) carry
+// only them, while code edges also keep the legacy spellings. File paths and
 // the two package key forms are kept apart so each hop matches only its own
 // endpoint fields: a mixed key list on both fields lets the package key derived
 // from one file pull in every edge of the whole package (US5: 616 edges instead
 // of that file's 14).
 type frontier struct {
-	files    []string // file paths (file_path, location_file, from_file)
+	files    []string // legacy file paths (file_path, location_file, from_file)
+	canon    []string // canonical refs (node_key ↔ edge from_key/to_key)
 	pkgKeys  []string // repo-namespaced package keys (PkgKey, edge to_package)
 	pkgNames []string // bare package names (definition `package` ↔ to_package_name)
 	syms     []string // symbols (symbol, to_symbol)
@@ -119,7 +125,7 @@ type frontier struct {
 
 // empty reports whether the frontier can no longer continue the traversal.
 func (fr frontier) empty() bool {
-	return len(fr.files) == 0 && len(fr.pkgKeys) == 0 && len(fr.pkgNames) == 0 && len(fr.syms) == 0
+	return len(fr.files) == 0 && len(fr.canon) == 0 && len(fr.pkgKeys) == 0 && len(fr.pkgNames) == 0 && len(fr.syms) == 0
 }
 
 // clamp bounds every key set to max keys; true means a cut happened.
@@ -127,6 +133,9 @@ func (fr frontier) clamp(max int) (frontier, bool) {
 	cut := false
 	if len(fr.files) > max {
 		fr.files, cut = fr.files[:max], true
+	}
+	if len(fr.canon) > max {
+		fr.canon, cut = fr.canon[:max], true
 	}
 	if len(fr.pkgKeys) > max {
 		fr.pkgKeys, cut = fr.pkgKeys[:max], true
@@ -147,24 +156,30 @@ type endpointKeys struct {
 }
 
 // hopFilter narrows Compiled.Edge to one hop's frontier. Each direction matches
-// only the endpoint fields it traverses: outgoing expansions leave from the
-// frontier files (from_file); incoming expansions arrive at the frontier
-// packages and symbols — to_package for edge-derived full keys, to_package_name
-// for bare package names, to_symbol for defines edges. A file's package key is
-// never matched on the outgoing side: it would widen the scan to the whole
-// package (US5). nil means the frontier has no endpoint of this direction.
+// only the endpoint fields it traverses, canonical first with the legacy
+// spellings OR-ed in behind it (T049): outgoing departs via from_key (orbit
+// edges) or from_file (code edges); incoming arrives via to_key (orbit edges)
+// or the legacy to_package / to_package_name / to_symbol (code edges). Legacy
+// keys stay in the OR for points written before canonical keys existed; they
+// never widen beyond their old granularity. A file's package key is never
+// matched on the outgoing side: it would widen the scan to the whole package
+// (US5). nil means the frontier has no endpoint of this direction.
 func hopFilter(c Compiled, fr frontier) *qdrant.Filter {
 	f := &qdrant.Filter{}
 	f.Must = append(f.Must, c.Edge.GetMust()...)
 	var cond *qdrant.Condition
 	if c.Direction == Incoming {
 		cond = endpointOr(
+			endpointKeys{"to_key", fr.canon},
 			endpointKeys{"to_package", fr.pkgKeys},
 			endpointKeys{"to_package_name", fr.pkgNames},
 			endpointKeys{"to_symbol", fr.syms},
 		)
 	} else {
-		cond = endpointOr(endpointKeys{"from_file", fr.files})
+		cond = endpointOr(
+			endpointKeys{"from_key", fr.canon},
+			endpointKeys{"from_file", fr.files},
+		)
 	}
 	if cond == nil {
 		return nil
@@ -192,6 +207,9 @@ func endpointOr(pairs ...endpointKeys) *qdrant.Condition {
 // frontierKeys derives the typed expansion keys of a scanned point set,
 // deduplicated and sorted (deterministic filters regardless of scan order):
 //
+//   - canonical keys come from every point: node_key on nodes, from_key
+//     (outgoing) or to_key (incoming) on edges — this is what carries the
+//     orbit edge families, whose endpoints have no legacy spellings;
 //   - an outgoing hop continues from files only (from_file): a file start must
 //     not widen to its package (US5) — package-level lookups belong to
 //     get_imports/get_dependents;
@@ -214,11 +232,16 @@ func frontierKeys(pts []*qdrant.RetrievedPoint, dir Direction) frontier {
 			if dir == Incoming {
 				add(&fr.pkgKeys, "pkgkey", payloadString(m, "to_package"))
 				add(&fr.syms, "sym", payloadString(m, "to_symbol"))
+				add(&fr.canon, "canon", payloadString(m, "to_key"))
 			} else {
 				add(&fr.files, "file", payloadString(m, "from_file"))
+				add(&fr.canon, "canon", payloadString(m, "from_key"))
 			}
 			continue
 		}
+		// Nodes: node_key is the endpoint both directions resolve to (edge
+		// from_key/to_key equal it by construction).
+		add(&fr.canon, "canon", payloadString(m, "node_key"))
 		if dir == Incoming {
 			add(&fr.pkgNames, "pkgname", payloadString(m, "package"))
 			add(&fr.syms, "sym", payloadString(m, "symbol"))
@@ -230,6 +253,7 @@ func frontierKeys(pts []*qdrant.RetrievedPoint, dir Direction) frontier {
 		}
 	}
 	sort.Strings(fr.files)
+	sort.Strings(fr.canon)
 	sort.Strings(fr.pkgKeys)
 	sort.Strings(fr.pkgNames)
 	sort.Strings(fr.syms)

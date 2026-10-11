@@ -22,16 +22,17 @@ const (
 // surface it verbatim. Such a query would be a full-collection scan.
 var ErrNonSelective = errors.New("non_selective_query: at least one selective indexed predicate required (repo|file_path|from_file|to_package|from_package|symbol|mr_id|node_key|from_key|to_key|parent_key)")
 
-// Orbit-parity start entities (T024/T032). Their payload kind discriminator IS
-// the entity name (kind=user, note, work_item, milestone, label), so
-// entityMatch maps them generically. Declared here with the start-entity
-// surface of the DSL.
+// Orbit-parity start entities (T024/T032/T036). Their payload kind
+// discriminator IS the entity name (kind=user, note, work_item, milestone,
+// label, runner), so entityMatch maps them generically. Declared here with the
+// start-entity surface of the DSL.
 const (
 	EntityUser      Entity = "user"
 	EntityNote      Entity = "note"
 	EntityWorkItem  Entity = "work_item"
 	EntityMilestone Entity = "milestone"
 	EntityLabel     Entity = "label"
+	EntityRunner    Entity = "runner"
 )
 
 // ErrRelTypesRequired is returned by Compile for a path_finding query without
@@ -216,11 +217,11 @@ func entityMatch(e Entity) ([]*qdrant.Condition, error) {
 		}, nil
 	case EntityMrFile, EntityCi, EntityVuln:
 		return []*qdrant.Condition{qdrant.NewMatch("kind", string(e))}, nil
-	case EntityUser, EntityNote, EntityWorkItem, EntityMilestone, EntityLabel:
+	case EntityUser, EntityNote, EntityWorkItem, EntityMilestone, EntityLabel, EntityRunner:
 		// Orbit families carry their own kind discriminator; no node_type.
 		return []*qdrant.Condition{qdrant.NewMatch("kind", string(e))}, nil
 	}
-	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln|user|note|work_item|milestone|label)", e)
+	return nil, fmt.Errorf("graph: invalid start entity %q (want definition|file|mr_file|ci|vuln|user|note|work_item|milestone|label|runner)", e)
 }
 
 // typedConditions maps the typed Filter fields to Qdrant match conditions.

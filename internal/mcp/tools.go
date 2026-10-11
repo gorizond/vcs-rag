@@ -482,7 +482,8 @@ func registerTools(server *mcp.Server, t *tools) {
 	}, t.queryGraph)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "graph_schema",
-		Description: "Self-describing graph schema: node types (definition) with indexed properties, edge types (imports, defines), " +
+		Description: "Self-describing graph schema: node types (definition, user, note, work_item, milestone, label, runner) with indexed properties, " +
+			"edge types (imports, defines, authored, commented, assigned_to, labelled, in_milestone, executed_by), " +
 			"entity types (mr_file; ci and vuln implemented, vuln gated on provider API/role), the query DSL version/operators, and coverage_per_repo " +
 			"(repo, indexed_commit, generation, indexed_at, languages_with_resolvers) from the per-repo coverage markers — " +
 			"best-effort, empty when no scan has completed yet.",
@@ -1333,15 +1334,57 @@ func (t *tools) graphSchema(ctx context.Context, _ *mcp.CallToolRequest, in grap
 		}
 		cov = marks
 	}
+	// Node/edge families per internal/graph + the store.graphIndexFields index
+	// list: properties mirror the builder payloads, indexed is the indexed
+	// subset (datetime fields index as datetime; body/title/description and
+	// generation/indexed_at stay unindexed).
 	return nil, graphSchemaResponse{
-		NodeTypes: []nodeTypeSpec{{
-			Name:       string(graph.NodeDefinition),
-			Properties: []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path", "signature", "commit_sha"},
-			Indexed:    []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path"},
-		}},
+		NodeTypes: []nodeTypeSpec{
+			{
+				Name:       string(graph.NodeDefinition),
+				Properties: []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path", "signature", "commit_sha"},
+				Indexed:    []string{"node_type", "symbol", "symbol_text", "symbol_kind", "package", "file_path"},
+			},
+			{
+				Name:       string(graph.KindUser),
+				Properties: []string{"node_key", "vcs_user_id", "vcs_host", "login", "name", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "vcs_user_id", "login", "name", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindNote),
+				Properties: []string{"node_key", "note_id", "parent_key", "author_key", "system", "body", "created_at", "updated_at", "last_seen_at", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "parent_key", "author_key", "created_at", "updated_at", "last_seen_at", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindWorkItem),
+				Properties: []string{"node_key", "item_id", "item_type", "state", "title", "updated_at", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "item_id", "item_type", "state", "updated_at", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindMilestone),
+				Properties: []string{"node_key", "ms_id", "title", "state", "due_date", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "ms_id", "state", "due_date", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindLabel),
+				Properties: []string{"node_key", "label_key", "name", "scope", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "label_key", "name", "scope", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+			{
+				Name:       string(graph.KindRunner),
+				Properties: []string{"node_key", "runner_id", "vcs_host", "description", "state", "runner_type", "tags", "repo", "group_org", "vcs_type", "branch", "schema_ver", "generation", "indexed_at"},
+				Indexed:    []string{"node_key", "runner_id", "runner_type", "tags", "state", "repo", "group_org", "vcs_type", "branch", "schema_ver"},
+			},
+		},
 		EdgeTypes: []edgeTypeSpec{
 			{Name: string(graph.EdgeImports), From: "file", To: "package"},
 			{Name: string(graph.EdgeDefines), From: "file", To: "symbol"},
+			{Name: string(graph.EdgeAuthored), From: "work_item", To: "user"},
+			{Name: string(graph.EdgeCommented), From: "note", To: "user"},
+			{Name: string(graph.EdgeAssignedTo), From: "work_item", To: "user"},
+			{Name: string(graph.EdgeLabelled), From: "work_item", To: "label"},
+			{Name: string(graph.EdgeInMilestone), From: "work_item", To: "milestone"},
+			{Name: string(graph.EdgeExecutedBy), From: "ci", To: "runner"},
 		},
 		EntityTypes: []entityTypeSpec{
 			{Name: string(graph.KindMrFile), Description: "per-file MR/PR diffs (search_pull_requests file_path)"},
