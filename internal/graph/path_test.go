@@ -11,10 +11,11 @@ import (
 )
 
 // edgeScroller — hermetic Scroller for path/neighbours: it serves edge points
-// matching the filter's from_key/to_key endpoint AND the edge_type condition
-// (so a test can prove rel_types is enforced), and resolves node_key filters
-// against the node fixture. Point IDs are synthetic; pointIDKey is only used
-// for dedup.
+// matching the filter's endpoint conditions — the canonical from_key/to_key
+// and the OR-ed legacy spellings (from_file/to_package/to_package_name/
+// to_symbol) — AND the edge_type condition (so a test can prove rel_types is
+// enforced), and resolves node_key filters against the node fixture. Point IDs
+// are synthetic; pointIDKey is only used for dedup.
 type edgeScroller struct {
 	edges   []*qdrant.RetrievedPoint
 	nodes   []*qdrant.RetrievedPoint
@@ -39,34 +40,53 @@ func (f *edgeScroller) ScrollAll(_ context.Context, flt *qdrant.Filter, _ uint32
 		return out, nil
 	}
 	fromKeys := filterValues(flt, "from_key")
+	fromFiles := filterValues(flt, "from_file")
 	toKeys := filterValues(flt, "to_key")
+	toPkgs := filterValues(flt, "to_package")
+	toPkgNames := filterValues(flt, "to_package_name")
+	toSyms := filterValues(flt, "to_symbol")
 	relTypes := filterValues(flt, "edge_type")
 	var out []*qdrant.RetrievedPoint
 	for _, e := range f.edges {
 		if len(relTypes) > 0 && !containsKey(relTypes, payloadStr(e, "edge_type")) {
 			continue
 		}
-		if (len(fromKeys) > 0 && containsKey(fromKeys, payloadStr(e, "from_key"))) ||
-			(len(toKeys) > 0 && containsKey(toKeys, payloadStr(e, "to_key"))) {
+		fromHit := (len(fromKeys) > 0 && containsKey(fromKeys, payloadStr(e, "from_key"))) ||
+			(len(fromFiles) > 0 && containsKey(fromFiles, payloadStr(e, "from_file")))
+		toHit := (len(toKeys) > 0 && containsKey(toKeys, payloadStr(e, "to_key"))) ||
+			(len(toPkgs) > 0 && containsKey(toPkgs, payloadStr(e, "to_package"))) ||
+			(len(toPkgNames) > 0 && containsKey(toPkgNames, payloadStr(e, "to_package_name"))) ||
+			(len(toSyms) > 0 && containsKey(toSyms, payloadStr(e, "to_symbol")))
+		if fromHit || toHit {
 			out = append(out, e)
 		}
 	}
 	return out, nil
 }
 
-// filterValues extracts every keyword value of a must-chain condition on
-// field: single Match keywords and MatchAny lists both feed the fake's router.
+// filterValues extracts every keyword value of a condition on field: single
+// Match keywords, MatchAny lists and the endpoint OR branches nested under a
+// must-chain filter condition (the T049/T051 hop shape) all feed the fake's
+// router.
 func filterValues(f *qdrant.Filter, field string) []string {
 	var out []string
-	for _, c := range f.GetMust() {
+	add := func(c *qdrant.Condition) {
 		fc := c.GetField()
 		if fc == nil || fc.GetKey() != field {
-			continue
+			return
 		}
 		if kw := fc.GetMatch().GetKeyword(); kw != "" {
 			out = append(out, kw)
 		}
 		out = append(out, fc.GetMatch().GetKeywords().GetStrings()...)
+	}
+	for _, c := range f.GetMust() {
+		add(c)
+		if nf := c.GetFilter(); nf != nil {
+			for _, sc := range nf.GetShould() {
+				add(sc)
+			}
+		}
 	}
 	return out
 }
@@ -233,6 +253,59 @@ func TestShortestPathValidation(t *testing.T) {
 	res, err := graph.ShortestPath(context.Background(), &edgeScroller{}, pathQuery(a, a, 3), graph.Coverage{})
 	if err != nil || res.Status != graph.PathFound || len(res.Nodes) != 1 || len(res.Edges) != 0 {
 		t.Fatalf("from==to = %+v err=%v, want a zero-hop found path", res, err)
+	}
+}
+
+// TestShortestPathLegacyFallback — T053: a point written before the canonical
+// keys existed (only from_file/to_package/from_package, no from_key/to_key) is
+// still a path hop. The hop filter ORs the legacy spellings derived from the
+// frontier (symmetric to the traversal/neighbours fallback), and both
+// endpoints resolve back into canonical key space — from_file through the
+// edge's repo, to_package through the lossless PkgKey — so the meet happens on
+// the canonical refs and the reconstructed edge keeps their direction.
+func TestShortestPathLegacyFallback(t *testing.T) {
+	a := graph.RefFile("r", "a.go")
+	pkg := graph.RefPkg("r", "github.com/x/y")
+	sc := &edgeScroller{edges: []*qdrant.RetrievedPoint{
+		point("e1", "edge", map[string]string{
+			"edge_type": "imports", "repo": "r",
+			"from_file": "a.go", "from_package": graph.PkgKey("r", "main"),
+			"to_package": graph.PkgKey("r", "github.com/x/y"),
+		}),
+	}}
+	res, err := graph.ShortestPath(context.Background(), sc, pathQuery(a, pkg, 3), graph.Coverage{Repo: "r"})
+	if err != nil {
+		t.Fatalf("ShortestPath: %v", err)
+	}
+	if res.Status != graph.PathFound || len(res.Nodes) != 2 || res.Nodes[0] != a || res.Nodes[1] != pkg {
+		t.Fatalf("status = %q nodes = %v, want the legacy import hop %s→%s", res.Status, res.Nodes, a, pkg)
+	}
+	if len(res.Edges) != 1 || res.Edges[0] != (graph.PathEdge{FromKey: a, ToKey: pkg, EdgeType: "imports"}) {
+		t.Fatalf("edges = %+v, want %s→%s over the legacy from_file/to_package edge", res.Edges, a, pkg)
+	}
+}
+
+// TestShortestPathLegacyFallbackRepoScope — the legacy spellings are not
+// repo-scoped on the wire, so the fallback must never join an edge of another
+// repo into this frontier: the edge-side decode of from_file/to_package
+// carries the edge's own repo, its endpoints land outside the visited set and
+// the hop is dropped. The fake serves the edge (it does not model the repo
+// scope condition), so this exercises the resolution guard itself; the search
+// stays conclusive, not inconclusive, because nothing was cut.
+func TestShortestPathLegacyFallbackRepoScope(t *testing.T) {
+	a, pkg := graph.RefFile("r", "a.go"), graph.RefPkg("r", "github.com/x/y")
+	sc := &edgeScroller{edges: []*qdrant.RetrievedPoint{
+		point("e1", "edge", map[string]string{
+			"edge_type": "imports", "repo": "other",
+			"from_file": "a.go", "to_package": graph.PkgKey("other", "github.com/x/y"),
+		}),
+	}}
+	res, err := graph.ShortestPath(context.Background(), sc, pathQuery(a, pkg, 3), graph.Coverage{Repo: "r"})
+	if err != nil {
+		t.Fatalf("ShortestPath: %v", err)
+	}
+	if res.Status != graph.PathNotFound || res.Truncated {
+		t.Fatalf("status = %q truncated=%v, want a conclusive not_found outside the edge's repo", res.Status, res.Truncated)
 	}
 }
 

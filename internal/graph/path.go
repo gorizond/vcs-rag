@@ -3,6 +3,8 @@ package graph
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/qdrant/go-client/qdrant"
 )
@@ -41,7 +43,9 @@ type PathResult struct {
 //
 //   - the search follows stored edge direction: the forward side expands
 //     from_key=frontier, the backward side to_key=frontier; endpoints bounded
-//     by canonical keys, depth by the compiled hops (≤3), rel_types required;
+//     by canonical keys — legacy-only pre-parity points join through the same
+//     OR fallback as traversal/neighbours (T053) — depth by the compiled hops
+//     (≤3), rel_types required;
 //   - the smaller frontier is expanded each step and the intersection of the
 //     two visited sets is checked after every expansion — the first meeting
 //     yields the minimum number of hops;
@@ -93,7 +97,8 @@ func ShortestPath(ctx context.Context, sc Scroller, q Query, coverage Coverage) 
 		if len(fr) > maxFrontier {
 			fr, cut = fr[:maxFrontier], true
 		}
-		edges, err := sc.ScrollAll(ctx, pathHopFilter(c.Edge, dir, fr, q.RelTypes), graphPageSize)
+		leg := pathFrontierLegacy(fr)
+		edges, err := sc.ScrollAll(ctx, pathHopFilter(c.Edge, dir, fr, leg, q.RelTypes), graphPageSize)
 		if err != nil {
 			return nil, cut, fmt.Errorf("graph: path hop (%s): %w", dir, err)
 		}
@@ -107,6 +112,15 @@ func ShortestPath(ctx context.Context, sc Scroller, q Query, coverage Coverage) 
 			parent, peer := from, to
 			if dir == Incoming {
 				parent, peer = to, from
+			}
+			// T053: a pre-parity point carries no from_key/to_key; resolve its
+			// legacy endpoint spellings back into the canonical key space of
+			// the visited sets (see pathLegacy).
+			if parent == "" {
+				parent = leg.nearKey(m, dir)
+			}
+			if peer == "" {
+				peer = pathPeerKey(m, dir)
 			}
 			d, ok := self[parent]
 			if !ok || peer == "" || d+1 > c.Hops {
@@ -192,19 +206,170 @@ func ShortestPath(ctx context.Context, sc Scroller, q Query, coverage Coverage) 
 }
 
 // pathHopFilter narrows the compiled edge filter to one hop of a path search:
-// the rel_types list plus the endpoint field the direction traverses.
-func pathHopFilter(base *qdrant.Filter, dir Direction, keys, rel []string) *qdrant.Filter {
+// the rel_types list plus the endpoint field the direction traverses. Like the
+// traversal hop filter (T049) and the single-centre neighbours filter (T051),
+// the endpoint is an OR of the canonical frontier keys and the legacy
+// spellings they derive (T053), so edges written before from_key/to_key existed
+// stay traversable. Unlike a single-centre lookup the frontier is a set, so
+// every frontier key's spelling feeds the same OR branches.
+func pathHopFilter(base *qdrant.Filter, dir Direction, fr []string, leg pathLegacy, rel []string) *qdrant.Filter {
 	f := &qdrant.Filter{}
 	f.Must = append(f.Must, base.GetMust()...)
 	if len(rel) > 0 {
 		f.Must = append(f.Must, qdrant.NewMatchKeywords("edge_type", rel...))
 	}
-	field := "from_key"
+	var cond *qdrant.Condition
 	if dir == Incoming {
-		field = "to_key"
+		cond = endpointOr(
+			endpointKeys{"to_key", fr},
+			endpointKeys{"to_package", leg.pkgKeys},
+			endpointKeys{"to_package_name", leg.pkgNames},
+			endpointKeys{"to_symbol", leg.syms},
+		)
+	} else {
+		cond = endpointOr(
+			endpointKeys{"from_key", fr},
+			endpointKeys{"from_file", leg.files},
+		)
 	}
-	f.Must = append(f.Must, qdrant.NewMatchKeywords(field, keys...))
+	if cond != nil {
+		f.Must = append(f.Must, cond)
+	}
 	return f
+}
+
+// pathLegacy is the legacy-endpoint projection of one BFS frontier (T053):
+// legacyCentre derives every pre-parity spelling of the frontier's canonical
+// keys, the hop filter ORs them in (symmetric to the traversal/neighbours
+// fallback), and the two spellings that carry no path back to a canonical ref
+// — a bare package name and a bare symbol — index the frontier key that
+// produced them, so a matched legacy edge's near endpoint resolves back into
+// the visited set.
+type pathLegacy struct {
+	files, pkgKeys, pkgNames, syms []string
+	byPkgName, bySym               map[string][]string
+}
+
+// pathFrontierLegacy projects a frontier onto its legacy spellings. The
+// spelling lists are deduplicated per family and sorted, so the hop filter is
+// deterministic regardless of frontier order.
+func pathFrontierLegacy(fr []string) pathLegacy {
+	leg := pathLegacy{byPkgName: map[string][]string{}, bySym: map[string][]string{}}
+	seen := map[string]bool{}
+	add := func(dst *[]string, family, v string) {
+		if v == "" || seen[family+"\x00"+v] {
+			return
+		}
+		seen[family+"\x00"+v] = true
+		*dst = append(*dst, v)
+	}
+	for _, k := range fr {
+		lc := legacyCentre(k)
+		add(&leg.files, "file", lc.file)
+		add(&leg.pkgKeys, "pkgkey", lc.pkgKey)
+		add(&leg.pkgNames, "pkgname", lc.pkgName)
+		add(&leg.syms, "sym", lc.sym)
+		if lc.pkgName != "" {
+			leg.byPkgName[lc.pkgName] = append(leg.byPkgName[lc.pkgName], k)
+		}
+		if lc.sym != "" {
+			leg.bySym[lc.sym] = append(leg.bySym[lc.sym], k)
+		}
+	}
+	sort.Strings(leg.files)
+	sort.Strings(leg.pkgKeys)
+	sort.Strings(leg.pkgNames)
+	sort.Strings(leg.syms)
+	return leg
+}
+
+// nearKey resolves the near endpoint — the one already in the visited set — of
+// a pre-parity edge back to its canonical key. from_file is repo-scoped by the
+// edge payload and to_package carries the lossless PkgKey, so both decode
+// exactly; to_package_name and to_symbol carry no full path, so the frontier
+// index supplies the key that derived the spelling. "" leaves the edge
+// untraversed.
+func (leg pathLegacy) nearKey(m map[string]*qdrant.Value, dir Direction) string {
+	repo := payloadString(m, "repo")
+	if dir == Outgoing {
+		if f := payloadString(m, "from_file"); f != "" {
+			if repo == "" {
+				return f
+			}
+			return RefFile(repo, f)
+		}
+		return ""
+	}
+	if v := payloadString(m, "to_package"); v != "" {
+		if k := decodePkgKey(v); k != "" {
+			return k
+		}
+		return v
+	}
+	if n := payloadString(m, "to_package_name"); n != "" {
+		return resolveSpelling(leg.byPkgName, n, repo)
+	}
+	if s := payloadString(m, "to_symbol"); s != "" {
+		return resolveSpelling(leg.bySym, s, repo)
+	}
+	return ""
+}
+
+// pathPeerKey resolves the far endpoint of an edge: the canonical key when
+// present, else its legacy spelling. from_file and to_package decode back to
+// their canonical refs (payload repo included); to_package_name and to_symbol
+// stay raw terminal pseudo-keys, exactly as Neighbors reports them.
+func pathPeerKey(m map[string]*qdrant.Value, dir Direction) string {
+	repo := payloadString(m, "repo")
+	if dir == Incoming {
+		if f := payloadString(m, "from_file"); f != "" {
+			if repo == "" {
+				return f
+			}
+			return RefFile(repo, f)
+		}
+		return ""
+	}
+	if v := payloadString(m, "to_package"); v != "" {
+		if k := decodePkgKey(v); k != "" {
+			return k
+		}
+		return v
+	}
+	if n := payloadString(m, "to_package_name"); n != "" {
+		return n
+	}
+	return payloadString(m, "to_symbol")
+}
+
+// decodePkgKey decodes the repo-namespaced pre-parity to_package spelling
+// (PkgKey, keySep-joined) back to the canonical package ref it encodes — the
+// encoding is lossless, unlike the bare to_package_name. "" when the spelling
+// is not a PkgKey (no writer ever produced another shape; guarded anyway).
+func decodePkgKey(v string) string {
+	parts := strings.Split(v, keySep)
+	if len(parts) != 3 || parts[0] != "pkg" {
+		return ""
+	}
+	return RefPkg(parts[1], parts[2])
+}
+
+// resolveSpelling maps a bare legacy spelling back to the frontier key that
+// produced it; several derivations are disambiguated by the edge's repo, and a
+// remaining ambiguity resolves to "" — the edge is left untraversed rather
+// than attributed to the wrong repo.
+func resolveSpelling(idx map[string][]string, spelling, repo string) string {
+	found := ""
+	for _, k := range idx[spelling] {
+		if repo != "" && !strings.HasPrefix(k, repo+"|") {
+			continue
+		}
+		if found != "" {
+			return ""
+		}
+		found = k
+	}
+	return found
 }
 
 // reverseStrings reverses s in place.

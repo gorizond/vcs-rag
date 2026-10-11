@@ -22,10 +22,11 @@ import (
 // cleanly.
 //
 // The US1 parity modes of query_graph (T016) get their own scenarios:
-// mode=aggregation counts the repo's MR points by author (SC001_Aggregation),
-// mode=path_finding follows a live import edge of GRAPH_E2E_FILE
-// (SC002_Path), mode=neighbors lists the 1-hop peers of its canonical file
-// node_key in both directions (SC003_Neighbors). They need no new fixture envs.
+// mode=aggregation groups the repo's MR/PR points by their populated status
+// column (SC001_Aggregation), mode=path_finding follows a live import edge of
+// GRAPH_E2E_FILE (SC002_Path), mode=neighbors lists the 1-hop peers of its
+// canonical file node_key in both directions (SC003_Neighbors). They need no
+// new fixture envs.
 //
 // The people/planning domains (SC-004/SC-005) get their own scenarios:
 // SC004_UserNote finds a user by login and the notes of one parent as nodes
@@ -380,10 +381,14 @@ func TestE2E_Graph_US5(t *testing.T) {
 }
 
 // TestE2E_Graph_SC001_Aggregation — US1 parity e2e of mode=aggregation
-// (SC-001): an exact grouped count of the fixture repo's MR/PR points by
-// author. The answer is rows of {key,count,value}; with op=count value equals
-// the group count, and every answer carries a coverage notice. Skipped when the
-// fixture has no author-bearing MR/PR points (a code-only index).
+// (SC-001): an exact grouped count of the fixture repo's MR/PR points by their
+// populated `status` column. The answer is rows of {key,count,value}; with
+// op=count value equals the group count, and every answer carries a coverage
+// notice. Deliberately not grouped by `author`: mr_file points carry no author
+// on this fixture, so a by-author query is a one-empty-group tautology and
+// proves nothing. An empty key is a legitimate row of a sparse column (the
+// points that lack the field group under ""); the scenario accepts and logs
+// it, but demands at least one populated (non-empty-key) group.
 //
 // Env: GRAPH_E2E_REPO (see the file header).
 func TestE2E_Graph_SC001_Aggregation(t *testing.T) {
@@ -393,7 +398,7 @@ func TestE2E_Graph_SC001_Aggregation(t *testing.T) {
 	line := graphCall(t, proc, 2, "query_graph", map[string]any{
 		"mode":     "aggregation",
 		"op":       "count",
-		"group_by": "author",
+		"group_by": "status",
 		"start":    map[string]any{"entity": "mr_file", "filters": map[string]any{"repo": repo}},
 		"limit":    100,
 	})
@@ -401,25 +406,32 @@ func TestE2E_Graph_SC001_Aggregation(t *testing.T) {
 	agg := decodeTool[gAggResp](t, line)
 	assertCoverage(t, "query_graph(aggregation)", agg.Coverage, repo)
 	if len(agg.Groups) == 0 {
-		t.Skipf("aggregation(count by author) for %q returned no groups: the fixture index has no MR/PR points with an author", repo)
+		t.Skipf("aggregation(count by status) for %q returned no groups: the fixture index has no MR/PR points", repo)
 	}
-	var total uint64
+	var total, populated uint64
 	for _, g := range agg.Groups {
-		if g.Key == "" {
-			t.Errorf("aggregation group with empty key: %+v", g)
-		}
 		if g.Count == 0 {
 			t.Errorf("aggregation group %q: count=0", g.Key)
 		}
 		if g.Value != float64(g.Count) {
 			t.Errorf("aggregation group %q: op=count value=%v, want %d", g.Key, g.Value, g.Count)
 		}
+		if g.Key == "" {
+			// Sparse columns legitimately group their unset points under the
+			// empty key: accepted and surfaced, never a failure by itself.
+			t.Logf("empty-key group: %d MR/PR points lack the group column", g.Count)
+			continue
+		}
+		populated++
 		total += g.Count
+	}
+	if populated == 0 {
+		t.Errorf("aggregation(count by status) for %q has no populated group: the group column must be populated on the fixture's MR/PR points", repo)
 	}
 	if agg.Truncated && len(agg.Groups) < 100 {
 		t.Errorf("truncated=true with only %d groups (< limit): an exact facet count is never cut silently", len(agg.Groups))
 	}
-	t.Logf("read-back: aggregation(count by author) groups=%d points=%d truncated=%v", len(agg.Groups), total, agg.Truncated)
+	t.Logf("read-back: aggregation(count by status) groups=%d populated=%d points=%d truncated=%v", len(agg.Groups), populated, total, agg.Truncated)
 }
 
 // TestE2E_Graph_SC002_Path — US1 parity e2e of mode=path_finding (SC-002): the
@@ -492,9 +504,14 @@ func TestE2E_Graph_SC002_Path(t *testing.T) {
 
 // TestE2E_Graph_SC003_Neighbors — US1 parity e2e of mode=neighbors (SC-003):
 // the 1-hop peers of the fixture file's canonical node_key in both directions
-// over the imports+defines relations. The fixture file has >=1 outgoing import,
-// so the peer list is non-empty; every peer is either a resolved stored node or
-// an honest pseudo-node, and the answer carries a coverage notice.
+// over the imports+defines relations. The fixture file has >=1 outgoing import
+// — via the canonical from_key or, on an index not yet re-scanned, via the
+// legacy from_file the T051 fallback ORs in — so the peer list is non-empty;
+// every peer is either a resolved stored node or an honest pseudo-node, and
+// the answer carries a coverage notice. Peers of pre-parity edges carry the
+// type their legacy field implies; a peer the engine cannot classify keeps an
+// empty type (honest pseudo-node) and is only counted — at least one typed
+// peer must still appear.
 //
 // Env: GRAPH_E2E_REPO + GRAPH_E2E_FILE (>=1 outgoing import).
 func TestE2E_Graph_SC003_Neighbors(t *testing.T) {
@@ -514,17 +531,21 @@ func TestE2E_Graph_SC003_Neighbors(t *testing.T) {
 	nb := decodeTool[gNeighborsResp](t, line)
 	assertCoverage(t, "query_graph(neighbors)", nb.Coverage, repo)
 	if len(nb.Neighbors) == 0 {
-		t.Fatalf("neighbors(%q) returned no peers: the fixture file must have >=1 outgoing import", centre)
+		t.Fatalf("neighbors(%q) returned no peers: the fixture file must have >=1 outgoing import (canonical from_key or legacy from_file)", centre)
 	}
+	typed := 0
 	for _, n := range nb.Neighbors {
 		if n.Key == "" || n.Key == centre {
 			t.Errorf("neighbor with empty or self key %q", n.Key)
 		}
-		if n.Type == "" {
-			t.Errorf("neighbor %q: type is empty", n.Key)
-		}
 		if len(n.EdgeTypes) == 0 {
 			t.Errorf("neighbor %q: no edge_types", n.Key)
+		}
+		// A pre-parity edge may have no stored endpoint type; the engine
+		// derives one from the legacy field, but an unclassified peer is
+		// still an honest pseudo-node, not a failure — it is only counted.
+		if n.Type != "" {
+			typed++
 		}
 		if n.Resolved {
 			if n.Node == nil {
@@ -536,7 +557,10 @@ func TestE2E_Graph_SC003_Neighbors(t *testing.T) {
 			t.Errorf("neighbor %q: unresolved but carries a node payload", n.Key)
 		}
 	}
-	t.Logf("read-back: neighbors(%s) peers=%d truncated=%v", centre, len(nb.Neighbors), nb.Truncated)
+	if typed == 0 {
+		t.Errorf("neighbors(%q): no peer carries a type — neither canonical to_type nor a recognised legacy endpoint field", centre)
+	}
+	t.Logf("read-back: neighbors(%s) peers=%d typed=%d truncated=%v", centre, len(nb.Neighbors), typed, nb.Truncated)
 }
 
 // TestE2E_Graph_SC004_UserNote — US2 (SC-004): the people/comment domain is

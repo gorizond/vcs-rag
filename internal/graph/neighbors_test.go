@@ -134,3 +134,49 @@ func TestNeighborsValidation(t *testing.T) {
 		t.Fatal("invalid direction must be refused")
 	}
 }
+
+// TestNeighborsLegacyFallback — T051: edge points written before the canonical
+// keys existed (only from_file/to_package/to_package_name/to_symbol, no
+// from_key/to_key/from_type/to_type) are still neighbours of the canonical
+// centre ref, and each peer carries the type its legacy field implies.
+func TestNeighborsLegacyFallback(t *testing.T) {
+	centre := graph.RefFile("r", "pkg/a.go")
+	pkgKey := graph.PkgKey("r", "github.com/x/y")
+	sc := &edgeScroller{edges: []*qdrant.RetrievedPoint{
+		point("e1", "edge", map[string]string{
+			"edge_type": "imports", "from_file": "pkg/a.go", "from_package": graph.PkgKey("r", "pkg"),
+			"to_package": pkgKey, "to_package_name": "y",
+		}),
+		point("e2", "edge", map[string]string{
+			"edge_type": "defines", "from_file": "pkg/a.go", "to_symbol": "F",
+		}),
+	}}
+
+	q := graph.Query{Mode: graph.ModeNeighbors, NodeKey: centre, Direction: graph.Outgoing}
+	res, err := graph.Neighbors(context.Background(), sc, q)
+	if err != nil {
+		t.Fatalf("Neighbors: %v", err)
+	}
+	if len(res.Neighbors) != 2 {
+		t.Fatalf("neighbors = %+v, want the two legacy edges of the centre", res.Neighbors)
+	}
+	pkg, ok := neighborByKey(res, pkgKey)
+	if !ok || pkg.Type != "package" || pkg.Resolved || pkg.Node != nil || len(pkg.EdgeTypes) != 1 || pkg.EdgeTypes[0] != "imports" {
+		t.Fatalf("legacy package peer = %+v, want pseudo-node keyed by to_package with type package", pkg)
+	}
+	sym, ok := neighborByKey(res, "F")
+	if !ok || sym.Type != "symbol" || sym.Resolved || sym.Node != nil || len(sym.EdgeTypes) != 1 || sym.EdgeTypes[0] != "defines" {
+		t.Fatalf("legacy symbol peer = %+v, want pseudo-node keyed by to_symbol with type symbol", sym)
+	}
+
+	// Incoming: the legacy to_package/to_package_name spelling of a package
+	// ref reaches its importer, a file pseudo-node.
+	q = graph.Query{Mode: graph.ModeNeighbors, NodeKey: graph.RefPkg("r", "github.com/x/y"), Direction: graph.Incoming}
+	res, err = graph.Neighbors(context.Background(), sc, q)
+	if err != nil {
+		t.Fatalf("Neighbors(incoming): %v", err)
+	}
+	if len(res.Neighbors) != 1 || res.Neighbors[0].Key != "pkg/a.go" || res.Neighbors[0].Type != "file" || res.Neighbors[0].Resolved {
+		t.Fatalf("incoming neighbors = %+v, want the importing file pseudo-node", res.Neighbors)
+	}
+}
