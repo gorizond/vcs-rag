@@ -84,3 +84,32 @@ func TestSweepGatesBestEffortKinds(t *testing.T) {
 		t.Fatalf("gates are per-kind: deleted=%v", ciOnly.deleted)
 	}
 }
+
+// TestSweepOwnershipInstanceWide — the pass-level ownership sweep is
+// repo-agnostic (kind + generation alone, no repo/branch scope): it deletes
+// the stale group and project points of the whole instance and touches no
+// other kind. The per-repo Sweep leaves both kinds alone.
+func TestSweepOwnershipInstanceWide(t *testing.T) {
+	ctx := context.Background()
+	stale := map[graph.Kind]int{graph.KindGroup: 2, graph.KindProject: 5, graph.KindNode: 3}
+
+	gs := &sweepFake{stale: stale, deleted: map[graph.Kind]int{}}
+	if _, err := graph.Sweep(ctx, gs, "r", "main", 10, false, graph.SweepTargets{}); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if gs.deleted[graph.KindGroup] != 0 || gs.deleted[graph.KindProject] != 0 {
+		t.Fatalf("per-repo Sweep must leave the ownership kinds alone: deleted=%v", gs.deleted)
+	}
+
+	gs = &sweepFake{stale: stale, deleted: map[graph.Kind]int{}}
+	deleted, err := graph.SweepOwnership(ctx, gs, 10, false)
+	if err != nil {
+		t.Fatalf("SweepOwnership: %v", err)
+	}
+	if deleted != 7 || gs.deleted[graph.KindGroup] != 2 || gs.deleted[graph.KindProject] != 5 {
+		t.Fatalf("SweepOwnership deleted=%d %v, want both ownership kinds (2+5)", deleted, gs.deleted)
+	}
+	if gs.deleted[graph.KindNode] != 0 {
+		t.Fatalf("SweepOwnership touched a foreign kind: %v", gs.deleted)
+	}
+}
