@@ -10,7 +10,7 @@ import (
 // RepoRef — one repository as stored in the payload (T133-fix, live-verified):
 // the worker writes repo=<short path> (r.Path) and group_org=<full namespace>
 // (r.Namespace). Matching "repo" against a full "ns/path" gives 0 points
-// (vcs_rag_<contour>: repo="databases" → 82, repo="example-orgexample-group/
+// (vcs_rag_<contour>: repo="databases" → 82, repo="example-org/
 // gitops/databases" → 0; vcs_rag: "runner" → 9, "secrets/runner" → 0), so a
 // resolved filter carries the pair, never the dashed full name.
 type RepoRef struct {

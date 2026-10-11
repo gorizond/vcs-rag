@@ -5,13 +5,13 @@ import "testing"
 // T140: the GC repo-scope filter is the payload triple (vcs_type, group_org,
 // repo); an empty vcs_type is omitted.
 func TestRepoPointsFilter(t *testing.T) {
-	flt := repoPointsFilter("gitlab", "example/group/gitops", "databases")
+	flt := repoPointsFilter("gitlab", "example-org/gitops", "databases")
 	if len(flt.GetMust()) != 3 {
 		t.Fatalf("must = %d conditions, want 3", len(flt.GetMust()))
 	}
 	want := []struct{ key, value string }{
 		{"vcs_type", "gitlab"},
-		{"group_org", "example/group/gitops"},
+		{"group_org", "example-org/gitops"},
 		{"repo", "databases"},
 	}
 	for i, w := range want {

@@ -37,11 +37,11 @@ func TestBuildFilterRepos(t *testing.T) {
 	}
 
 	// a single pair is the same direct Must pair (group_org comes from the pair).
-	one := buildFilter(Filter{RepoRefs: []RepoRef{{GroupOrg: "example/group/gitops", Repo: "databases"}}})
+	one := buildFilter(Filter{RepoRefs: []RepoRef{{GroupOrg: "example-org/gitops", Repo: "databases"}}})
 	if one == nil || len(one.GetMust()) != 2 {
 		t.Fatalf("single pair must = %+v", one)
 	}
-	if k, v := fieldKeyword(one.GetMust()[0]); k != "group_org" || v != "example/group/gitops" {
+	if k, v := fieldKeyword(one.GetMust()[0]); k != "group_org" || v != "example-org/gitops" {
 		t.Errorf("pair group_org = %s=%q", k, v)
 	}
 	if k, v := fieldKeyword(one.GetMust()[1]); k != "repo" || v != "databases" {
