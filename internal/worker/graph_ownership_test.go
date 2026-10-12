@@ -8,6 +8,7 @@ import (
 
 	"github.com/qdrant/go-client/qdrant"
 
+	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/graph"
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
@@ -180,5 +181,59 @@ func TestInGroupResolvesAgainstPassLevelKeys(t *testing.T) {
 		if m := p.GetPayload(); m["edge_type"].GetStringValue() == string(graph.EdgeInGroup) {
 			t.Fatalf("in_group edge emitted without pass-level keys: %v", m)
 		}
+	}
+}
+
+// graphStoreFake is the graph pass's store seam with recorded calls: it serves
+// the ownership upsert and the count/delete/scroll surface of the instance
+// sweep without a Qdrant server.
+type graphStoreFake struct {
+	upserts int
+	counts  int
+	deletes int
+}
+
+func (f *graphStoreFake) Upsert(context.Context, []*qdrant.PointStruct) error {
+	f.upserts++
+	return nil
+}
+
+func (f *graphStoreFake) CountByFilter(context.Context, *qdrant.Filter) (uint64, error) {
+	f.counts++
+	return 0, nil
+}
+
+func (f *graphStoreFake) DeleteByFilter(context.Context, *qdrant.Filter) error {
+	f.deletes++
+	return nil
+}
+
+func (f *graphStoreFake) ScrollAll(context.Context, *qdrant.Filter, uint32) ([]*qdrant.RetrievedPoint, error) {
+	return nil, nil
+}
+
+// TestGraphPassSweepsOwnershipWithoutRepos — the instance-wide ownership sweep
+// runs BEFORE the per-repo loop, so an empty snapshot (no repository to
+// process) still emits the ownership points and runs the sweep exactly once;
+// the repo loop never runs. A long (or stuck) per-repo loop therefore cannot
+// starve the instance sweep.
+func TestGraphPassSweepsOwnershipWithoutRepos(t *testing.T) {
+	deps := RepoDeps{VCSType: "gitlab", VCS: &ownershipStub{}, Logger: testLogger()}
+	cfg := &config.Config{Worker: config.Worker{GraphSchemaVer: "4"}}
+	gs := &graphStoreFake{}
+	snap := &snapshot{} // empty snapshot: nothing for the repo loop to process
+
+	sum := graphPass(context.Background(), cfg, deps, snap, gs, 0, &vulnGate{}, &runnerGate{})
+
+	if sum.repos.Load() != 0 {
+		t.Fatalf("repo loop ran with an empty snapshot: repos=%d", sum.repos.Load())
+	}
+	if gs.upserts != 1 {
+		t.Fatalf("ownership points upserted %d times, want 1", gs.upserts)
+	}
+	// One count per swept kind (group, project): the sweep path ran even though
+	// the pass processed no repository.
+	if gs.counts != 2 {
+		t.Fatalf("instance sweep counted %d filters, want 2 (group, project) — the sweep must not be gated behind the repo loop", gs.counts)
 	}
 }
