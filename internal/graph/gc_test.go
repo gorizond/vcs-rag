@@ -1,7 +1,10 @@
 package graph_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/qdrant/go-client/qdrant"
@@ -111,5 +114,31 @@ func TestSweepOwnershipInstanceWide(t *testing.T) {
 	}
 	if gs.deleted[graph.KindNode] != 0 {
 		t.Fatalf("SweepOwnership touched a foreign kind: %v", gs.deleted)
+	}
+}
+
+// TestSweepOwnershipZeroTrace — the instance-level sweep is traceable even
+// when nothing matches: each kind logs its scanned count (a zero included) and
+// the run logs an entry and a completion line with the total deleted.
+func TestSweepOwnershipZeroTrace(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	gs := &sweepFake{stale: map[graph.Kind]int{}, deleted: map[graph.Kind]int{}}
+	n, err := graph.SweepOwnership(context.Background(), gs, 10, false)
+	if err != nil || n != 0 {
+		t.Fatalf("SweepOwnership: n=%d err=%v, want 0,nil", n, err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"gc scan", "kind=group", "kind=project",
+		"generation_below=10", "points=0",
+		"gc sweep start", "scope=instance", "gc sweep done",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("zero-count sweep log misses %q:\n%s", want, out)
+		}
 	}
 }

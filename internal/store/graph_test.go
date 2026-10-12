@@ -60,8 +60,8 @@ func containsField(fields []string, want string) bool {
 }
 
 // TestGraphIndexFieldsOrbitParity pins the T004 index declaration: the
-// canonical key/type fields, the new node-family fields and their datetime
-// classification, with body/title deliberately unindexed.
+// canonical key/type fields, the new node-family fields and their
+// datetime/integer classification, with body/title deliberately unindexed.
 func TestGraphIndexFieldsOrbitParity(t *testing.T) {
 	for _, f := range []string{
 		"node_key", "from_key", "to_key", "from_type", "to_type",
@@ -69,6 +69,7 @@ func TestGraphIndexFieldsOrbitParity(t *testing.T) {
 		"item_id", "item_type", "ms_id", "label_key", "scope",
 		"runner_id", "runner_type", "tags",
 		"created_at", "updated_at", "due_date", "last_seen_at",
+		"generation",
 	} {
 		if !containsField(graphIndexFields, f) {
 			t.Errorf("graphIndexFields misses %q", f)
@@ -82,6 +83,17 @@ func TestGraphIndexFieldsOrbitParity(t *testing.T) {
 	for _, f := range []string{"created_at", "updated_at", "due_date", "last_seen_at"} {
 		if !graphDatetimeIndexFields[f] {
 			t.Errorf("%q must be classified as datetime", f)
+		}
+	}
+	// The numeric range field must be declared as an integer index: the
+	// sweep's generation < current filter is evaluated exactly only against an
+	// integer index, never against a keyword field.
+	for _, f := range []string{"generation"} {
+		if !graphIntegerIndexFields[f] {
+			t.Errorf("%q must be classified as an integer index field", f)
+		}
+		if graphDatetimeIndexFields[f] {
+			t.Errorf("%q cannot be datetime and integer at once", f)
 		}
 	}
 	for _, f := range []string{"node_key", "from_key", "to_key", "parent_key"} {

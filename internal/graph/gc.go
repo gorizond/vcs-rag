@@ -50,7 +50,10 @@ type SweepTargets struct {
 
 // sweepStore is the store seam of the sweep: the production
 // *store.GraphStore satisfies this method set, and gc_test.go fakes it to prove
-// the gating contract without a Qdrant server.
+// the gating contract without a Qdrant server. CountByFilter must return an
+// EXACT count (the production implementation passes Exact:true, and generation
+// is integer-indexed): a sweep deletes exactly the points its count matched, so
+// an approximate or silently-zero count would skip live stale points.
 type sweepStore interface {
 	CountByFilter(ctx context.Context, f *qdrant.Filter) (uint64, error)
 	DeleteByFilter(ctx context.Context, f *qdrant.Filter) error
@@ -208,14 +211,19 @@ func Sweep(ctx context.Context, gs sweepStore, repo, branch string, generation i
 // the stale points (FR-024/T016), exactly like the per-repo sweep rule. The
 // per-repo Sweep never touches these kinds.
 func SweepOwnership(ctx context.Context, gs sweepStore, generation int, dryRun bool) (int, error) {
+	// The kinds this sweep covers; the start/done lines make every run
+	// traceable, including a run that matches nothing.
+	kinds := []Kind{KindGroup, KindProject}
+	slog.Info("gc sweep start", "scope", "instance", "kinds", kinds, "generation", generation, "dry_run", dryRun)
 	deleted := 0
-	for _, kind := range []Kind{KindGroup, KindProject} {
+	for _, kind := range kinds {
 		n, err := sweepInstanceKind(ctx, gs, kind, generation, dryRun)
 		if err != nil {
 			return deleted, err
 		}
 		deleted += n
 	}
+	slog.Info("gc sweep done", "scope", "instance", "points", deleted, "dry_run", dryRun)
 	return deleted, nil
 }
 
@@ -235,17 +243,20 @@ func sweepInstanceKind(ctx context.Context, gs sweepStore, kind Kind, generation
 }
 
 // sweepStale is the shared count/delete/report body of sweepKind and
-// sweepInstanceKind; logAttrs carry the optional scope of the selection.
+// sweepInstanceKind; logAttrs carry the optional scope of the selection. The
+// scanned count is logged unconditionally — a zero (nothing matched) is a fact
+// of the sweep, not silence.
 func sweepStale(ctx context.Context, gs sweepStore, kind Kind, flt *qdrant.Filter, generation int, dryRun bool, logAttrs ...any) (int, error) {
 	n, err := gs.CountByFilter(ctx, flt)
 	if err != nil {
 		return 0, fmt.Errorf("graph gc: count %s: %w", kind, err)
 	}
+	attrs := append([]any{"kind", kind}, logAttrs...)
+	attrs = append(attrs, "generation_below", generation, "points", n)
+	slog.Info("gc scan", attrs...)
 	if n == 0 {
 		return 0, nil
 	}
-	attrs := append([]any{"kind", kind}, logAttrs...)
-	attrs = append(attrs, "generation_below", generation, "points", n)
 	if dryRun {
 		slog.Info("gc would-delete", attrs...)
 		return int(n), nil
