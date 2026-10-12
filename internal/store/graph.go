@@ -66,10 +66,10 @@ func (g *GraphStore) EnsureGraphCollection(ctx context.Context) error {
 
 // graphIndexFields are the payload indexes of the graph collection. All are
 // keyword (array payloads such as tags index element-wise) except symbol_text
-// (full-text) and the graphDatetimeIndexFields; patch, signature, generation,
-// and indexed_at are deliberately NOT indexed, and body/title are never
-// indexed (bodies stay unindexed). commit_sha is indexed as of schema v4
-// (review/commit filters).
+// (full-text), the graphDatetimeIndexFields and the graphIntegerIndexFields;
+// patch, signature, and indexed_at are deliberately NOT indexed, and
+// body/title are never indexed (bodies stay unindexed). commit_sha is indexed
+// as of schema v4 (review/commit filters).
 var graphIndexFields = []string{
 	"kind",
 	"node_type",
@@ -81,6 +81,9 @@ var graphIndexFields = []string{
 	"branch",
 	"language",
 	"schema_ver",
+	// Numeric range field, indexed as integer (see graphIntegerIndexFields):
+	// the sweep's generation < current filter.
+	"generation",
 	"symbol",
 	"symbol_text",
 	"symbol_kind",
@@ -164,6 +167,13 @@ var graphDatetimeIndexFields = map[string]bool{
 	"last_seen_at": true,
 }
 
+// graphIntegerIndexFields are indexed as FieldTypeInteger instead of the
+// keyword default: numeric ranges (the sweep's generation < current) are
+// evaluated exactly only against an integer index.
+var graphIntegerIndexFields = map[string]bool{
+	"generation": true,
+}
+
 // graphOnDiskIndexFields are indexed on disk (long values, many distinct
 // values per field); the rest of the payload indexes live in memory.
 var graphOnDiskIndexFields = map[string]bool{
@@ -193,6 +203,9 @@ func (g *GraphStore) EnsureGraphIndexes(ctx context.Context) error {
 		}
 		if graphDatetimeIndexFields[field] {
 			req.FieldType = qdrant.FieldType_FieldTypeDatetime.Enum()
+		}
+		if graphIntegerIndexFields[field] {
+			req.FieldType = qdrant.FieldType_FieldTypeInteger.Enum()
 		}
 		if graphOnDiskIndexFields[field] {
 			req.FieldIndexParams = &qdrant.PayloadIndexParams{
