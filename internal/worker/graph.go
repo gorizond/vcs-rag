@@ -88,16 +88,25 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	}
 }
 
+// graphStore is the narrow store surface of the graph pass (fake in tests):
+// the point upsert plus the count/delete/scroll surface of the sweep. The
+// production *store.GraphStore satisfies it.
+type graphStore interface {
+	Upsert(ctx context.Context, points []*qdrant.PointStruct) error
+	CountByFilter(ctx context.Context, f *qdrant.Filter) (uint64, error)
+	DeleteByFilter(ctx context.Context, f *qdrant.Filter) error
+	ScrollAll(ctx context.Context, filter *qdrant.Filter, limit uint32) ([]*qdrant.RetrievedPoint, error)
+}
+
 // graphPass extracts the graph of up to WORKER_GRAPH_MAX_REPOS_PER_PASS
 // repositories from the discovery snapshot, starting at the rotating offset
 // (T015): per-repo lock, failure isolation (FR-014). One generation stamp is
 // shared by every repository of the pass — the sweep of a repository (T016)
 // compares against exactly the generation of its scan. The ownership step
-// (US4/T039) is instance-level, so it runs at the pass level, before and
-// independently of the repo loop: a pass that processes no repository (an
-// idle discovery window) still re-emits the group/project points and sweeps
-// them once the pass completes.
-func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs *store.GraphStore, start int, vuln *vulnGate, runners *runnerGate) *summary {
+// (US4/T039) is instance-level and runs at the pass level BEFORE the repo
+// loop: its emission and its instance-wide stale sweep do not depend on any
+// repository, so a long (or stuck) per-repo loop can never starve them.
+func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs graphStore, start int, vuln *vulnGate, runners *runnerGate) *summary {
 	sum := newSummary("graph")
 	generation := int(time.Now().Unix())
 	// US4/T039: the ownership listing is best-effort (FR-024): a missing
@@ -119,6 +128,20 @@ func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *sna
 			deps.Logger.Info("graph: ownership points upserted", "points", len(ownerPts))
 		}
 	}
+	// The instance-wide ownership sweep runs right here, BEFORE the repo loop:
+	// it is instance-level and does not depend on any repository, so it must
+	// not be starved by a long (or stuck) per-repo loop — the stale
+	// group/project points go away on every pass whose ownership listing
+	// completed, even one that processes no repository. A canceled pass still
+	// never sweeps (T016).
+	if ownerOK && ctx.Err() == nil {
+		deleted, err := graph.SweepOwnership(ctx, gs, generation, cfg.Worker.GCDryRun)
+		if err != nil {
+			deps.Logger.Error("graph: ownership sweep failed", "err", err)
+		} else if deleted > 0 {
+			deps.Logger.Info("graph: ownership points swept", "points", deleted)
+		}
+	}
 	// The group keys are pass-level too: every per-repo step resolves its
 	// in_group edges (milestone/label/work_item → group) against exactly the
 	// groups this pass emitted.
@@ -132,6 +155,9 @@ func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *sna
 		if max := cfg.Worker.GraphMaxReposPerPass; max > 0 && len(repos) > max {
 			repos = repos[:max]
 		}
+		// Pass start trace: with the ownership sweep already done, this line
+		// separates a long repo loop from a hung pass.
+		deps.Logger.Info("pass start: graph", "repos", len(repos), "start", start, "generation", generation)
 		for _, repo := range repos {
 			if ctx.Err() != nil {
 				break
@@ -146,18 +172,6 @@ func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *sna
 					return err
 				})
 			}))
-		}
-	}
-	// The instance-wide ownership sweep (SweepOwnership) runs once per
-	// completed pass — even when no repository was processed — so the stale
-	// group/project points go away on any pass whose ownership listing
-	// completed. A canceled pass never sweeps (T016, the per-repo rule).
-	if ownerOK && ctx.Err() == nil {
-		deleted, err := graph.SweepOwnership(ctx, gs, generation, cfg.Worker.GCDryRun)
-		if err != nil {
-			deps.Logger.Error("graph: ownership sweep failed", "err", err)
-		} else if deleted > 0 {
-			deps.Logger.Info("graph: ownership points swept", "points", deleted)
 		}
 	}
 	return sum
@@ -200,7 +214,7 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 // only that domain's sweep (SweepTargets) and never the pass. CPU-only: no
 // embeddings, no commit budget (R13). Lock-free by design: the lane and the
 // refresh composition hold the per-repo lock.
-func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs *store.GraphStore, repo provider.Repo, generation int, groups map[string]bool, vuln *vulnGate, runners *runnerGate) (int, error) {
+func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs graphStore, repo provider.Repo, generation int, groups map[string]bool, vuln *vulnGate, runners *runnerGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
 	if err != nil {
