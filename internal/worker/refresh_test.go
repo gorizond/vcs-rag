@@ -1,9 +1,13 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -497,5 +501,61 @@ func TestRefreshAccessErrorExcluded(t *testing.T) {
 				t.Errorf("the pass did not continue after the exclusion: meta = %d", res.MetaUpdated)
 			}
 		})
+	}
+}
+
+// T037 (FR-006, SC-003): a marker token lives in the config/AuthEnv of a
+// refresh pass but must appear in NONE of the pass artifacts — logs, the
+// repository state sidecar, the pass report or the status payload.
+func TestRefreshDoesNotLeakToken(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not found: %v", err)
+	}
+	ctx := context.Background()
+	src, _ := indexFixture(t, 2)
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "file://" + src, DefaultBranch: "main"}
+	deps, _ := newIndexDeps(t, repo)
+	const marker = "glpat-MARKER-LEAK-CANARY"
+	deps.Cfg.Provider.GitLabToken = marker
+	deps.Engine.AuthEnv = gitengine.AuthEnv("gitlab", marker)
+	deps.VCS = &fake.Provider{} // no API traffic; the token stays in config only
+	var logs bytes.Buffer
+	deps.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	deps.stats = newSummary("index")
+
+	res := refreshOnce(ctx, deps, &faultStore{}, &countingStore{}, repo, "")
+	if len(res.Errors) != 0 {
+		t.Fatalf("refresh errors = %v, want a clean pass", res.Errors)
+	}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("state sidecar: %v", err)
+	}
+	snap := &snapshot{}
+	snap.set([]provider.Repo{repo})
+	status, err := json.Marshal(collectWorkerStatus(ctx, deps, snap, passStats(deps.stats), nil, time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The raw token and its Basic credential form are both forbidden.
+	cred := base64.StdEncoding.EncodeToString([]byte("oauth2:" + marker))
+	for name, blob := range map[string]string{
+		"logs":   logs.String(),
+		"state":  string(state),
+		"status": string(status),
+		"result": string(result),
+	} {
+		for _, needle := range []string{marker, cred} {
+			if strings.Contains(blob, needle) {
+				t.Errorf("%s leaked %q: %s", name, needle, blob)
+			}
+		}
 	}
 }

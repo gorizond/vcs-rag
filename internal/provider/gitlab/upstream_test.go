@@ -3,7 +3,9 @@ package gitlab
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,5 +66,70 @@ func TestTokenBucketWaitCancels(t *testing.T) {
 	defer cancel()
 	if err := b.wait(ctx); err == nil {
 		t.Error("an empty bucket must wait, not hand out a token")
+	}
+}
+
+// T035 (FR-005/FR-016, SC-003): the Wave B transport must not strip or
+// overwrite authentication headers — every request, including the first, is
+// forwarded with its credentials intact.
+func TestTransportPreservesAuthHeaders(t *testing.T) {
+	var gotAuth, gotPrivate string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPrivate = r.Header.Get("Private-Token")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	tr := &upstreamTransport{base: http.DefaultTransport}
+	tr.gate.Store(provider.NewUpstreamGate(1))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/v4/user", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer canary-oauth")
+	req.Header.Set("Private-Token", "canary-private")
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	resp.Body.Close()
+	if gotAuth != "Bearer canary-oauth" {
+		t.Errorf("Authorization = %q, want it preserved by the wrapper", gotAuth)
+	}
+	if gotPrivate != "canary-private" {
+		t.Errorf("Private-Token = %q, want it preserved by the wrapper", gotPrivate)
+	}
+}
+
+// T035 (FR-016): the very first API request of a fresh client is already
+// authenticated — no anonymous first request (failed-auth ban risk).
+func TestFirstRequestIsAuthenticated(t *testing.T) {
+	const token = "test-token" // testClient's Provider.GitLabToken
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Get("Private-Token"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	if _, err := c.ListGroups(context.Background()); err != nil {
+		t.Fatalf("ListGroups: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) == 0 {
+		t.Fatal("no API request was made")
+	}
+	for i, got := range seen {
+		if got != token {
+			t.Errorf("request %d: Private-Token = %q, want the configured token on every request", i, got)
+		}
 	}
 }

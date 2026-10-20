@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -389,5 +390,41 @@ func TestSharedAccountWarn(t *testing.T) {
 	rep.recordPass(newSummary("index"))
 	if rep.lastPass.SharedAccountWarn {
 		t.Error("the warning must be gated by Worker.SharedAccountWarn")
+	}
+}
+
+// T038 (FR-006/FR-008): neither the published worker status nor the pass
+// report may carry token values or credential-bearing URLs. The hostile repo
+// record below has credentials in CloneURL — the status must not copy it.
+func TestStatusReportHasNoCredentials(t *testing.T) {
+	const marker = "glpat-STATUS-CANARY"
+	deps := RepoDeps{VCSType: "gitlab", Engine: gitengine.New(t.TempDir()), Logger: testLogger()}
+	deps.Cfg = &config.Config{}
+	deps.Cfg.Provider.GitLabToken = marker
+	snap := &snapshot{}
+	snap.set([]provider.Repo{{
+		ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "https://oauth2:" + marker + "@gitlab.example/grp/fixture.git",
+	}})
+	sum := newSummary("index")
+	sum.configureUnitBudget(0)
+	sum.markUnprocessed("grp/fixture")
+
+	status, err := json.Marshal(collectWorkerStatus(context.Background(), deps, snap, passStats(sum), nil, time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pass, err := json.Marshal(passStats(sum))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credURL := regexp.MustCompile(`://[^/]*:[^/]*@`)
+	for name, blob := range map[string]string{"status": string(status), "pass_report": string(pass)} {
+		if strings.Contains(blob, marker) {
+			t.Errorf("%s leaked the token: %s", name, blob)
+		}
+		if credURL.MatchString(blob) {
+			t.Errorf("%s contains a credential-bearing URL: %s", name, blob)
+		}
 	}
 }
