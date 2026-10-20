@@ -2,6 +2,7 @@ package worker
 
 import (
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,12 +25,25 @@ type summary struct {
 	pruned  atomic.Int64
 
 	// a VCS rate limit seen in this pass (T129): the pacer dominates the delay.
+	// US4: the event/repo counters and the last observed Retry-After feed the
+	// pass report (rate_limited_count/rate_limited_repos/last_retry_after_ms).
 	rateLimit  atomic.Bool
 	retryAfter atomic.Int64 // nanoseconds
+	rateCount  atomic.Int64 // 429 events observed in this pass
+	rateRepos  atomic.Int64 // repositories that hit at least one 429
+	ratePause  atomic.Int64 // unix nanoseconds of the next-pass pause end
 
-	// T160: the per-pass commit budget of the index lane.
+	// T160: the per-pass unit budget of the index lane (1 commit OR 1 API page,
+	// FR-003). unlimited — WORKER_UPSTREAM_MAX_UNITS=0 (FR-010).
 	commitBudget    atomic.Int64
 	budgetExhausted atomic.Bool
+	unlimited       atomic.Bool
+
+	unprocessedMu sync.Mutex
+	unprocessed   []string // ≤10 examples of units left by an exhausted budget
+
+	excludedMu sync.Mutex
+	excluded   []string // ≤10 examples of units excluded by 403/404 (FR-012)
 
 	// repo-GC counters (T140).
 	gcKnown           atomic.Int64
@@ -58,6 +72,9 @@ type summary struct {
 // metaDeletePerPass caps the entity deletions of one metadata pass (T140).
 const metaDeletePerPass = 128
 
+// unprocessedSampleMax bounds the pass report sample (data-model: ≤10).
+const unprocessedSampleMax = 10
+
 // newSummary starts a lane pass.
 func newSummary(phase string) *summary {
 	s := &summary{phase: phase, start: time.Now()}
@@ -66,9 +83,25 @@ func newSummary(phase string) *summary {
 	return s
 }
 
-// reserveCommit consumes one slot of the index pass commit budget (T160) and
-// reports whether it is available; exhaustion is flagged once for the pass log.
-func (s *summary) reserveCommit() bool {
+// configureUnitBudget applies WORKER_UPSTREAM_MAX_UNITS to this pass (FR-003):
+// 0 means unlimited and is flagged in the report (FR-010); a positive value is
+// the ceiling, replacing the legacy indexMaxCommitsPerPass default (the var
+// stays functional for unit tests that build a config bypassing Load).
+func (s *summary) configureUnitBudget(units int) {
+	switch {
+	case units == 0:
+		s.unlimited.Store(true)
+	case units > 0:
+		s.commitBudget.Store(int64(units))
+	}
+}
+
+// reserveUnit consumes one slot of the pass budget: 1 commit or 1 API page
+// (FR-003); an unlimited pass always succeeds. Exhaustion is flagged once.
+func (s *summary) reserveUnit() bool {
+	if s.unlimited.Load() {
+		return true
+	}
 	for {
 		n := s.commitBudget.Load()
 		if n <= 0 {
@@ -79,6 +112,47 @@ func (s *summary) reserveCommit() bool {
 			return true
 		}
 	}
+}
+
+// reserveCommit consumes one slot of the index pass commit budget (T160) and
+// reports whether it is available; exhaustion is flagged once for the pass log.
+func (s *summary) reserveCommit() bool { return s.reserveUnit() }
+
+// markUnprocessed records up to 10 examples of units left by an exhausted
+// budget (FR-003); the full resume point is the per-commit checkpoint.
+func (s *summary) markUnprocessed(names ...string) {
+	s.unprocessedMu.Lock()
+	defer s.unprocessedMu.Unlock()
+	for _, name := range names {
+		if len(s.unprocessed) >= unprocessedSampleMax {
+			return
+		}
+		s.unprocessed = append(s.unprocessed, name)
+	}
+}
+
+// unprocessedSample copies the bounded sample for the pass report.
+func (s *summary) unprocessedSample() []string {
+	s.unprocessedMu.Lock()
+	defer s.unprocessedMu.Unlock()
+	return append([]string(nil), s.unprocessed...)
+}
+
+// markExcluded records up to 10 units excluded by an access error (FR-012).
+func (s *summary) markExcluded(name string) {
+	s.excludedMu.Lock()
+	defer s.excludedMu.Unlock()
+	if len(s.excluded) >= unprocessedSampleMax {
+		return
+	}
+	s.excluded = append(s.excluded, name)
+}
+
+// excludedSample copies the bounded excluded sample for the pass report.
+func (s *summary) excludedSample() []string {
+	s.excludedMu.Lock()
+	defer s.excludedMu.Unlock()
+	return append([]string(nil), s.excluded...)
 }
 
 // reserveMetaDelete consumes one deletion slot of the pass budget (T140).
@@ -95,13 +169,14 @@ func (s *summary) reserveMetaDelete() bool {
 }
 
 // countRepo records the processing result of one repository; a rate limit error
-// is remembered for the pacer (T129).
+// is remembered for the pacer (T129) and counted for the pass report (US4).
 func (s *summary) countRepo(err error) {
 	s.repos.Add(1)
 	if err != nil {
 		s.failed.Add(1)
 		if d, ok := provider.IsRateLimit(err); ok {
 			s.markRateLimit(d)
+			s.rateRepos.Add(1)
 		}
 		return
 	}
@@ -123,12 +198,32 @@ func (s *summary) addSkipped(n int) { s.skipped.Add(int64(n)) }
 // addPruned records deleted points/commits (prune in index/metadata).
 func (s *summary) addPruned(n int) { s.pruned.Add(int64(n)) }
 
-// markRateLimit remembers a VCS rate limit (0 — the pacer falls back to 30s).
+// markRateLimit remembers one VCS rate-limit event (0 — no Retry-After; the
+// pacer falls back to its floor).
 func (s *summary) markRateLimit(d time.Duration) {
 	s.rateLimit.Store(true)
+	s.rateCount.Add(1)
 	if d > 0 {
 		s.retryAfter.Store(int64(d))
 	}
+}
+
+// markRateLimitedRepo records a repository affected by a rate limit once.
+func (s *summary) markRateLimitedRepo() { s.rateRepos.Add(1) }
+
+// setRatePause records the end of the rate-limit pause before the next pass.
+func (s *summary) setRatePause(until time.Time) {
+	if !until.IsZero() {
+		s.ratePause.Store(until.UnixNano())
+	}
+}
+
+// ratePauseUntil returns the pause end (zero — no pause).
+func (s *summary) ratePauseUntil() time.Time {
+	if n := s.ratePause.Load(); n > 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
 }
 
 // rateLimited reports the rate limit state of the pass.

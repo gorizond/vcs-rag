@@ -49,6 +49,32 @@ func IsRateLimit(err error) (time.Duration, bool) {
 	return 0, false
 }
 
+// IsAccessError recognizes an access error (403/404) of a work unit (FR-012):
+// the unit is excluded from the pass, not treated as a fatal failure.
+func IsAccessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var glErr *gitlab.ErrorResponse
+	if errors.As(err, &glErr) {
+		code := glErr.StatusCode
+		if code == 0 && glErr.Response != nil {
+			code = glErr.Response.StatusCode
+		}
+		// A typed GitLab response is authoritative; its Error() may dereference
+		// fields a bare test value does not have, so do not fall through.
+		return code == http.StatusForbidden || code == http.StatusNotFound
+	}
+	// git transport errors carry no typed response: the HTTP-style status in
+	// the text ("The requested URL returned error: 403") is the only signal.
+	// Match status tokens, not bare digits (a sha/path may contain "404").
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error: 403") || strings.Contains(msg, "error: 404") ||
+		strings.Contains(msg, "http 403") || strings.Contains(msg, "http 404") ||
+		strings.Contains(msg, "status 403") || strings.Contains(msg, "status 404") ||
+		strings.Contains(msg, "403 forbidden") || strings.Contains(msg, "forbidden")
+}
+
 // retryAfterFromHeader parses the Retry-After header of a GitLab error response:
 // seconds ("7") or an HTTP-date; invalid/absent → 0 (the caller picks the pause).
 func retryAfterFromHeader(resp *http.Response) time.Duration {

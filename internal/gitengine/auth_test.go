@@ -27,12 +27,49 @@ func TestAuthEnv(t *testing.T) {
 		"Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("oauth2:"+exampleGitLabToken)))
 
 	gh := AuthEnv("github", exampleGitHubToken)
+	assertEnvKV(t, gh, "GIT_CONFIG_COUNT", "1")
+	assertEnvKV(t, gh, "GIT_CONFIG_KEY_0", "http.extraHeader")
 	assertEnvKV(t, gh, "GIT_CONFIG_VALUE_0",
 		"Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:"+exampleGitHubToken)))
 
 	if AuthEnv("gitlab", "") != nil {
 		t.Error("empty token: env must be nil")
 	}
+
+	// T036/FR-016: the FIRST network command of a fresh mirror already carries
+	// the full GIT_CONFIG_* authorization env — no anonymous first request
+	// (failed-auth IP ban risk). The wrapper proves it without any network.
+	t.Run("first network command is authenticated", func(t *testing.T) {
+		src := initLocalRepo(t)
+		logPath := filepath.Join(t.TempDir(), "git.log")
+		eng := New(t.TempDir())
+		eng.GitBin = gitWrapper(t, logPath) // the existing env/argv logger
+		eng.AuthEnv = AuthEnv("gitlab", exampleGitLabToken)
+		repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture",
+			CloneURL: "file://" + src, DefaultBranch: "main"}
+
+		if _, err := eng.EnsureMirror(context.Background(), "gitlab", repo); err != nil {
+			t.Fatalf("EnsureMirror (first network command): %v", err)
+		}
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("wrapper log: %v", err)
+		}
+		first := findLine(string(data), "ARGS:clone")
+		if first == "" {
+			t.Fatalf("no clone in the wrapper log:\n%s", data)
+		}
+		if !strings.Contains(first, "CONFIG:1|http.extraHeader") {
+			t.Errorf("first command lacks GIT_CONFIG_COUNT/http.extraHeader: %s", first)
+		}
+		want := "ENV:Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte("oauth2:"+exampleGitLabToken))
+		if !strings.Contains(first, want) {
+			t.Errorf("first command lacks the Authorization header: %s", first)
+		}
+		if strings.Contains(first, exampleGitLabToken) {
+			t.Errorf("token leaked into argv of the first command: %s", first)
+		}
+	})
 }
 
 func assertEnvKV(t *testing.T, env []string, key, want string) {
@@ -56,7 +93,11 @@ func gitWrapper(t *testing.T, logPath string) string {
 		t.Skipf("git not found: %v", err)
 	}
 	script := "#!/bin/sh\n" +
-		"printf 'ENV:%s ARGS:%s\\n' \"$GIT_CONFIG_VALUE_0\" \"$*\" >> '" + logPath + "'\n" +
+		"if [ -n \"$GIT_CONFIG_COUNT\" ]; then\n" +
+		"  printf 'ENV:%s CONFIG:%s|%s ARGS:%s\\n' \"$GIT_CONFIG_VALUE_0\" \"$GIT_CONFIG_COUNT\" \"$GIT_CONFIG_KEY_0\" \"$*\" >> '" + logPath + "'\n" +
+		"else\n" +
+		"  printf 'ENV:%s ARGS:%s\\n' \"$GIT_CONFIG_VALUE_0\" \"$*\" >> '" + logPath + "'\n" +
+		"fi\n" +
 		"exec '" + realGit + "' \"$@\"\n"
 	path := filepath.Join(t.TempDir(), "git")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {

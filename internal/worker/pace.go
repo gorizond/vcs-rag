@@ -36,8 +36,13 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // pacer computes the delay after a lane pass; not safe for concurrent use.
 type pacer struct {
 	min, ceiling time.Duration
-	delay        time.Duration
-	reason       string
+	// rateFloor/rateCap are the configured retry policy bounds (FR-007);
+	// rateN counts consecutive rate-limit outcomes since the last non-rate-limit
+	// result — the exponent of the growing retry interval.
+	rateFloor, rateCap time.Duration
+	rateN              int
+	delay              time.Duration
+	reason             string
 
 	rnd   *rand.Rand
 	sleep func(ctx context.Context, d time.Duration) error
@@ -49,12 +54,30 @@ func newPacer(ceiling time.Duration) *pacer {
 		ceiling = paceMin
 	}
 	return &pacer{
-		min:     paceMin,
-		ceiling: ceiling,
-		delay:   paceMin,
-		rnd:     rand.New(rand.NewSource(time.Now().UnixNano())),
-		sleep:   sleepCtx,
+		min:       paceMin,
+		ceiling:   ceiling,
+		rateFloor: paceRateFloor,
+		rateCap:   paceRateCap,
+		delay:     paceMin,
+		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		sleep:     sleepCtx,
 	}
+}
+
+// newPacerWithLimits creates a pacer with the configured retry floor/cap
+// (WORKER_UPSTREAM_RETRY_FLOOR/CAP); zero values keep the built-in defaults.
+func newPacerWithLimits(ceiling, rateFloor, rateCap time.Duration) *pacer {
+	p := newPacer(ceiling)
+	if rateFloor > 0 {
+		p.rateFloor = rateFloor
+	}
+	if rateCap > 0 {
+		p.rateCap = rateCap
+	}
+	if p.rateCap < p.rateFloor {
+		p.rateCap = p.rateFloor
+	}
+	return p
 }
 
 // startDelay returns the random startup delay U[0, 2s] (avoids a boot herd).
@@ -63,23 +86,22 @@ func (p *pacer) startDelay() time.Duration {
 }
 
 // next computes the delay after a pass: rate limit > busy > idle backoff.
-// retryAfter <= 0 falls back to 30s; the result is capped at 5m and jittered.
+// A rate limit starts from the base interval
+// clamp(max(Retry-After, RetryFloor), RetryFloor, RetryCap); repeated
+// consecutive rate-limit outcomes double it (FR-007) up to the cap.
+// retryAfter <= 0 falls back to the floor; the result is capped and jittered.
 func (p *pacer) next(busy, rateLimited bool, retryAfter time.Duration) time.Duration {
+	if !rateLimited {
+		p.rateN = 0 // a non-rate-limit result resets the growth (FR-007)
+	}
 	var d time.Duration
 	switch {
 	case rateLimited:
-		d = retryAfter
-		if d <= 0 {
-			d = paceRateFloor
-		}
-		if d < p.min {
-			d = p.min
-		}
-		if d > paceRateCap {
-			d = paceRateCap
-		}
+		d = p.rateWait(retryAfter) // already jittered and clamped (FR-007)
+		p.rateN++
 		p.delay = d
 		p.reason = "rate-limit"
+		return d
 	case busy:
 		d = p.min
 		p.delay = d
@@ -96,6 +118,36 @@ func (p *pacer) next(busy, rateLimited bool, retryAfter time.Duration) time.Dura
 		p.reason = "idle"
 	}
 	return p.withJitter(d)
+}
+
+// rateWait is the FR-007 retry interval:
+//
+//	wait₀ = clamp(max(Retry-After, RetryFloor), RetryFloor, RetryCap)
+//	waitₙ = clamp(wait₀ · 2ⁿ + jitter, RetryFloor, RetryCap)
+func (p *pacer) rateWait(retryAfter time.Duration) time.Duration {
+	base := retryAfter
+	if base < p.rateFloor {
+		base = p.rateFloor
+	}
+	if base > p.rateCap {
+		base = p.rateCap
+	}
+	d := base
+	for i := 0; i < p.rateN; i++ {
+		if d >= p.rateCap/2 {
+			d = p.rateCap
+			break
+		}
+		d *= 2
+	}
+	d = p.withJitter(d)
+	if d < p.rateFloor {
+		d = p.rateFloor
+	}
+	if d > p.rateCap {
+		d = p.rateCap
+	}
+	return d
 }
 
 // withJitter spreads the delay by ±25 %.

@@ -26,7 +26,11 @@ type RepoDeps struct {
 	Store   *store.Store
 	Cfg     *config.Config
 	Logger  *slog.Logger
-	stats   *summary // optional pass counters (T060)
+	// Upstream/Queue are the instance-wide FR-002/FR-011 gate shared by the
+	// git and API paths (nil — narrow unit tests run unthrottled).
+	Upstream *provider.UpstreamGate
+	Queue    *upstreamQueue
+	stats    *summary // optional pass counters (T060)
 }
 
 // indexMaxCommitsPerPass caps the commits indexed by one pass: the backfill of
@@ -57,7 +61,7 @@ type indexStore interface {
 // own ticker (T150/T153).
 func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, status *statusReporter) error {
 	deps.Logger = log.WithPhase(deps.Logger, "index")
-	p := newPacer(cfg.Worker.Interval)
+	p := newPacerWithLimits(cfg.Worker.Interval, cfg.Worker.RetryFloor, cfg.Worker.RetryCap)
 	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
 	if err := p.sleep(ctx, p.startDelay()); err != nil {
 		return nil
@@ -77,6 +81,10 @@ func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 		delay := p.next(busy, rl, retry)
 		if sum != nil && sum.budgetExhausted.Load() && delay < indexBudgetPause {
 			delay = indexBudgetPause // T160: let the embeddings backend breathe
+		}
+		if sum != nil && rl {
+			// US4: the pass report states when the rate-limit pause ends.
+			sum.setRatePause(time.Now().Add(delay))
 		}
 		if sum != nil {
 			sum.withPace(delay, p.reason)
@@ -109,13 +117,18 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 		return nil
 	}
 	sum := newSummary("index")
+	// FR-003/FR-010: ONE unit budget per pass (commits + API pages); 0 = unlimited.
+	sum.configureUnitBudget(passConfig(cfg).UpstreamMaxUnits)
 	deps.stats = sum
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
-	for _, repo := range repos {
+	for i, repo := range repos {
 		// T160: nothing new is dispatched once the pass budget is exhausted
 		// (running repositories stop at their next commit reservation).
 		if sum.budgetExhausted.Load() {
+			for _, left := range repos[i:] {
+				sum.markUnprocessed(left.Namespace + "/" + left.Path)
+			}
 			break
 		}
 		wg.Add(1)
@@ -125,12 +138,17 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 				return
 			}
 			defer p.Release()
-			sum.countRepo(processSafely(ctx, deps.Logger, repo, "index", func() error {
+			err := processSafely(ctx, deps.Logger, repo, "index", func() error {
 				// T110: the per-repo lock is taken at the call site only.
 				return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
 					return ProcessRepoOnce(ctx, deps, repo)
 				})
-			}))
+			})
+			sum.countRepo(err)
+			if provider.IsAccessError(err) {
+				// FR-012: a 403/404 unit is excluded, not a pass failure.
+				sum.markExcluded(repo.Namespace + "/" + repo.Path)
+			}
 		}(repo)
 	}
 	wg.Wait()
@@ -155,7 +173,12 @@ func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) err
 func processRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo, st indexStore) error {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 
-	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
+	var mirror string
+	err := deps.runUpstream(ctx, func() error {
+		var err error
+		mirror, err = deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("mirror: %w", err)
 	}
@@ -249,6 +272,7 @@ func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provi
 		// T160: the per-pass commit budget — a huge backfill must not occupy
 		// the embeddings backend for hours; the checkpoints keep the progress.
 		if deps.stats != nil && !deps.stats.reserveCommit() {
+			deps.stats.markUnprocessed(repo.Namespace + "/" + repo.Path)
 			return BranchState{}, errIndexBudget
 		}
 		if err := processCommit(ctx, deps, st, repo, mirror, branch, sha, reader, lg); err != nil {
@@ -256,7 +280,9 @@ func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provi
 		}
 		done = append(done, sha)
 		// T088: persist the branch progress — a crash/restart resumes from here.
-		if err := checkpointBranch(statePath, branch, tip, window, prev.IndexedCommits, done); err != nil {
+		// The coverage marker (IndexedAt) is preserved: FR-009 moves it only on
+		// a successful phase completion, not on a partial/aborted pass.
+		if err := checkpointBranch(statePath, branch, tip, window, prev.IndexedCommits, done, prev.IndexedAt); err != nil {
 			return BranchState{}, fmt.Errorf("state: %w", err)
 		}
 	}
@@ -296,12 +322,12 @@ func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provi
 // checkpointBranch persists the intermediate branch progress after a commit
 // (T088): only st.Branches[branch] is touched inside the closure — the fresh
 // state's meta/last_fetch_at and the other branches are preserved (the index
-// lane is the only writer of Branches).
-func checkpointBranch(statePath, branch, tip string, window, prev, done []string) error {
+// lane is the only writer of Branches). IndexedAt (the coverage marker) is the
+// PREVIOUS value: FR-009 advances it only on a successful phase completion.
+func checkpointBranch(statePath, branch, tip string, window, prev, done []string, indexedAt time.Time) error {
 	idx := mergedIndexed(window, prev, done)
-	at := time.Now().UTC()
 	return updateState(statePath, func(st *MirrorState) {
-		st.Branches[branch] = BranchState{Tip: tip, IndexedCommits: idx, IndexedAt: at}
+		st.Branches[branch] = BranchState{Tip: tip, IndexedCommits: idx, IndexedAt: indexedAt}
 	})
 }
 

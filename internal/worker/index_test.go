@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,7 +76,9 @@ func newIndexDeps(t *testing.T, repo provider.Repo) (RepoDeps, *countingEmbed) {
 type faultStore struct {
 	upserts         int
 	points          int
-	failAt          int // fail exactly the failAt-th upsert (0 — never)
+	failAt          int   // fail exactly the failAt-th upsert (0 — never)
+	failAlways      bool  // every upsert from failAt on fails (retry-exhaustion tests)
+	failErr         error // injected upsert error (default: a generic failure)
 	firstOp         func()
 	byBranch        map[string]int // payload branch → points (T160)
 	deletedBranches []string       // DeleteBranch calls (T160)
@@ -107,7 +111,10 @@ func (f *faultStore) DeleteCodeCommits(context.Context, string, string, []string
 func (f *faultStore) Upsert(_ context.Context, points []store.Point) error {
 	f.tick()
 	f.upserts++
-	if f.upserts == f.failAt { // one-shot: the K-th upsert fails, the retry succeeds
+	if f.upserts == f.failAt || (f.failAlways && f.failAt > 0 && f.upserts > f.failAt) { // one-shot by default: the K-th upsert fails, the retry succeeds
+		if f.failErr != nil {
+			return f.failErr
+		}
 		return errors.New("injected upsert failure")
 	}
 	if f.byBranch == nil {
@@ -436,5 +443,179 @@ func TestIndexCommitBudgetPartialResume(t *testing.T) {
 	}
 	if got := saved.Branches["main"].IndexedCommits; len(got) != len(shas) {
 		t.Errorf("resumed commits = %d, want %d", len(got), len(shas))
+	}
+}
+
+// T024/T025 (FR-011): the bounded queue rejects only NEW work when the waiting
+// room is full; already queued operations are executed, none is dropped.
+func TestUpstreamQueueOverflow(t *testing.T) {
+	ctx := context.Background()
+	gate := provider.NewUpstreamGate(1)
+	q := newUpstreamQueue(gate, 1) // 1 running + 1 queued
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = q.run(ctx, func() error { close(started); <-release; return nil })
+	}()
+	<-started
+
+	queued := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = q.run(ctx, func() error { close(queued); return nil })
+	}()
+	for i := 0; i < 200 && q.pending.Load() < 2; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	if got := q.pending.Load(); got != 2 {
+		t.Fatalf("pending = %d, want the queued operation admitted", got)
+	}
+
+	err := q.run(ctx, func() error { return nil })
+	if !errors.Is(err, ErrTooManyTasks) {
+		t.Fatalf("overflow = %v, want ErrTooManyTasks", err)
+	}
+	if err.Error() != "too many tasks" {
+		t.Errorf("overflow message = %q, want the stable operator message", err.Error())
+	}
+
+	close(release)
+	wg.Wait()
+	select {
+	case <-queued:
+	default:
+		t.Error("the queued operation was lost")
+	}
+	if got := q.pending.Load(); got != 0 {
+		t.Errorf("pending after drain = %d, want 0", got)
+	}
+}
+
+// T032 (SC-002): one shared upstream gate => the peak concurrency equals
+// WORKER_UPSTREAM_CONCURRENCY even when many operations are submitted at once.
+func TestUpstreamConcurrencyPeak(t *testing.T) {
+	deps, _ := newIndexDeps(t, provider.Repo{})
+	deps.Cfg.Worker.UpstreamConcurrency = 1
+	deps.Cfg.Worker.UpstreamQueueLimit = 16
+	deps.Upstream, deps.Queue = upstreamFor(deps.Cfg)
+
+	var active, peak atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := deps.runUpstream(context.Background(), func() error {
+				n := active.Add(1)
+				defer active.Add(-1)
+				for {
+					p := peak.Load()
+					if n <= p || peak.CompareAndSwap(p, n) {
+						break
+					}
+				}
+				time.Sleep(2 * time.Millisecond)
+				return nil
+			})
+			if err != nil {
+				t.Errorf("upstream operation: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := peak.Load(); got != 1 {
+		t.Errorf("peak concurrent upstream operations = %d, want 1", got)
+	}
+}
+
+// T026/T031 (SC-002): WORKER_UPSTREAM_MAX_UNITS=50 stops the pass after 50
+// units, flags budget_exhausted, keeps a non-empty unprocessed sample and does
+// not advance the coverage marker.
+func TestIndexUnitBudgetStop(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not found: %v", err)
+	}
+	ctx := context.Background()
+	src, _ := indexFixture(t, 55)
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "file://" + src, DefaultBranch: "main"}
+	deps, _ := newIndexDeps(t, repo)
+	deps.Cfg.Worker.UpstreamMaxUnits = 50
+	stats := newSummary("index")
+	stats.configureUnitBudget(deps.Cfg.Worker.UpstreamMaxUnits) // exactly what indexAll does
+	deps.stats = stats
+
+	if err := processRepoOnce(ctx, deps, repo, &faultStore{}); err != nil {
+		t.Fatalf("budgeted pass: %v", err)
+	}
+	if !stats.budgetExhausted.Load() {
+		t.Fatal("budget_exhausted was not flagged")
+	}
+	if sample := stats.unprocessedSample(); len(sample) == 0 {
+		t.Error("unprocessed_sample is empty")
+	}
+	if stats.unlimited.Load() {
+		t.Error("a bounded pass must not be flagged unlimited")
+	}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(saved.Branches["main"].IndexedCommits); got != 50 {
+		t.Errorf("checkpointed commits = %d, want exactly the 50-unit budget", got)
+	}
+	if !saved.Branches["main"].IndexedAt.IsZero() {
+		t.Errorf("coverage advanced on an exhausted pass: %v", saved.Branches["main"].IndexedAt)
+	}
+
+	report := passStats(stats)
+	if !report.BudgetExhausted || len(report.UnprocessedSample) == 0 {
+		t.Errorf("pass report = %+v, want budget_exhausted + unprocessed_sample", report)
+	}
+}
+
+// T027/T033 (FR-010): WORKER_UPSTREAM_MAX_UNITS=0 disables the volume stop
+// (even the legacy package-var ceiling is ignored) and flags the report as
+// unlimited instead of silently skipping the budget.
+func TestIndexUnlimitedBudget(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not found: %v", err)
+	}
+	old := indexMaxCommitsPerPass
+	indexMaxCommitsPerPass = 2 // the legacy ceiling must be ignored in unlimited mode
+	t.Cleanup(func() { indexMaxCommitsPerPass = old })
+
+	ctx := context.Background()
+	src, shas := indexFixture(t, 4)
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "file://" + src, DefaultBranch: "main"}
+	deps, _ := newIndexDeps(t, repo)
+	deps.Cfg.Worker.UpstreamMaxUnits = 0
+	stats := newSummary("index")
+	stats.configureUnitBudget(0)
+	deps.stats = stats
+
+	if err := processRepoOnce(ctx, deps, repo, &faultStore{}); err != nil {
+		t.Fatalf("unlimited pass: %v", err)
+	}
+	if stats.budgetExhausted.Load() {
+		t.Error("an unlimited pass stopped on the volume budget")
+	}
+	if !stats.unlimited.Load() || !passStats(stats).Unlimited {
+		t.Error("the unlimited mode is not flagged in the pass report")
+	}
+	statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
+	saved, err := LoadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(saved.Branches["main"].IndexedCommits); got != len(shas) {
+		t.Errorf("indexed commits = %d, want all %d", got, len(shas))
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/qdrant/go-client/qdrant"
@@ -1293,5 +1294,101 @@ func TestQueryGraphNeighborsDispatch(t *testing.T) {
 	}
 	if te, ok := out.(toolError); !ok || te.Code != codeSearchFailed {
 		t.Fatalf("store error = %T %+v, want %s", out, out, codeSearchFailed)
+	}
+}
+
+// coverageMark builds a graph coverage marker for the freshness tests.
+func coverageMark(repo string, at time.Time) *qdrant.RetrievedPoint {
+	return &qdrant.RetrievedPoint{Payload: qdrant.NewValueMap(map[string]any{
+		"kind": "coverage", "repo": repo, "indexed_commit": "abc123",
+		"indexed_at": at.UTC().Format(time.RFC3339),
+	})}
+}
+
+// codePoint is one vector-search hit of the scoped repo.
+func codePoint(repo, file string) store.ScoredPoint {
+	return store.ScoredPoint{Score: 0.9, Payload: map[string]any{
+		"repo": repo, "group_org": "acme", "branch": "main", "file_path": file,
+		"commit_sha": "abc", "text": "content",
+	}}
+}
+
+// T047–T050 (FR-013): the repo-scoped search carries index_freshness with the
+// stale/fresh/refreshing classification; the annotation never hides results,
+// and a neighbouring repo (fresh) is the negative control for the stale one.
+func TestIndexFreshnessAnnotation(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := context.Background()
+
+	// stale: indexed_at 48h ago with the 24h threshold.
+	staleGraph := &fakeGraphReader{points: []*qdrant.RetrievedPoint{
+		coverageMark("acme/stale", now.Add(-48*time.Hour)),
+	}}
+	stale := &tools{
+		embedder: &mockEmbedder{}, searcher: &mockSearcher{points: []store.ScoredPoint{codePoint("stale", "a.go")}},
+		graph: staleGraph, freshThreshold: 24 * time.Hour,
+	}
+	_, out, err := stale.searchCode(ctx, nil, searchCodeInput{Query: "x", Repo: "acme/stale"})
+	if err != nil {
+		t.Fatalf("searchCode(stale): %v", err)
+	}
+	resp := out.(resultsResponse[codeHit])
+	if len(resp.Results) != 1 {
+		t.Fatalf("stale annotation suppressed the results: %+v", resp.Results)
+	}
+	f := resp.IndexFreshness
+	if f == nil || f.Freshness != "stale" || f.Reason == nil || *f.Reason != "stale_index" || f.Threshold != "24h" {
+		t.Fatalf("stale freshness = %+v", f)
+	}
+	js := marshalJSON(out)
+	for _, want := range []string{`"results":[`, `"index_freshness":{`, `"freshness":"stale"`,
+		`"reason":"stale_index"`, `"threshold":"24h"`, `"indexed_at":"`} {
+		if !strings.Contains(js, want) {
+			t.Errorf("stale JSON does not contain %s: %s", want, js)
+		}
+	}
+
+	// negative control: the neighbouring repo is fresh (reason null).
+	freshGraph := &fakeGraphReader{points: []*qdrant.RetrievedPoint{
+		coverageMark("acme/fresh", now.Add(-time.Hour)),
+	}}
+	fresh := &tools{
+		embedder: &mockEmbedder{}, searcher: &mockSearcher{points: []store.ScoredPoint{codePoint("fresh", "b.go")}},
+		graph: freshGraph, freshThreshold: 24 * time.Hour,
+	}
+	_, out2, err := fresh.searchCode(ctx, nil, searchCodeInput{Query: "x", Repo: "acme/fresh"})
+	if err != nil {
+		t.Fatalf("searchCode(fresh): %v", err)
+	}
+	f2 := out2.(resultsResponse[codeHit]).IndexFreshness
+	if f2 == nil || f2.Freshness != "fresh" || f2.Reason != nil {
+		t.Fatalf("fresh freshness = %+v, want fresh with a null reason", f2)
+	}
+	if js2 := marshalJSON(out2); !strings.Contains(js2, `"reason":null`) {
+		t.Errorf("fresh JSON must carry reason:null: %s", js2)
+	}
+
+	// refreshing: a live refresh of the repo wins over the age classification.
+	refreshing := &tools{
+		embedder: &mockEmbedder{}, searcher: &mockSearcher{points: []store.ScoredPoint{codePoint("fresh", "b.go")}},
+		graph: freshGraph, freshThreshold: 24 * time.Hour, inflight: newFlightGroup(),
+	}
+	refreshing.inflight.calls[refreshSlug("acme/fresh")] = &flightCall{done: make(chan struct{})}
+	_, out3, err := refreshing.searchCode(ctx, nil, searchCodeInput{Query: "x", Repo: "acme/fresh"})
+	if err != nil {
+		t.Fatalf("searchCode(refreshing): %v", err)
+	}
+	f3 := out3.(resultsResponse[codeHit]).IndexFreshness
+	if f3 == nil || f3.Freshness != "refreshing" || f3.Reason == nil || *f3.Reason != "refresh_in_progress" {
+		t.Fatalf("refreshing freshness = %+v", f3)
+	}
+
+	// unscoped search: no single repo → no annotation (and no suppression).
+	_, out4, err := fresh.searchCode(ctx, nil, searchCodeInput{Query: "x"})
+	if err != nil {
+		t.Fatalf("searchCode(unscoped): %v", err)
+	}
+	if f4 := out4.(resultsResponse[codeHit]).IndexFreshness; f4 != nil {
+		t.Errorf("unscoped search carries freshness: %+v", f4)
 	}
 }

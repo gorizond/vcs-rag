@@ -94,6 +94,19 @@ type Worker struct {
 	HistoryMaxCommits    int   // ponytail: starting default, to be refined based on facts
 	MaxFileBytes         int64 // ponytail: starting default, to be refined based on facts
 	CIWindow             int   // ponytail: starting default, to be refined based on facts
+
+	// Upstream request budget (FR-002/FR-003/FR-007/FR-010/FR-014).
+	// UpstreamMaxUnits == 0 means unlimited (the only field where 0 is valid).
+	UpstreamConcurrency int           // WORKER_UPSTREAM_CONCURRENCY (default 2)
+	UpstreamMaxUnits    int           // WORKER_UPSTREAM_MAX_UNITS (default 500)
+	RetryFloor          time.Duration // WORKER_UPSTREAM_RETRY_FLOOR (default 60s)
+	RetryCap            time.Duration // WORKER_UPSTREAM_RETRY_CAP (default 15m)
+	MaxRetries          int           // WORKER_UPSTREAM_MAX_RETRIES (default 5)
+	UpstreamQueueLimit  int           // WORKER_UPSTREAM_QUEUE_LIMIT (default 1000)
+	FreshThreshold      time.Duration // WORKER_FRESH_THRESHOLD (default 24h)
+	// SharedAccountWarn enables the soft FR-015 warning when the authenticated
+	// account budget is >80% consumed (VCS_DEDUP_ACCOUNT=1).
+	SharedAccountWarn bool // VCS_DEDUP_ACCOUNT (default 0)
 }
 
 // MCP is the MCP server transport (FR-013) and query-mode caps.
@@ -298,6 +311,44 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// FR-002/FR-003/FR-007/FR-010/FR-014: the upstream budget. Only
+	// WORKER_UPSTREAM_MAX_UNITS accepts 0 (unlimited); every other value must
+	// be positive — 0 is rejected by envInt/envDuration.
+	upstreamConcurrency, err := envInt("WORKER_UPSTREAM_CONCURRENCY", 2)
+	if err != nil {
+		return nil, err
+	}
+	upstreamMaxUnits, err := envNonNegativeInt("WORKER_UPSTREAM_MAX_UNITS", 500)
+	if err != nil {
+		return nil, err
+	}
+	retryFloor, err := envDuration("WORKER_UPSTREAM_RETRY_FLOOR", 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	retryCap, err := envDuration("WORKER_UPSTREAM_RETRY_CAP", 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	if retryFloor > retryCap {
+		return nil, &ConfigError{Problem: "WORKER_UPSTREAM_RETRY_FLOOR must not exceed WORKER_UPSTREAM_RETRY_CAP"}
+	}
+	maxRetries, err := envInt("WORKER_UPSTREAM_MAX_RETRIES", 5)
+	if err != nil {
+		return nil, err
+	}
+	upstreamQueueLimit, err := envInt("WORKER_UPSTREAM_QUEUE_LIMIT", 1000)
+	if err != nil {
+		return nil, err
+	}
+	freshThreshold, err := envDuration("WORKER_FRESH_THRESHOLD", 24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	sharedAccountWarn, err := envBool("VCS_DEDUP_ACCOUNT", false)
+	if err != nil {
+		return nil, err
+	}
 	cfg.Worker = Worker{
 		Interval:             interval,
 		MetaInterval:         metaInterval,
@@ -313,6 +364,15 @@ func Load() (*Config, error) {
 		HistoryMaxCommits:    historyMax,
 		MaxFileBytes:         int64(maxFileBytes),
 		CIWindow:             ciWindow,
+
+		UpstreamConcurrency: upstreamConcurrency,
+		UpstreamMaxUnits:    upstreamMaxUnits,
+		RetryFloor:          retryFloor,
+		RetryCap:            retryCap,
+		MaxRetries:          maxRetries,
+		UpstreamQueueLimit:  upstreamQueueLimit,
+		FreshThreshold:      freshThreshold,
+		SharedAccountWarn:   sharedAccountWarn,
 	}
 
 	// --- NATS (T108/T117): empty URL — the refresh mode is off; the instance
@@ -392,6 +452,20 @@ func envInt(name string, def int) (int, error) {
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
 		return 0, &ConfigError{Problem: name + ": positive integer expected"}
+	}
+	return n, nil
+}
+
+// envNonNegativeInt reads a non-negative integer: 0 is meaningful for
+// WORKER_UPSTREAM_MAX_UNITS (unlimited); a negative value is an error.
+func envNonNegativeInt(name string, def int) (int, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, &ConfigError{Problem: name + ": non-negative integer expected"}
 	}
 	return n, nil
 }

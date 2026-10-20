@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/gitengine"
 	"github.com/gorizond/vcs-rag/internal/provider"
+	"github.com/gorizond/vcs-rag/internal/provider/fake"
 )
 
 // fakeStatusStore records the published KV entries.
@@ -340,5 +342,202 @@ func TestNatsStatusStoreEmbedded(t *testing.T) {
 	// a second Put reuses the ensured bucket.
 	if err := store.Put(workerStatusKey, []byte(`{"repos_total":2}`)); err != nil {
 		t.Fatalf("second Put: %v", err)
+	}
+}
+
+// T029/T030 (FR-015): with VCS_DEDUP_ACCOUNT=1 the pass report warns when the
+// authenticated account budget is >80% consumed — headers first, the instance
+// page count as the header-less fallback, never a shared counter.
+func TestSharedAccountWarn(t *testing.T) {
+	newRep := func(usage float64, usageOK bool, pages int64) (*statusReporter, *summary) {
+		deps := RepoDeps{Cfg: &config.Config{}, Logger: testLogger()}
+		deps.Cfg.Worker.SharedAccountWarn = true
+		deps.VCS = &fake.Provider{AccountUsage: usage, AccountUsageOK: usageOK, PageCount: pages}
+		return newStatusReporter(newStatusPublisher(&fakeStatusStore{}, testLogger()), deps, &snapshot{}), newSummary("index")
+	}
+
+	rep, sum := newRep(0.9, true, 0)
+	rep.recordPass(sum)
+	if rep.lastPass == nil || !rep.lastPass.SharedAccountWarn {
+		t.Fatalf("last_pass = %+v, want shared_account_warn", rep.lastPass)
+	}
+	data, err := json.Marshal(rep.lastPass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"shared_account_warn":true`) {
+		t.Errorf("report does not carry the flag: %s", data)
+	}
+
+	// below the threshold — no warning.
+	rep, sum = newRep(0.5, true, 0)
+	rep.recordPass(sum)
+	if rep.lastPass.SharedAccountWarn {
+		t.Error("a 50% usage must not warn")
+	}
+
+	// no headers: the instance page count is compared with 5000/h.
+	rep, sum = newRep(0, false, 4100)
+	rep.recordPass(sum)
+	if !rep.lastPass.SharedAccountWarn {
+		t.Error("the header-less fallback did not warn above 80%")
+	}
+
+	// the feature is off by default (VCS_DEDUP_ACCOUNT unset).
+	deps := RepoDeps{Cfg: &config.Config{}, Logger: testLogger()}
+	deps.VCS = &fake.Provider{AccountUsage: 0.99, AccountUsageOK: true}
+	rep = newStatusReporter(newStatusPublisher(&fakeStatusStore{}, testLogger()), deps, &snapshot{})
+	rep.recordPass(newSummary("index"))
+	if rep.lastPass.SharedAccountWarn {
+		t.Error("the warning must be gated by Worker.SharedAccountWarn")
+	}
+}
+
+// T038 (FR-006/FR-008): neither the published worker status nor the pass
+// report may carry token values or credential-bearing URLs. The hostile repo
+// record below has credentials in CloneURL — the status must not copy it.
+func TestStatusReportHasNoCredentials(t *testing.T) {
+	const marker = "glpat-STATUS-CANARY"
+	deps := RepoDeps{VCSType: "gitlab", Engine: gitengine.New(t.TempDir()), Logger: testLogger()}
+	deps.Cfg = &config.Config{}
+	deps.Cfg.Provider.GitLabToken = marker
+	snap := &snapshot{}
+	snap.set([]provider.Repo{{
+		ID: "1", Namespace: "grp", Path: "fixture",
+		CloneURL: "https://oauth2:" + marker + "@gitlab.example/grp/fixture.git",
+	}})
+	sum := newSummary("index")
+	sum.configureUnitBudget(0)
+	sum.markUnprocessed("grp/fixture")
+
+	status, err := json.Marshal(collectWorkerStatus(context.Background(), deps, snap, passStats(sum), nil, time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pass, err := json.Marshal(passStats(sum))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credURL := regexp.MustCompile(`://[^/]*:[^/]*@`)
+	for name, blob := range map[string]string{"status": string(status), "pass_report": string(pass)} {
+		if strings.Contains(blob, marker) {
+			t.Errorf("%s leaked the token: %s", name, blob)
+		}
+		if credURL.MatchString(blob) {
+			t.Errorf("%s contains a credential-bearing URL: %s", name, blob)
+		}
+	}
+}
+
+// T044 (FR-008): the pass report counts 429 events per pass and repo, keeps
+// last_retry_after_ms absent when no Retry-After was seen, and omits the rate
+// fields entirely when there was no 429 (zero is not serialized).
+func TestPassStatsRateLimitCounters(t *testing.T) {
+	sum := newSummary("index")
+	for i := 0; i < 10; i++ {
+		// 10 artificial 429 events across 10 repos (the text form matches the
+		// git-transport classification used by the lanes).
+		sum.countRepo(errors.New("git fetch: The requested URL returned error: 429"))
+	}
+	st := passStats(sum)
+	if st.RateLimitedCount != 10 || st.RateLimitedRepos != 10 {
+		t.Fatalf("counters = %d/%d, want 10/10", st.RateLimitedCount, st.RateLimitedRepos)
+	}
+	if st.LastRetryAfterMS != 0 || st.RatePauseUntil != "" {
+		t.Errorf("no Retry-After/pause expected: %+v", st)
+	}
+	if st.Phase != "rate_pause" {
+		t.Errorf("phase = %q, want rate_pause", st.Phase)
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"rate_limited_count":10`, `"rate_limited_repos":10`, `"phase":"rate_pause"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("report does not contain %s: %s", want, data)
+		}
+	}
+	if strings.Contains(string(data), "last_retry_after_ms") {
+		t.Errorf("last_retry_after_ms must be absent without Retry-After: %s", data)
+	}
+
+	// a typed Retry-After is carried in milliseconds.
+	sum2 := newSummary("index")
+	sum2.markRateLimit(7 * time.Second)
+	sum2.setRatePause(time.Now().Add(time.Minute).UTC().Truncate(time.Second))
+	if st2 := passStats(sum2); st2.LastRetryAfterMS != 7000 || st2.RatePauseUntil == "" {
+		t.Errorf("retry/pause = %d/%q, want 7000/non-empty", st2.LastRetryAfterMS, st2.RatePauseUntil)
+	}
+
+	// zero 429: the rate fields are absent, not zero.
+	bare, err := json.Marshal(passStats(newSummary("index")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{"rate_limited_count", "rate_limited_repos", "last_retry_after_ms", "rate_pause_until"} {
+		if strings.Contains(string(bare), absent) {
+			t.Errorf("zero-event report contains %s: %s", absent, bare)
+		}
+	}
+}
+
+// T044/T042: the provider-side 429 observation (transport) is merged into the
+// pass report as a per-pass delta.
+func TestPassStatsProviderRateLimitDelta(t *testing.T) {
+	deps := RepoDeps{
+		Cfg:    &config.Config{},
+		Logger: testLogger(),
+		VCS:    &fake.Provider{RateLimitEventCount: 10, LastRetry: 60 * time.Second},
+	}
+	rep := newStatusReporter(newStatusPublisher(&fakeStatusStore{}, testLogger()), deps, &snapshot{})
+	rep.recordPass(newSummary("index"))
+	st := rep.lastPass
+	if st == nil || st.RateLimitedCount != 10 || st.LastRetryAfterMS != 60000 || st.Phase != "rate_pause" {
+		t.Fatalf("last_pass = %+v, want 10 events / 60000ms / rate_pause", st)
+	}
+
+	// the same provider totals are not counted twice on the next pass.
+	rep.recordPass(newSummary("index"))
+	if st := rep.lastPass; st.RateLimitedCount != 0 {
+		t.Errorf("second pass re-counted the provider totals: %+v", st)
+	}
+}
+
+// T045 (FR-008): the counters survive the existing status KV publication path
+// with their exact JSON names.
+func TestStatusPublishesRateLimitCounters(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeStatusStore{}
+	deps := RepoDeps{
+		VCSType: "gitlab",
+		Engine:  gitengine.New(t.TempDir()),
+		Logger:  testLogger(),
+		Cfg:     &config.Config{},
+		VCS:     &fake.Provider{RateLimitEventCount: 3, LastRetry: time.Second},
+	}
+	snap := &snapshot{}
+	snap.set([]provider.Repo{{ID: "1", Namespace: "g", Path: "a"}})
+	rep, base := newTestReporter(t, store, snap, deps)
+
+	sum := newSummary("index")
+	sum.markRateLimit(0)
+	sum.setRatePause(time.Now().Add(time.Minute))
+	sum.markExcluded("g/b")
+	rep.recordPass(sum)
+	*base = base.Add(workerStatusInterval)
+	rep.tick(ctx)
+
+	data, ok := store.puts[workerStatusKey]
+	if !ok {
+		t.Fatal("no status was published")
+	}
+	for _, want := range []string{
+		`"rate_limited_count":4`, `"last_retry_after_ms":1000`, `"phase":"rate_pause"`,
+		`"excluded_sample":["g/b"]`, `"rate_pause_until":"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("published status does not contain %s: %s", want, data)
+		}
 	}
 }

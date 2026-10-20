@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
+	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 
@@ -16,15 +18,22 @@ import (
 // Client is the GitLab provider: lists group projects (including subgroups)
 // unioned with explicitly configured projects.
 type Client struct {
-	api      *gitlab.Client
-	groups   []string
-	projects []string
-	ciWindow int
+	api         *gitlab.Client
+	groups      []string
+	projects    []string
+	ciWindow    int
+	groupRate   *tokenBucket // GET /groups: 50/min (R2)
+	projectRate *tokenBucket // project listing: 600/min (R2)
+	upstream    *upstreamTransport
 }
 
 // New creates the GitLab client; it makes no network calls.
 func New(cfg *config.Config) (*Client, error) {
-	api, err := gitlab.NewClient(cfg.Provider.GitLabToken, gitlab.WithBaseURL(cfg.Provider.GitLabBaseURL))
+	tr := &upstreamTransport{base: http.DefaultTransport}
+	tr.gate.Store(provider.NewUpstreamGate(cfg.Worker.UpstreamConcurrency))
+	api, err := gitlab.NewClient(cfg.Provider.GitLabToken,
+		gitlab.WithBaseURL(cfg.Provider.GitLabBaseURL),
+		gitlab.WithHTTPClient(&http.Client{Transport: tr}))
 	if err != nil {
 		return nil, fmt.Errorf("gitlab client: %w", err)
 	}
@@ -33,11 +42,48 @@ func New(cfg *config.Config) (*Client, error) {
 		ciWindow = 50 // ponytail: fallback in case the config is built bypassing Load
 	}
 	return &Client{
-		api:      api,
-		groups:   cfg.Provider.GitLabGroups,
-		projects: cfg.Provider.GitLabProjects,
-		ciWindow: ciWindow,
+		api:         api,
+		groups:      cfg.Provider.GitLabGroups,
+		projects:    cfg.Provider.GitLabProjects,
+		ciWindow:    ciWindow,
+		groupRate:   newTokenBucket(groupsPerMinute),
+		projectRate: newTokenBucket(projectsPerMinute),
+		upstream:    tr,
 	}, nil
+}
+
+// SetUpstreamGate shares the instance-wide upstream semaphore with the worker
+// (FR-002): git clone/fetch and API traffic then draw from one gate.
+func (c *Client) SetUpstreamGate(g *provider.UpstreamGate) {
+	if g != nil {
+		c.upstream.gate.Store(g)
+	}
+}
+
+// RateUsage exposes the authenticated budget consumption from the last
+// RateLimit-* headers (FR-015); ok=false — headers were absent.
+func (c *Client) RateUsage() (float64, bool) { return c.upstream.usage() }
+
+// Pages returns the API page responses served since start (FR-003).
+func (c *Client) Pages() int64 { return c.upstream.pages.Load() }
+
+// RateLimitEvents returns the 429 responses observed since start (FR-008).
+func (c *Client) RateLimitEvents() int64 { return c.upstream.four29s.Load() }
+
+// LastRetryAfter returns the last Retry-After carried by a 429 (FR-008).
+func (c *Client) LastRetryAfter() time.Duration {
+	return time.Duration(c.upstream.retry.Load())
+}
+
+// SetPageCharger installs the per-page budget hook (FR-003); nil removes it.
+func (c *Client) SetPageCharger(fn func()) { c.upstream.setPageCharger(fn) }
+
+// waitRate applies the narrow-endpoint cap before a request (FR-002).
+func waitRate(ctx context.Context, bucket *tokenBucket) error {
+	if bucket == nil {
+		return nil
+	}
+	return bucket.wait(ctx)
 }
 
 // Type returns "gitlab".
@@ -54,6 +100,9 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 			IncludeSubGroups: gitlab.Ptr(true),
 		}
 		for {
+			if err := waitRate(ctx, c.groupRate); err != nil {
+				return nil, err
+			}
 			projects, resp, err := c.api.Groups.ListGroupProjects(gid, opt, gitlab.WithContext(ctx))
 			if err != nil {
 				return nil, fmt.Errorf("group %s: %w", gid, err)
@@ -72,6 +121,9 @@ func (c *Client) ListRepositories(ctx context.Context) ([]provider.Repo, error) 
 	// endpoint. A project that cannot be fetched (404/403) is logged and
 	// skipped — never fatal.
 	for _, ref := range c.projects {
+		if err := waitRate(ctx, c.projectRate); err != nil {
+			return nil, err
+		}
 		p, _, err := c.api.Projects.GetProject(ref, nil, gitlab.WithContext(ctx))
 		if err != nil {
 			if ctx.Err() != nil {

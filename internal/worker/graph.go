@@ -52,7 +52,7 @@ func runGraph(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	// first completed pass of a repo+branch deletes every stale generation of
 	// it (Sweep, T016) including the whole old namespace. Until that pass,
 	// canonical-key path/neighbors over the repo simply resolve nothing.
-	p := newPacer(cfg.Worker.GraphInterval)
+	p := newPacerWithLimits(cfg.Worker.GraphInterval, cfg.Worker.RetryFloor, cfg.Worker.RetryCap)
 	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
 	if err := p.sleep(ctx, p.startDelay()); err != nil {
 		return nil
@@ -216,8 +216,12 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 // refresh composition hold the per-repo lock.
 func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs graphStore, repo provider.Repo, generation int, groups map[string]bool, vuln *vulnGate, runners *runnerGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
-	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
-	if err != nil {
+	var mirror string
+	if err := deps.runUpstream(ctx, func() error {
+		var err error
+		mirror, err = deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
+		return err
+	}); err != nil {
 		return 0, fmt.Errorf("mirror: %w", err)
 	}
 	refs, err := deps.Engine.Snapshot(ctx, mirror)

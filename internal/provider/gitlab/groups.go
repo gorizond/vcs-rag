@@ -19,6 +19,9 @@ func (c *Client) ListGroups(ctx context.Context) ([]provider.Group, error) {
 	opt := &gitlab.ListGroupsOptions{ListOptions: gitlab.ListOptions{PerPage: 100}}
 	var out []provider.Group
 	for {
+		if err := waitRate(ctx, c.groupRate); err != nil {
+			return nil, err
+		}
 		groups, resp, err := c.api.Groups.ListGroups(opt, gitlab.WithContext(ctx))
 		if err != nil {
 			if domainUnavailable(err) {
@@ -52,6 +55,9 @@ func (c *Client) ListGroupProjects(ctx context.Context, groupPath string) ([]pro
 	}
 	var out []provider.Project
 	for {
+		if err := waitRate(ctx, c.projectRate); err != nil {
+			return nil, err
+		}
 		projects, resp, err := c.api.Groups.ListGroupProjects(groupPath, opt, gitlab.WithContext(ctx))
 		if err != nil {
 			if domainUnavailable(err) {

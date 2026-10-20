@@ -432,3 +432,66 @@ func TestNATSRefresherInstanceScope(t *testing.T) {
 		t.Error("bucket b exists in the a-scoped test")
 	}
 }
+
+// T049 (FR-011): refresh_repo speaks the full status vocabulary — queued,
+// rate_limited, budget_exhausted — with a null rate_pause_until when idle and
+// an eta_hint the caller can act on.
+func TestRefreshRepoStatusVocabulary(t *testing.T) {
+	pause := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	cases := []struct {
+		name       string
+		out        refreshOutcome
+		wantStatus string
+		wantETA    string
+		wantPause  bool
+	}{
+		{"queued", refreshOutcome{Status: refreshStatus{State: "in_progress"}}, "queued", "queued", false},
+		{"in_progress", refreshOutcome{Status: refreshStatus{State: "in_progress"}, Seen: true}, "in_progress", "wait_for_completion", false},
+		{"rate_limited", refreshOutcome{Status: refreshStatus{State: "in_progress", RatePauseUntil: &pause}, Seen: true},
+			"rate_limited", "retry_after_rate_limit", true},
+		{"budget_exhausted", refreshOutcome{Status: refreshStatus{State: "done", Incomplete: true}, Seen: true},
+			"budget_exhausted", "resume_next_pass", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tl := newTools(&mockEmbedder{}, &mockSearcher{}, &fakeRefresher{out: tc.out})
+			_, out, err := tl.refreshRepo(context.Background(), nil, refreshRepoInput{Repo: "grp/fixture"})
+			if err != nil {
+				t.Fatalf("refreshRepo: %v", err)
+			}
+			resp, ok := out.(refreshInProgressResponse)
+			if !ok {
+				t.Fatalf("out = %T, want refreshInProgressResponse", out)
+			}
+			if resp.Status != tc.wantStatus || resp.ETAHint != tc.wantETA {
+				t.Errorf("status/eta = %q/%q, want %q/%q", resp.Status, resp.ETAHint, tc.wantStatus, tc.wantETA)
+			}
+			if (resp.RatePauseUntil != nil) != tc.wantPause {
+				t.Errorf("rate_pause_until = %v, want present=%v", resp.RatePauseUntil, tc.wantPause)
+			}
+			js := marshalJSON(out)
+			if !strings.Contains(js, `"status":"`+tc.wantStatus+`"`) {
+				t.Errorf("JSON lacks the status: %s", js)
+			}
+			if tc.wantPause {
+				if !strings.Contains(js, `"rate_pause_until":"`) {
+					t.Errorf("JSON lacks rate_pause_until: %s", js)
+				}
+			} else if !strings.Contains(js, `"rate_pause_until":null`) {
+				t.Errorf("JSON must carry rate_pause_until:null: %s", js)
+			}
+		})
+	}
+
+	// a finished pass keeps the existing done shape.
+	tl := newTools(&mockEmbedder{}, &mockSearcher{}, &fakeRefresher{out: refreshOutcome{
+		Status: refreshStatus{State: "done", CommitsIndexed: 1}, Cached: true, Seen: true,
+	}})
+	_, out, err := tl.refreshRepo(context.Background(), nil, refreshRepoInput{Repo: "grp/fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, ok := out.(refreshDoneResponse); !ok || resp.Status != "done" || resp.RatePauseUntil != nil {
+		t.Errorf("done response = %#v", out)
+	}
+}

@@ -2,6 +2,7 @@ package gitengine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,5 +58,50 @@ func TestEnsureLocalMirrorNoNetwork(t *testing.T) {
 	// negative control: the mirror lane (EnsureMirror) tries the remote and fails.
 	if _, err := eng.EnsureMirror(ctx, "gitlab", repo); err == nil {
 		t.Fatal("EnsureMirror with an unusable remote must fail (control)")
+	}
+}
+
+// failingGit installs a git wrapper that always fails with stderr text.
+func failingGit(t *testing.T, stderr string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\necho '" + stderr + "' >&2\nexit 128\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// T010: a clone/fetch 429 is a typed rate-limit error, not a generic one; the
+// classification survives provider.IsRateLimit through the wrapped text.
+func TestEnsureMirrorRateLimitTyped(t *testing.T) {
+	eng := New(t.TempDir())
+	eng.GitBin = failingGit(t, "fatal: unable to access 'https://git.example/x.git/': The requested URL returned error: 429")
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture", CloneURL: "https://git.example/x.git"}
+	_, err := eng.EnsureMirror(context.Background(), "gitlab", repo)
+	if err == nil {
+		t.Fatal("EnsureMirror must fail")
+	}
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("err = %T (%v), want *RateLimitError", err, err)
+	}
+	if _, ok := provider.IsRateLimit(err); !ok {
+		t.Errorf("the wrapped error is not classified as a rate limit: %v", err)
+	}
+}
+
+// T010: a non-429 git failure stays generic (no false positive).
+func TestEnsureMirrorNonRateLimitNotTyped(t *testing.T) {
+	eng := New(t.TempDir())
+	eng.GitBin = failingGit(t, "fatal: repository not found")
+	repo := provider.Repo{ID: "1", Namespace: "grp", Path: "fixture", CloneURL: "https://git.example/x.git"}
+	_, err := eng.EnsureMirror(context.Background(), "gitlab", repo)
+	if err == nil {
+		t.Fatal("EnsureMirror must fail")
+	}
+	var rl *RateLimitError
+	if errors.As(err, &rl) {
+		t.Fatalf("a non-429 failure was typed as a rate limit: %v", err)
 	}
 }

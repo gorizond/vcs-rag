@@ -9,6 +9,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/embed"
 	"github.com/gorizond/vcs-rag/internal/gitengine"
+	"github.com/gorizond/vcs-rag/internal/provider"
 	"github.com/gorizond/vcs-rag/internal/provider/factory"
 	"github.com/gorizond/vcs-rag/internal/store"
 )
@@ -25,9 +26,15 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 	defer release()
 
+	// FR-002: one instance-wide upstream gate + bounded queue shared by all
+	// lanes (git clone/fetch and API traffic).
+	gate, queue := upstreamFor(cfg)
 	vcs, err := factory.New(cfg)
 	if err != nil {
 		return err
+	}
+	if s, ok := vcs.(interface{ SetUpstreamGate(*provider.UpstreamGate) }); ok {
+		s.SetUpstreamGate(gate)
 	}
 	emb, err := embed.New(cfg)
 	if err != nil {
@@ -66,6 +73,9 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		Store:  st,
 		Cfg:    cfg,
 		Logger: logger,
+
+		Upstream: gate,
+		Queue:    queue,
 	}
 	snap := &snapshot{}
 
@@ -92,7 +102,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 	wg.Add(6)
 	go run(func() error { return runDiscovery(ctx, vcs, cfg, logger, snap) })
-	go run(func() error { return runMirror(ctx, cfg, deps.VCSType, deps.Engine, logger, snap) })
+	go run(func() error { return runMirror(ctx, cfg, deps, logger, snap) })
 	go run(func() error { return runIndex(ctx, cfg, deps, snap, statusRep) })
 	go run(func() error { return runMetadata(ctx, cfg, deps, snap) })
 	// T140: repo-GC — discovery is the source of truth; dry-run by default.

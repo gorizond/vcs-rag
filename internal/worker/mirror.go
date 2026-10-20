@@ -17,12 +17,12 @@ import (
 // loop (T129) — WORKER_MIRROR_INTERVAL (default WORKER_INTERVAL) is the
 // ceiling, not a tick; concurrency — WORKER_CONCURRENCY. Errors do not break
 // the loop (FR-014).
-func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) error {
+func runMirror(ctx context.Context, cfg *config.Config, deps RepoDeps, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "mirror")
-	p := newPacer(cfg.Worker.MirrorInterval)
+	p := newPacerWithLimits(cfg.Worker.MirrorInterval, cfg.Worker.RetryFloor, cfg.Worker.RetryCap)
 	lastRepos := -1
 	for {
-		sum := mirrorAll(ctx, cfg, vcsType, eng, logger, snap)
+		sum := mirrorAll(ctx, cfg, deps, logger, snap)
 		busy := sum != nil && sum.failed.Load() > 0
 		rl, retry := false, time.Duration(0)
 		if sum != nil {
@@ -46,7 +46,7 @@ func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 // mirrorAll refreshes mirrors of all known repositories through the pool;
 // failures are isolated (FR-014). It returns the pass summary (nil — nothing to
 // do) for the pacer and the pass log (T129).
-func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) *summary {
+func mirrorAll(ctx context.Context, cfg *config.Config, deps RepoDeps, logger *slog.Logger, snap *snapshot) *summary {
 	repos := snap.get()
 	if len(repos) == 0 {
 		return nil
@@ -63,7 +63,7 @@ func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 			}
 			defer p.Release()
 			sum.countRepo(processSafely(ctx, logger, repo, "mirror", func() error {
-				return mirrorRepo(ctx, vcsType, eng, logger, repo)
+				return mirrorRepo(ctx, deps, logger, repo)
 			}))
 		}(repo)
 	}
@@ -73,12 +73,16 @@ func mirrorAll(ctx context.Context, cfg *config.Config, vcsType string, eng *git
 
 // mirrorRepo mirrors a single repository and records LastFetchAt; the per-repo
 // lock (T110) serializes it with the index/metadata lanes and the refresh.
-func mirrorRepo(ctx context.Context, vcsType string, eng *gitengine.Engine, logger *slog.Logger, repo provider.Repo) error {
+func mirrorRepo(ctx context.Context, deps RepoDeps, logger *slog.Logger, repo provider.Repo) error {
 	return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
 		name := repo.Namespace + "/" + repo.Path
-		mirror, err := eng.EnsureMirror(ctx, vcsType, repo)
-		if err != nil {
-			return fmt.Errorf("mirror: %w", err)
+		var mirror string
+		if err := deps.runUpstream(ctx, func() error {
+			var err error
+			mirror, err = deps.Engine.EnsureMirror(ctx, deps.VCSType, repo)
+			return err
+		}); err != nil {
+			return err
 		}
 		if err := updateState(gitengine.StatePath(mirror), func(st *MirrorState) {
 			st.LastFetchAt = time.Now().UTC()

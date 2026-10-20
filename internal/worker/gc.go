@@ -119,7 +119,7 @@ func (r *gcRunner) registryPath() string {
 // keeps it observational until the kill-switch is disabled explicitly.
 func runGC(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) error {
 	deps.Logger = log.WithPhase(deps.Logger, "gc")
-	p := newPacer(cfg.Worker.GCInterval)
+	p := newPacerWithLimits(cfg.Worker.GCInterval, cfg.Worker.RetryFloor, cfg.Worker.RetryCap)
 	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
 	if err := p.sleep(ctx, p.startDelay()); err != nil {
 		return nil

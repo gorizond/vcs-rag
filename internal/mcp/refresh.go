@@ -37,6 +37,9 @@ type refreshStatus struct {
 	MetaUpdated    int       `json:"meta_updated"`
 	Errors         []string  `json:"errors,omitempty"`
 	DurationMS     int64     `json:"duration_ms"`
+	// US4/US5: the worker's partial-pass signal and the rate-limit pause end.
+	Incomplete     bool       `json:"incomplete,omitempty"`
+	RatePauseUntil *time.Time `json:"rate_pause_until,omitempty"`
 }
 
 // refreshTask is the published request (worker/refresh.go reads it).
@@ -76,14 +79,21 @@ type refreshDoneResponse struct {
 	Errors         []string `json:"errors"`
 	DurationMS     int64    `json:"duration_ms"`
 	Cached         bool     `json:"cached"`
+	// rate_pause_until is null when no rate-limit pause is active (T049).
+	RatePauseUntil *string `json:"rate_pause_until"`
+	ETAHint        string  `json:"eta_hint,omitempty"`
 }
 
 type refreshInProgressResponse struct {
-	Status     string `json:"status"` // in_progress
+	// status: in_progress | queued | rate_limited | budget_exhausted (T049).
+	Status     string `json:"status"`
 	Repo       string `json:"repo"`
 	StartedAt  string `json:"started_at,omitempty"`
 	ElapsedMS  int64  `json:"elapsed_ms"`
 	WorkerSeen bool   `json:"worker_seen"`
+	// rate_pause_until is null when no rate-limit pause is active.
+	RatePauseUntil *string `json:"rate_pause_until"`
+	ETAHint        string  `json:"eta_hint,omitempty"`
 }
 
 // refreshRepo — on-demand repository refresh (T113): a fresh KV result is
@@ -112,6 +122,19 @@ func (t *tools) refreshRepo(ctx context.Context, _ *mcp.CallToolRequest, in refr
 
 	switch out.Status.State {
 	case "done":
+		if out.Status.Incomplete {
+			// FR-009/T049: a partial pass is not a silent success — the next
+			// call resumes; no error is raised.
+			status, eta := partialRefreshStatus(out.Status)
+			return nil, refreshInProgressResponse{
+				Status:         status,
+				Repo:           repo,
+				ElapsedMS:      time.Since(start).Milliseconds(),
+				WorkerSeen:     out.Seen,
+				RatePauseUntil: ratePauseString(out.Status),
+				ETAHint:        eta,
+			}, nil
+		}
 		return nil, refreshDoneResponse{
 			Status:         "done",
 			Repo:           repo,
@@ -120,6 +143,7 @@ func (t *tools) refreshRepo(ctx context.Context, _ *mcp.CallToolRequest, in refr
 			Errors:         nonNilStrings(out.Status.Errors),
 			DurationMS:     out.Status.DurationMS,
 			Cached:         out.Cached,
+			RatePauseUntil: ratePauseString(out.Status),
 		}, nil
 	case "failed":
 		msg := "refresh failed"
@@ -128,18 +152,51 @@ func (t *tools) refreshRepo(ctx context.Context, _ *mcp.CallToolRequest, in refr
 		}
 		return nil, toolError{Code: codeRefreshUnavailable,
 			Message: msg + " — continue searching the current index"}, nil
-	default: // in_progress: the task continues in background
+	default: // the task continues in the background
+		status, eta := inProgressStatus(out)
 		resp := refreshInProgressResponse{
-			Status:     "in_progress",
-			Repo:       repo,
-			ElapsedMS:  time.Since(start).Milliseconds(),
-			WorkerSeen: out.Seen,
+			Status:         status,
+			Repo:           repo,
+			ElapsedMS:      time.Since(start).Milliseconds(),
+			WorkerSeen:     out.Seen,
+			RatePauseUntil: ratePauseString(out.Status),
+			ETAHint:        eta,
 		}
 		if !out.Status.StartedAt.IsZero() {
 			resp.StartedAt = out.Status.StartedAt.UTC().Format(time.RFC3339)
 		}
 		return nil, resp, nil
 	}
+}
+
+// inProgressStatus maps an unfinished worker status onto the T049 vocabulary
+// (queued — the task was published but the worker has not picked it up yet).
+func inProgressStatus(out refreshOutcome) (status, eta string) {
+	if !out.Seen {
+		return "queued", "queued"
+	}
+	if pause := out.Status.RatePauseUntil; pause != nil && !pause.IsZero() && time.Now().Before(*pause) {
+		return "rate_limited", "retry_after_rate_limit"
+	}
+	return "in_progress", "wait_for_completion"
+}
+
+// partialRefreshStatus maps a terminal partial pass (Incomplete): a live
+// rate-limit pause is rate_limited, otherwise the unit budget stopped it.
+func partialRefreshStatus(st refreshStatus) (status, eta string) {
+	if st.RatePauseUntil != nil && !st.RatePauseUntil.IsZero() && time.Now().Before(*st.RatePauseUntil) {
+		return "rate_limited", "retry_after_rate_limit"
+	}
+	return "budget_exhausted", "resume_next_pass"
+}
+
+// ratePauseString renders the pause end (null when no pause is active).
+func ratePauseString(st refreshStatus) *string {
+	if st.RatePauseUntil == nil || st.RatePauseUntil.IsZero() {
+		return nil
+	}
+	s := st.RatePauseUntil.UTC().Format(time.RFC3339)
+	return &s
 }
 
 // clampRefreshTimeout applies the default of 20 s and the cap of 120 s.
@@ -184,6 +241,18 @@ type flightCall struct {
 }
 
 func newFlightGroup() *flightGroup { return &flightGroup{calls: make(map[string]*flightCall)} }
+
+// active reports whether a refresh of the key is in flight (FR-013: the
+// freshness annotation marks the repo refreshing). Nil-safe.
+func (g *flightGroup) active(key string) bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.calls[key]
+	return ok
+}
 
 // do runs fn once per key while it is in flight; duplicates wait for the result.
 func (g *flightGroup) do(key string, fn func() (refreshOutcome, error)) (refreshOutcome, error) {
