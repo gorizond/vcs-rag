@@ -237,3 +237,42 @@ func TestGraphPassSweepsOwnershipWithoutRepos(t *testing.T) {
 		t.Fatalf("instance sweep counted %d filters, want 2 (group, project) — the sweep must not be gated behind the repo loop", gs.counts)
 	}
 }
+
+// chargingOwnershipStub simulates the API transport: every listing page calls
+// provider.ChargePage with the pass context (T064).
+type chargingOwnershipStub struct {
+	ownershipStub
+	pages int
+}
+
+func (s *chargingOwnershipStub) ListGroups(ctx context.Context) ([]provider.Group, error) {
+	provider.ChargePage(ctx)
+	s.pages++
+	return s.ownershipStub.ListGroups(ctx)
+}
+
+func (s *chargingOwnershipStub) ListGroupProjects(ctx context.Context, groupPath string) ([]provider.Project, error) {
+	provider.ChargePage(ctx)
+	s.pages++
+	return s.ownershipStub.ListGroupProjects(ctx, groupPath)
+}
+
+// T064 (FR-003): API pages served during the graph pass are charged exactly
+// once each against WORKER_UPSTREAM_MAX_UNITS.
+func TestGraphPassChargesAPIPages(t *testing.T) {
+	stub := &chargingOwnershipStub{}
+	deps := RepoDeps{VCSType: "gitlab", VCS: stub, Logger: testLogger()}
+	cfg := &config.Config{Worker: config.Worker{GraphSchemaVer: "4", UpstreamMaxUnits: 100}}
+	sum := graphPass(context.Background(), cfg, deps, &snapshot{}, &graphStoreFake{}, 0, &vulnGate{}, &runnerGate{})
+
+	// ownershipStub: one groups page + one projects page per group = 3 pages.
+	if stub.pages != 3 {
+		t.Fatalf("simulated API pages = %d, want 3", stub.pages)
+	}
+	if got := sum.commitBudget.Load(); got != 97 {
+		t.Errorf("remaining unit budget = %d, want 100-3=97 (one charge per page)", got)
+	}
+	if sum.budgetExhausted.Load() {
+		t.Error("budget flagged as exhausted with 97 units left")
+	}
+}

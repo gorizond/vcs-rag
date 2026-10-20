@@ -36,6 +36,9 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	if s, ok := vcs.(interface{ SetUpstreamGate(*provider.UpstreamGate) }); ok {
 		s.SetUpstreamGate(gate)
 	}
+	if s, ok := vcs.(interface{ SetUpstreamQueue(*provider.UpstreamQueue) }); ok {
+		s.SetUpstreamQueue(queue.UpstreamQueue)
+	}
 	emb, err := embed.New(cfg)
 	if err != nil {
 		return err

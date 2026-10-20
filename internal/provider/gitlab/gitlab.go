@@ -60,6 +60,15 @@ func (c *Client) SetUpstreamGate(g *provider.UpstreamGate) {
 	}
 }
 
+// SetUpstreamQueue shares the bounded FR-011 queue with the worker: an API
+// request over capacity fails with provider.ErrTooManyTasks instead of waiting
+// indefinitely (T063).
+func (c *Client) SetUpstreamQueue(q *provider.UpstreamQueue) {
+	if q != nil {
+		c.upstream.queue.Store(q)
+	}
+}
+
 // RateUsage exposes the authenticated budget consumption from the last
 // RateLimit-* headers (FR-015); ok=false — headers were absent.
 func (c *Client) RateUsage() (float64, bool) { return c.upstream.usage() }

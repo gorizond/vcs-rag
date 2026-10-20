@@ -2,8 +2,6 @@ package worker
 
 import (
 	"context"
-	"errors"
-	"sync/atomic"
 
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/provider"
@@ -11,25 +9,18 @@ import (
 
 // ErrTooManyTasks is the honest FR-011 overflow error of the bounded upstream
 // queue: queued work is never dropped, only new work is rejected.
-var ErrTooManyTasks = errors.New("too many tasks")
+var ErrTooManyTasks = provider.ErrTooManyTasks
 
-// upstreamQueue is the bounded waiting room in front of the instance-wide
-// gate: at most UpstreamConcurrency operations run and at most
-// UpstreamQueueLimit wait; the (concurrency+limit)-th pending operation is
-// rejected with ErrTooManyTasks. Waiters that already entered are never lost.
+// upstreamQueue is the worker-side handle of the shared provider queue: the
+// same queue bounds git operations and API requests (T063).
 type upstreamQueue struct {
-	gate    *provider.UpstreamGate
-	limit   int
-	pending atomic.Int64
+	*provider.UpstreamQueue
 }
 
 // newUpstreamQueue sizes the queue; limit <= 0 falls back to the FR-010
 // default of 1000 (a zero-value unit-test config).
 func newUpstreamQueue(gate *provider.UpstreamGate, limit int) *upstreamQueue {
-	if limit <= 0 {
-		limit = 1000
-	}
-	return &upstreamQueue{gate: gate, limit: gate.Cap() + limit}
+	return &upstreamQueue{provider.NewUpstreamQueue(gate, limit)}
 }
 
 // upstreamFor builds the one gate and queue shared by all lanes (FR-002).
@@ -45,17 +36,7 @@ func (q *upstreamQueue) run(ctx context.Context, fn func() error) error {
 	if q == nil {
 		return fn()
 	}
-	if q.pending.Add(1) > int64(q.limit) {
-		q.pending.Add(-1)
-		return ErrTooManyTasks
-	}
-	defer q.pending.Add(-1)
-	release, err := q.gate.Acquire(ctx)
-	if err != nil {
-		return err
-	}
-	defer release()
-	return fn()
+	return q.Run(ctx, fn)
 }
 
 // runUpstream routes one outbound (git clone/fetch) operation through the

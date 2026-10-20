@@ -108,6 +108,10 @@ type graphStore interface {
 // repository, so a long (or stuck) per-repo loop can never starve them.
 func graphPass(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, gs graphStore, start int, vuln *vulnGate, runners *runnerGate) *summary {
 	sum := newSummary("graph")
+	// T064: graph listings consume API pages too — charge them to the pass
+	// budget (the context charger keeps concurrent lanes separate).
+	sum.configureUnitBudget(passConfig(cfg).UpstreamMaxUnits)
+	ctx = passContext(ctx, sum)
 	generation := int(time.Now().Unix())
 	// US4/T039: the ownership listing is best-effort (FR-024): a missing
 	// GroupReader seam or a failed listing logs and withholds the instance

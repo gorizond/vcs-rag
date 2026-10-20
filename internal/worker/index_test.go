@@ -469,10 +469,10 @@ func TestUpstreamQueueOverflow(t *testing.T) {
 		defer wg.Done()
 		_ = q.run(ctx, func() error { close(queued); return nil })
 	}()
-	for i := 0; i < 200 && q.pending.Load() < 2; i++ {
+	for i := 0; i < 200 && q.Pending() < 2; i++ {
 		time.Sleep(time.Millisecond)
 	}
-	if got := q.pending.Load(); got != 2 {
+	if got := q.Pending(); got != 2 {
 		t.Fatalf("pending = %d, want the queued operation admitted", got)
 	}
 
@@ -491,7 +491,7 @@ func TestUpstreamQueueOverflow(t *testing.T) {
 	default:
 		t.Error("the queued operation was lost")
 	}
-	if got := q.pending.Load(); got != 0 {
+	if got := q.Pending(); got != 0 {
 		t.Errorf("pending after drain = %d, want 0", got)
 	}
 }
@@ -617,5 +617,23 @@ func TestIndexUnlimitedBudget(t *testing.T) {
 	}
 	if got := len(saved.Branches["main"].IndexedCommits); got != len(shas) {
 		t.Errorf("indexed commits = %d, want all %d", got, len(shas))
+	}
+}
+
+// T064 (FR-003): the index pass context charges every API page served under it
+// exactly once against the pass unit budget.
+func TestPassContextChargesAPIPagesOnce(t *testing.T) {
+	sum := newSummary("index")
+	sum.configureUnitBudget(10)
+	ctx := passContext(context.Background(), sum)
+
+	provider.ChargePage(ctx)
+	provider.ChargePage(ctx)
+
+	if got := sum.commitBudget.Load(); got != 8 {
+		t.Errorf("remaining unit budget = %d, want 10-2=8 (one charge per page)", got)
+	}
+	if sum.budgetExhausted.Load() {
+		t.Error("budget flagged as exhausted with 8 units left")
 	}
 }

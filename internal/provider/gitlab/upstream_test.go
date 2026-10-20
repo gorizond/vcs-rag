@@ -2,9 +2,12 @@ package gitlab
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -133,3 +136,100 @@ func TestFirstRequestIsAuthenticated(t *testing.T) {
 		}
 	}
 }
+
+// blockingRoundTripper holds a request until released (queue-overflow tests).
+type blockingRoundTripper struct{ release chan struct{} }
+
+func (b *blockingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	<-b.release
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{},
+		Body: io.NopCloser(strings.NewReader("{}"))}, nil
+}
+
+// T063 (FR-011): an API request over the shared queue capacity fails fast with
+// provider.ErrTooManyTasks instead of waiting indefinitely; admitted work is
+// never dropped.
+func TestTransportQueueOverflow(t *testing.T) {
+	base := &blockingRoundTripper{release: make(chan struct{})}
+	gate := provider.NewUpstreamGate(1)
+	queue := provider.NewUpstreamQueue(gate, 1) // 1 running + 1 waiting
+	tr := &upstreamTransport{base: base}
+	tr.gate.Store(gate)
+	tr.queue.Store(queue)
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	run := func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://gitlab.invalid/api/v4/user", nil)
+			resp, err := tr.RoundTrip(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+	run() // holds the gate
+	for i := 0; i < 200 && queue.Pending() < 1; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	run() // waits in the queue
+	for i := 0; i < 200 && queue.Pending() < 2; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	if got := queue.Pending(); got != 2 {
+		t.Fatalf("pending = %d, want 2 admitted operations", got)
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://gitlab.invalid/api/v4/user", nil)
+	if _, err := tr.RoundTrip(req); !errors.Is(err, provider.ErrTooManyTasks) {
+		t.Fatalf("overflow err = %v, want provider.ErrTooManyTasks", err)
+	}
+	close(base.release)
+	wg.Wait()
+	if got := queue.Pending(); got != 0 {
+		t.Errorf("pending after drain = %d, want 0", got)
+	}
+}
+
+// T064: the per-pass context charger takes precedence over the client-wide
+// fallback — one page response is charged exactly once.
+func TestPageChargerContextWins(t *testing.T) {
+	ok := func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader("{}"))}, nil
+	}
+	tr := &upstreamTransport{base: roundTripFunc(ok)}
+	tr.gate.Store(provider.NewUpstreamGate(1))
+	var installed, contextual int
+	tr.setPageCharger(func() { installed++ })
+
+	req := func(ctx context.Context) *http.Request {
+		r, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://gitlab.invalid/api/v4/user", nil)
+		return r
+	}
+	ctx := provider.WithPageCharger(context.Background(), func() { contextual++ })
+	resp, err := tr.RoundTrip(req(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if contextual != 1 || installed != 0 {
+		t.Fatalf("chargers = context %d / installed %d, want 1/0", contextual, installed)
+	}
+
+	resp, err = tr.RoundTrip(req(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if installed != 1 {
+		t.Errorf("installed charger = %d, want the fallback to fire once", installed)
+	}
+}
+
+// roundTripFunc is an inline http.RoundTripper for the charger test.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
