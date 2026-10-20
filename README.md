@@ -176,6 +176,72 @@ restarts after the initial deploy:
 - The current limit, latency p50/p95, throttle count, and the next pace delay
   with its reason are printed in the per-pass summary.
 
+## Rate limits and upstream budget
+
+The worker treats the provider's rate limit as normal degradation, not an error:
+a unit that cannot be completed is resumed by the next pass.
+
+**429 handling (per work unit).** A retry waits
+`clamp(max(Retry-After, WORKER_UPSTREAM_RETRY_FLOOR), floor, cap)` — the default
+floor is **60 s**, the cap **15 m**; the next attempt doubles the base wait plus
+±25 % jitter, capped the same way. At most **5** retries per unit
+(`WORKER_UPSTREAM_MAX_RETRIES`); after that the unit is left unprocessed — the
+refresh path records it in the repository's `*.state.json` `unprocessed` list —
+the pass is `incomplete`, and the coverage marker stays where it was. A 429
+without `Retry-After` uses the floor.
+
+**Per-pass unit budget.** One unit is **1 processed commit or 1 API page**;
+`WORKER_UPSTREAM_MAX_UNITS` (default **500**) is summed across the instance for
+one pass. Exhaustion stops dispatching new work, keeps the per-commit
+checkpoints and records the leftovers in `unprocessed_sample`
+(`budget_exhausted: true`) — the next pass resumes without duplicates. `0`
+disables the volume stop and the report says `unlimited: true`.
+
+**Concurrency, queue and endpoint caps.** Git clone/fetch operations and
+GitLab API requests draw from one instance-wide semaphore
+(`WORKER_UPSTREAM_CONCURRENCY`, default **2**). Pending git operations wait in a
+bounded queue of `WORKER_UPSTREAM_QUEUE_LIMIT` (default **1000**); when it
+overflows the operation fails with the stable **`too many tasks`** error and
+already queued work is not dropped. Two narrow endpoints keep their own token
+buckets: group listing **50 req/min**, project listing **600 req/min**. When a
+response carries `RateLimit-Remaining` below **10 %** of `RateLimit-Limit`, the
+client parks until `RateLimit-Reset` instead of waiting for a 429.
+
+**`last_pass` additions** (`index_status`; each field is omitted when not
+applicable):
+
+| Field | Meaning |
+|-------|---------|
+| `rate_limited_count` | 429 events observed in the pass |
+| `rate_limited_repos` | repositories that hit at least one 429 |
+| `last_retry_after_ms` | last `Retry-After` in ms (absent when none was sent) |
+| `rate_pause_until` | RFC3339 end of the rate-limit pause |
+| `budget_exhausted` / `unlimited` | volume stop fired / no volume budget |
+| `unprocessed_sample` / `excluded_sample` | ≤10 leftover units / ≤10 units excluded by 403/404 |
+| `phase` | `active`, `rate_pause`, `budget_exhausted`, `idle`, `error` |
+
+**`index_freshness`** annotates repo-scoped search answers (`search_code`,
+`search_definitions`, `search_pull_requests`, `search_issues`,
+`search_ci_failures`, `get_imports`, `get_dependents`); it never hides results:
+
+| Field | Meaning |
+|-------|---------|
+| `indexed_at` | RFC3339 time of the repository coverage marker |
+| `freshness` | `fresh`, `stale` (older than the threshold) or `refreshing` (pass is live) |
+| `threshold` | `WORKER_FRESH_THRESHOLD` as a duration string (`24h`) |
+| `reason` | `null` for fresh, else `stale_index` or `refresh_in_progress` |
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WORKER_UPSTREAM_CONCURRENCY` | `2` | concurrent upstream operations (git + API) |
+| `WORKER_UPSTREAM_MAX_UNITS` | `500` | units per pass (commit or API page); `0` — unlimited |
+| `WORKER_UPSTREAM_RETRY_FLOOR` | `60s` | minimum wait after 429 / absent `Retry-After` |
+| `WORKER_UPSTREAM_RETRY_CAP` | `15m` | upper bound of a single wait |
+| `WORKER_UPSTREAM_MAX_RETRIES` | `5` | retries per unit, then `unprocessed` |
+| `WORKER_UPSTREAM_QUEUE_LIMIT` | `1000` | pending upstream operations; overflow — `too many tasks` |
+| `WORKER_FRESH_THRESHOLD` | `24h` | age above which `index_freshness` is `stale` |
+| `VCS_DEDUP_ACCOUNT` | `0` | `1` — warn above 80 % of the account budget |
+
 ## Auto freshness
 
 With `NATS_URL` set, a repository-scoped search refreshes itself when the index
@@ -415,8 +481,9 @@ the worker publishes at most once per minute (only with `NATS_URL` set):
 - `points` — the exact Qdrant point count (omitted when the count failed);
 - `last_pass` — the counters of the last **completed** index pass
   (`repos`, `ok`, `errors`, `indexed_commits`, `resumed`, `skipped`, `pruned`,
-  `duration_ms`); the field is omitted until the first pass completes, so a
-  long backfill still reports fresh totals without it;
+  `duration_ms`, plus the rate-limit/budget fields above); the field is omitted
+  until the first pass completes, so a long backfill still reports fresh totals
+  without it;
 - `updated_at` — when the snapshot was built.
 
 The published value lives in `worker_status_<instance id>` (key `status`, TTL

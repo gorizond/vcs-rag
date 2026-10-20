@@ -41,6 +41,14 @@ services:
       WORKER_INTERVAL: "${WORKER_INTERVAL:-60s}"
       WORKER_META_INTERVAL: "${WORKER_META_INTERVAL:-}"
       WORKER_MIRROR_INTERVAL: "${WORKER_MIRROR_INTERVAL:-}"
+      # Upstream budget / rate limits (defaults are the conservative profile)
+      WORKER_UPSTREAM_CONCURRENCY: "${WORKER_UPSTREAM_CONCURRENCY:-2}"
+      WORKER_UPSTREAM_MAX_UNITS: "${WORKER_UPSTREAM_MAX_UNITS:-500}"
+      WORKER_UPSTREAM_RETRY_FLOOR: "${WORKER_UPSTREAM_RETRY_FLOOR:-60s}"
+      WORKER_UPSTREAM_RETRY_CAP: "${WORKER_UPSTREAM_RETRY_CAP:-15m}"
+      WORKER_UPSTREAM_MAX_RETRIES: "${WORKER_UPSTREAM_MAX_RETRIES:-5}"
+      WORKER_UPSTREAM_QUEUE_LIMIT: "${WORKER_UPSTREAM_QUEUE_LIMIT:-1000}"
+      VCS_DEDUP_ACCOUNT: "${VCS_DEDUP_ACCOUNT:-0}"
       # On-demand refresh by the LLM (empty NATS_URL disables the feature)
       NATS_URL: "nats://nats:4222"
       NATS_INSTANCE_ID: "${NATS_INSTANCE_ID:-default}"
@@ -69,6 +77,8 @@ services:
       QDRANT_COLLECTION: "${QDRANT_COLLECTION:-vcs_rag}"
       MCP_TRANSPORT: "sse"
       MCP_ADDR: ":8080"
+      # Stale-index threshold of the index_freshness annotation
+      WORKER_FRESH_THRESHOLD: "${WORKER_FRESH_THRESHOLD:-24h}"
       # refresh_repo is registered only when NATS_URL is set
       NATS_URL: "nats://nats:4222"
       NATS_INSTANCE_ID: "${NATS_INSTANCE_ID:-default}"

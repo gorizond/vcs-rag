@@ -67,6 +67,27 @@ explicitly listed project/repo), deduplicated. If only the allowlist is set
 | `MAX_FILE_BYTES` | `1048576` | Skip larger files while chunking |
 | `CI_WINDOW` | `50` | Pipelines inspected per repository for failed jobs |
 
+## Upstream budget and rate limits
+
+The worker's outbound operations are authenticated, bounded and paced (see
+[README · Rate limits](../README.md#rate-limits-and-upstream-budget)). All
+values are read once at the pass boundary; an in-flight pass keeps its snapshot.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WORKER_UPSTREAM_CONCURRENCY` | `2` | Concurrent upstream operations (git clone/fetch + API requests), one instance-wide semaphore |
+| `WORKER_UPSTREAM_MAX_UNITS` | `500` | Units per pass: 1 commit or 1 API page; `0` — unlimited (reported as `unlimited: true`) |
+| `WORKER_UPSTREAM_RETRY_FLOOR` | `60s` | Minimum wait after a 429; also the fallback when `Retry-After` is absent |
+| `WORKER_UPSTREAM_RETRY_CAP` | `15m` | Upper bound of a single retry wait; larger `Retry-After` values are clamped to it |
+| `WORKER_UPSTREAM_MAX_RETRIES` | `5` | Retries per work unit; after that the unit goes to `unprocessed` and the pass is `incomplete` |
+| `WORKER_UPSTREAM_QUEUE_LIMIT` | `1000` | Pending upstream operations; overflow fails with the stable `too many tasks` error, already queued work is kept |
+| `WORKER_FRESH_THRESHOLD` | `24h` | Age above which the MCP `index_freshness` annotation is `stale` |
+| `VCS_DEDUP_ACCOUNT` | `0` | `1` — warn in the pass report when the authenticated account budget is >80 % consumed (soft coordination, no shared counter) |
+
+Narrow endpoint caps are constants, not env: group listing 50 req/min and
+project listing 600 req/min; a `RateLimit-Remaining` below 10 % of
+`RateLimit-Limit` parks the client until `RateLimit-Reset`.
+
 ## NATS (refresh / auto-freshness / status)
 
 | Variable | Default | Purpose |
