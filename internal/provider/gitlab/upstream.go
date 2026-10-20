@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,6 +68,9 @@ type upstreamTransport struct {
 	base  http.RoundTripper
 	gate  atomic.Pointer[provider.UpstreamGate]
 	pages atomic.Int64
+	// US4/FR-008: 429 responses and the last Retry-After seen on one.
+	four29s atomic.Int64
+	retry   atomic.Int64 // nanoseconds
 
 	chargerMu sync.Mutex
 	charger   func()
@@ -92,6 +96,12 @@ func (t *upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return nil, err
 	}
 	t.pages.Add(1)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		t.four29s.Add(1)
+		if d := retryAfterDuration(resp.Header); d > 0 {
+			t.retry.Store(int64(d))
+		}
+	}
 	t.observe(resp.Header)
 	t.charge()
 	return resp, nil
@@ -165,4 +175,22 @@ func headerInt(h http.Header, name string) int {
 		return 0
 	}
 	return n
+}
+
+// retryAfterDuration parses Retry-After: seconds or an HTTP-date (0 — none).
+func retryAfterDuration(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if at, err := http.ParseTime(v); err == nil && time.Until(at) > 0 {
+		return time.Until(at)
+	}
+	return 0
 }

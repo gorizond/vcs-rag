@@ -82,6 +82,10 @@ func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 		if sum != nil && sum.budgetExhausted.Load() && delay < indexBudgetPause {
 			delay = indexBudgetPause // T160: let the embeddings backend breathe
 		}
+		if sum != nil && rl {
+			// US4: the pass report states when the rate-limit pause ends.
+			sum.setRatePause(time.Now().Add(delay))
+		}
 		if sum != nil {
 			sum.withPace(delay, p.reason)
 			if l, ok := deps.Embed.(*limiter); ok {
@@ -134,12 +138,17 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 				return
 			}
 			defer p.Release()
-			sum.countRepo(processSafely(ctx, deps.Logger, repo, "index", func() error {
+			err := processSafely(ctx, deps.Logger, repo, "index", func() error {
 				// T110: the per-repo lock is taken at the call site only.
 				return withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
 					return ProcessRepoOnce(ctx, deps, repo)
 				})
-			}))
+			})
+			sum.countRepo(err)
+			if provider.IsAccessError(err) {
+				// FR-012: a 403/404 unit is excluded, not a pass failure.
+				sum.markExcluded(repo.Namespace + "/" + repo.Path)
+			}
 		}(repo)
 	}
 	wg.Wait()

@@ -1,6 +1,9 @@
 package provider
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // UpstreamGate is the instance-wide bound on concurrent outbound operations
 // (FR-002/FR-011): git transport and API traffic draw from one semaphore.
@@ -59,4 +62,16 @@ type PageCounter interface {
 // a charger that consumes one pass unit per API page response; nil removes it.
 type PageCharger interface {
 	SetPageCharger(func())
+}
+
+// RateLimitEventCounter is an optional provider capability (FR-008): the number
+// of 429 responses observed since the client started.
+type RateLimitEventCounter interface {
+	RateLimitEvents() int64
+}
+
+// RetryAfterReporter is an optional provider capability (FR-008): the last
+// Retry-After duration carried by a 429 response (0 — none).
+type RetryAfterReporter interface {
+	LastRetryAfter() time.Duration
 }

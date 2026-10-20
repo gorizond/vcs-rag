@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -49,6 +50,34 @@ type indexPassStats struct {
 	BudgetExhausted   bool     `json:"budget_exhausted,omitempty"`
 	UnprocessedSample []string `json:"unprocessed_sample,omitempty"`
 	SharedAccountWarn bool     `json:"shared_account_warn,omitempty"`
+	// US4 rate-limit report (FR-008/FR-009/FR-012), all omitempty.
+	RateLimitedCount int64    `json:"rate_limited_count,omitempty"`
+	RateLimitedRepos int64    `json:"rate_limited_repos,omitempty"`
+	LastRetryAfterMS int64    `json:"last_retry_after_ms,omitempty"`
+	RatePauseUntil   string   `json:"rate_pause_until,omitempty"`
+	Phase            string   `json:"phase,omitempty"`
+	ExcludedSample   []string `json:"excluded_sample,omitempty"`
+}
+
+// upstreamCounter is the instance-level upstream counter (FR-008): the request
+// window, 429 events, the last Retry-After and the current phase. The pass
+// report carries the per-pass deltas; the counter keeps the instance totals.
+type upstreamCounter struct {
+	requestsWindow atomic.Int64
+	four29s        atomic.Int64
+	lastRetryAfter atomic.Int64 // nanoseconds
+	phase          atomic.Value // string
+}
+
+// setPhase records the current phase (active|rate_pause|budget_exhausted|idle|error).
+func (c *upstreamCounter) setPhase(p string) { c.phase.Store(p) }
+
+// phaseName returns the current phase ("" before the first pass).
+func (c *upstreamCounter) phaseName() string {
+	if v, ok := c.phase.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // workerStatus is the published payload (the MCP read model repeats it in
@@ -127,6 +156,11 @@ type statusReporter struct {
 	snap   *snapshot
 	points statusPoints // deps.Store in production (narrow interface for tests)
 
+	counter upstreamCounter // FR-008 instance upstream totals
+	// per-pass deltas of the provider totals (single writer: the index lane).
+	lastPages int64
+	last429s  int64
+
 	mu          sync.Mutex
 	lastPass    *indexPassStats // nil before the first completed pass
 	emptyLogged bool            // one debug line per empty-snapshot episode
@@ -149,6 +183,37 @@ func (r *statusReporter) recordPass(sum *summary) {
 		return
 	}
 	st := passStats(sum)
+	// FR-008: merge the provider-side observation (API pages and 429 responses)
+	// into the per-pass report; the summary already counted git-side 429s.
+	if pc, ok := r.deps.VCS.(provider.PageCounter); ok {
+		total := pc.Pages()
+		if d := total - r.lastPages; d > 0 {
+			r.counter.requestsWindow.Add(d)
+		}
+		r.lastPages = total
+	}
+	if rc, ok := r.deps.VCS.(provider.RateLimitEventCounter); ok {
+		total := rc.RateLimitEvents()
+		if d := total - r.last429s; d > 0 {
+			st.RateLimitedCount += d
+			r.counter.four29s.Add(d)
+		}
+		r.last429s = total
+	}
+	if st.LastRetryAfterMS == 0 {
+		if ra, ok := r.deps.VCS.(provider.RetryAfterReporter); ok {
+			if d := ra.LastRetryAfter(); d > 0 {
+				st.LastRetryAfterMS = d.Milliseconds()
+			}
+		}
+	}
+	if st.LastRetryAfterMS > 0 {
+		r.counter.lastRetryAfter.Store(int64(time.Duration(st.LastRetryAfterMS) * time.Millisecond))
+	}
+	// The provider deltas are part of this pass: derive the phase from the
+	// merged total, not only from the git-side summary count.
+	st.Phase = passPhase(sum, st.RateLimitedCount)
+	r.counter.setPhase(st.Phase)
 	if r.deps.Cfg != nil && r.deps.Cfg.Worker.SharedAccountWarn {
 		if used, ok := sharedAccountUsage(r.deps.VCS); ok && used > sharedAccountWarnThreshold {
 			st.SharedAccountWarn = true
@@ -202,7 +267,7 @@ func (r *statusReporter) tick(ctx context.Context) {
 
 // passStats snapshots the counters of one completed pass.
 func passStats(sum *summary) *indexPassStats {
-	return &indexPassStats{
+	st := &indexPassStats{
 		Repos:             sum.repos.Load(),
 		OK:                sum.ok.Load(),
 		Errors:            sum.failed.Load(),
@@ -214,6 +279,31 @@ func passStats(sum *summary) *indexPassStats {
 		Unlimited:         sum.unlimited.Load(),
 		BudgetExhausted:   sum.budgetExhausted.Load(),
 		UnprocessedSample: sum.unprocessedSample(),
+		RateLimitedCount:  sum.rateCount.Load(),
+		RateLimitedRepos:  sum.rateRepos.Load(),
+		LastRetryAfterMS:  time.Duration(sum.retryAfter.Load()).Milliseconds(),
+		ExcludedSample:    sum.excludedSample(),
+	}
+	if until := sum.ratePauseUntil(); !until.IsZero() {
+		st.RatePauseUntil = until.UTC().Format(time.RFC3339)
+	}
+	st.Phase = passPhase(sum, st.RateLimitedCount)
+	return st
+}
+
+// passPhase derives the pass state-machine phase (contracts/status-report.md).
+func passPhase(sum *summary, rateCount int64) string {
+	switch {
+	case sum.budgetExhausted.Load():
+		return "budget_exhausted"
+	case rateCount > 0 || sum.rateLimit.Load():
+		return "rate_pause"
+	case sum.repos.Load() == 0:
+		return "idle"
+	case sum.failed.Load() > 0 && sum.ok.Load() == 0:
+		return "error"
+	default:
+		return "active"
 	}
 }
 

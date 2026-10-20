@@ -4,6 +4,7 @@ package fake
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
@@ -30,6 +31,9 @@ type Provider struct {
 	AccountUsage   float64
 	AccountUsageOK bool
 	PageCount      int64
+	// US4/FR-008: observed 429 responses and the last Retry-After.
+	RateLimitEventCount int64
+	LastRetry           time.Duration
 }
 
 // RateUsage implements provider.RateLimitObserver (FR-015).
@@ -37,6 +41,12 @@ func (p *Provider) RateUsage() (float64, bool) { return p.AccountUsage, p.Accoun
 
 // Pages implements provider.PageCounter (FR-003).
 func (p *Provider) Pages() int64 { return p.PageCount }
+
+// RateLimitEvents implements provider.RateLimitEventCounter (FR-008).
+func (p *Provider) RateLimitEvents() int64 { return p.RateLimitEventCount }
+
+// LastRetryAfter implements provider.RetryAfterReporter (FR-008).
+func (p *Provider) LastRetryAfter() time.Duration { return p.LastRetry }
 
 // Type returns "fake".
 func (p *Provider) Type() string { return "fake" }

@@ -358,6 +358,7 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 		State: "done", RequestID: task.RequestID, StartedAt: started,
 		FinishedAt: time.Now().UTC(), CommitsIndexed: res.CommitsIndexed,
 		MetaUpdated: res.MetaUpdated, Errors: res.Errors, DurationMS: res.Duration.Milliseconds(),
+		Incomplete: res.Incomplete, RatePauseUntil: ratePausePtr(res.RatePauseUntil),
 	}
 	if len(res.Errors) > 0 {
 		status.State = "failed" // partial result; errors[] carries the detail
@@ -386,6 +387,15 @@ func (c *refreshConsumer) handle(ctx context.Context, msg refreshMsg) {
 		c.logger.Warn("refresh failed (retry)", "repo", task.Repo,
 			"delivery", msg.NumDelivered(), "errors", res.Errors)
 	}
+}
+
+// ratePausePtr converts the optional pause end for the JSON status (nil when
+// there is no pause — omitempty keeps the old schema).
+func ratePausePtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // runRefreshTask runs the refresh composition with a panic guard (T158): a

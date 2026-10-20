@@ -428,3 +428,116 @@ func TestStatusReportHasNoCredentials(t *testing.T) {
 		}
 	}
 }
+
+// T044 (FR-008): the pass report counts 429 events per pass and repo, keeps
+// last_retry_after_ms absent when no Retry-After was seen, and omits the rate
+// fields entirely when there was no 429 (zero is not serialized).
+func TestPassStatsRateLimitCounters(t *testing.T) {
+	sum := newSummary("index")
+	for i := 0; i < 10; i++ {
+		// 10 artificial 429 events across 10 repos (the text form matches the
+		// git-transport classification used by the lanes).
+		sum.countRepo(errors.New("git fetch: The requested URL returned error: 429"))
+	}
+	st := passStats(sum)
+	if st.RateLimitedCount != 10 || st.RateLimitedRepos != 10 {
+		t.Fatalf("counters = %d/%d, want 10/10", st.RateLimitedCount, st.RateLimitedRepos)
+	}
+	if st.LastRetryAfterMS != 0 || st.RatePauseUntil != "" {
+		t.Errorf("no Retry-After/pause expected: %+v", st)
+	}
+	if st.Phase != "rate_pause" {
+		t.Errorf("phase = %q, want rate_pause", st.Phase)
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"rate_limited_count":10`, `"rate_limited_repos":10`, `"phase":"rate_pause"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("report does not contain %s: %s", want, data)
+		}
+	}
+	if strings.Contains(string(data), "last_retry_after_ms") {
+		t.Errorf("last_retry_after_ms must be absent without Retry-After: %s", data)
+	}
+
+	// a typed Retry-After is carried in milliseconds.
+	sum2 := newSummary("index")
+	sum2.markRateLimit(7 * time.Second)
+	sum2.setRatePause(time.Now().Add(time.Minute).UTC().Truncate(time.Second))
+	if st2 := passStats(sum2); st2.LastRetryAfterMS != 7000 || st2.RatePauseUntil == "" {
+		t.Errorf("retry/pause = %d/%q, want 7000/non-empty", st2.LastRetryAfterMS, st2.RatePauseUntil)
+	}
+
+	// zero 429: the rate fields are absent, not zero.
+	bare, err := json.Marshal(passStats(newSummary("index")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{"rate_limited_count", "rate_limited_repos", "last_retry_after_ms", "rate_pause_until"} {
+		if strings.Contains(string(bare), absent) {
+			t.Errorf("zero-event report contains %s: %s", absent, bare)
+		}
+	}
+}
+
+// T044/T042: the provider-side 429 observation (transport) is merged into the
+// pass report as a per-pass delta.
+func TestPassStatsProviderRateLimitDelta(t *testing.T) {
+	deps := RepoDeps{
+		Cfg:    &config.Config{},
+		Logger: testLogger(),
+		VCS:    &fake.Provider{RateLimitEventCount: 10, LastRetry: 60 * time.Second},
+	}
+	rep := newStatusReporter(newStatusPublisher(&fakeStatusStore{}, testLogger()), deps, &snapshot{})
+	rep.recordPass(newSummary("index"))
+	st := rep.lastPass
+	if st == nil || st.RateLimitedCount != 10 || st.LastRetryAfterMS != 60000 || st.Phase != "rate_pause" {
+		t.Fatalf("last_pass = %+v, want 10 events / 60000ms / rate_pause", st)
+	}
+
+	// the same provider totals are not counted twice on the next pass.
+	rep.recordPass(newSummary("index"))
+	if st := rep.lastPass; st.RateLimitedCount != 0 {
+		t.Errorf("second pass re-counted the provider totals: %+v", st)
+	}
+}
+
+// T045 (FR-008): the counters survive the existing status KV publication path
+// with their exact JSON names.
+func TestStatusPublishesRateLimitCounters(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeStatusStore{}
+	deps := RepoDeps{
+		VCSType: "gitlab",
+		Engine:  gitengine.New(t.TempDir()),
+		Logger:  testLogger(),
+		Cfg:     &config.Config{},
+		VCS:     &fake.Provider{RateLimitEventCount: 3, LastRetry: time.Second},
+	}
+	snap := &snapshot{}
+	snap.set([]provider.Repo{{ID: "1", Namespace: "g", Path: "a"}})
+	rep, base := newTestReporter(t, store, snap, deps)
+
+	sum := newSummary("index")
+	sum.markRateLimit(0)
+	sum.setRatePause(time.Now().Add(time.Minute))
+	sum.markExcluded("g/b")
+	rep.recordPass(sum)
+	*base = base.Add(workerStatusInterval)
+	rep.tick(ctx)
+
+	data, ok := store.puts[workerStatusKey]
+	if !ok {
+		t.Fatal("no status was published")
+	}
+	for _, want := range []string{
+		`"rate_limited_count":4`, `"last_retry_after_ms":1000`, `"phase":"rate_pause"`,
+		`"excluded_sample":["g/b"]`, `"rate_pause_until":"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("published status does not contain %s: %s", want, data)
+		}
+	}
+}

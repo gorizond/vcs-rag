@@ -26,6 +26,10 @@ type refreshStatus struct {
 	MetaUpdated    int       `json:"meta_updated"`
 	Errors         []string  `json:"errors,omitempty"`
 	DurationMS     int64     `json:"duration_ms"`
+	// US4/US5: terminal-partial signal and the rate-limit pause end; the MCP
+	// refresh_repo statuses (rate_limited|budget_exhausted) read them.
+	Incomplete     bool       `json:"incomplete,omitempty"`
+	RatePauseUntil *time.Time `json:"rate_pause_until,omitempty"`
 }
 
 // RefreshResult is the outcome of one on-demand repository refresh (T111).
@@ -43,6 +47,9 @@ type RefreshResult struct {
 	Excluded []string
 	// Incomplete reports that at least one unit was left unprocessed (FR-009).
 	Incomplete bool
+	// RatePauseUntil is the end of the rate-limit pause when retries were
+	// exhausted (zero — no pause); the MCP refresh_repo response exposes it.
+	RatePauseUntil time.Time
 }
 
 // errRefreshTransient marks retryable resolve failures (an empty discovery
@@ -113,10 +120,11 @@ func isRateLimit(err error) bool {
 
 // retryUnit runs one unit under the FR-007 policy: only rate-limit failures
 // are retried, at most maxRetries times, with the pacer's growing interval
-// waitₙ = clamp(wait₀·2ⁿ + jitter, RetryFloor, RetryCap). A non-rate-limit
-// failure is returned immediately; an exhausted rate limit is returned as-is
-// so the caller can mark the unit unprocessed.
-func retryUnit(ctx context.Context, policy retryPolicy, fn func() error) error {
+// waitₙ = clamp(wait₀·2ⁿ + jitter, RetryFloor, RetryCap). onLimit (optional)
+// observes every 429 event (FR-008). A non-rate-limit failure is returned
+// immediately; an exhausted rate limit is returned as-is so the caller can
+// mark the unit unprocessed.
+func retryUnit(ctx context.Context, policy retryPolicy, onLimit func(time.Duration), fn func() error) error {
 	p := newPacerWithLimits(policy.cap, policy.floor, policy.cap)
 	for attempt := 0; ; attempt++ {
 		err := fn()
@@ -126,6 +134,9 @@ func retryUnit(ctx context.Context, policy retryPolicy, fn func() error) error {
 		retryAfter, limited := provider.IsRateLimit(err)
 		if !limited {
 			return err
+		}
+		if onLimit != nil {
+			onLimit(retryAfter)
 		}
 		if attempt >= policy.maxRetries {
 			return err
@@ -163,12 +174,21 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 			before = &MirrorState{}
 		}
 
+		// FR-003: the pass also works on one unit budget (commits + API pages).
+		if deps.stats == nil {
+			stats := newSummary("index")
+			stats.configureUnitBudget(passConfig(deps.Cfg).UpstreamMaxUnits)
+			deps.stats = stats
+		}
+
 		// runPhase applies the retry policy to one unit (a phase pass over the
 		// repository) and classifies the outcome: an access error excludes the
 		// unit (FR-012); an exhausted rate limit leaves it unprocessed and marks
 		// the pass incomplete (FR-007/FR-009); anything else is a phase error.
 		runPhase := func(phase string, fn func(context.Context) error) {
-			err := retryUnit(ctx, policy, func() error { return fn(ctx) })
+			err := retryUnit(ctx, policy, func(d time.Duration) {
+				deps.stats.markRateLimit(d) // FR-008: every 429 event counts
+			}, func() error { return fn(ctx) })
 			if err == nil || ctx.Err() != nil {
 				return
 			}
@@ -183,6 +203,12 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 			case isRateLimit(err):
 				res.Unprocessed = append(res.Unprocessed, unit)
 				res.Incomplete = true
+				deps.stats.markRateLimitedRepo()
+				d, _ := provider.IsRateLimit(err)
+				if d <= 0 {
+					d = policy.floor
+				}
+				res.RatePauseUntil = time.Now().Add(d)
 				if deps.Logger != nil {
 					deps.Logger.Warn("rate limit retries exhausted: unit left unprocessed",
 						"repo", repoName, "phase", phase, "err", err)
@@ -204,12 +230,6 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 		})
 		// phase 2: index new commits. A retry resumes from the per-commit
 		// checkpoints, so only the remaining units are processed (FR-004).
-		// FR-003: the pass also works on one unit budget (commits + API pages).
-		if deps.stats == nil {
-			stats := newSummary("index")
-			stats.configureUnitBudget(passConfig(deps.Cfg).UpstreamMaxUnits)
-			deps.stats = stats
-		}
 		runPhase("index", func(fctx context.Context) error {
 			return processRepoOnce(fctx, deps, repo, idx)
 		})

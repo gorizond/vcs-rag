@@ -68,6 +68,8 @@ type tools struct {
 
 	graph          GraphReader // nil — graph tools report qdrant_unavailable (T017–T019)
 	graphSchemaVer string      // WORKER_GRAPH_SCHEMA_VER, reported by graph_schema
+	// freshThreshold is WORKER_FRESH_THRESHOLD (FR-013); <=0 — the 24h default.
+	freshThreshold time.Duration
 }
 
 // statusReader reads the worker indexing status from the instance KV (T151).
@@ -184,6 +186,8 @@ type queryGraphEdge struct {
 // would route the error path through the output-schema validation.
 type resultsResponse[T any] struct {
 	Results []T `json:"results"`
+	// IndexFreshness annotates a repo-scoped answer (FR-013); nil — unscoped.
+	IndexFreshness *indexFreshness `json:"index_freshness,omitempty"`
 }
 
 // --- response items (contracts/mcp-tools.md) ---
@@ -240,6 +244,16 @@ type coverage struct {
 	Truncated     bool   `json:"truncated"`
 }
 
+// indexFreshness is the repo-scoped freshness annotation (FR-013,
+// contracts/mcp-tools.md). Reason is null for fresh, otherwise one of
+// stale_index | refresh_in_progress | last_refresh_failed.
+type indexFreshness struct {
+	IndexedAt string  `json:"indexed_at"`
+	Freshness string  `json:"freshness"` // fresh | stale | refreshing
+	Threshold string  `json:"threshold"` // WORKER_FRESH_THRESHOLD
+	Reason    *string `json:"reason"`    // null for fresh
+}
+
 // definitionHit — one definition node; commit_sha is always carried (honesty).
 type definitionHit struct {
 	Repo       string  `json:"repo"`
@@ -253,8 +267,9 @@ type definitionHit struct {
 }
 
 type definitionsResponse struct {
-	Results  []definitionHit `json:"results"`
-	Coverage []coverage      `json:"coverage"`
+	Results        []definitionHit `json:"results"`
+	Coverage       []coverage      `json:"coverage"`
+	IndexFreshness *indexFreshness `json:"index_freshness,omitempty"`
 }
 
 // importEdge — one edge_type=imports point.
@@ -266,8 +281,9 @@ type importEdge struct {
 }
 
 type importsResponse struct {
-	Results  []importEdge `json:"results"`
-	Coverage []coverage   `json:"coverage"`
+	Results        []importEdge    `json:"results"`
+	Coverage       []coverage      `json:"coverage"`
+	IndexFreshness *indexFreshness `json:"index_freshness,omitempty"`
 }
 
 // queryGraphResponse — T037: the traversal points (payload fields flattened,
@@ -388,6 +404,18 @@ type indexPassView struct {
 	Skipped        int64 `json:"skipped"`
 	Pruned         int64 `json:"pruned"`
 	DurationMS     int64 `json:"duration_ms"`
+	// US2 budget fields (kept 1:1 with the worker write model).
+	Unlimited         bool     `json:"unlimited,omitempty"`
+	BudgetExhausted   bool     `json:"budget_exhausted,omitempty"`
+	UnprocessedSample []string `json:"unprocessed_sample,omitempty"`
+	SharedAccountWarn bool     `json:"shared_account_warn,omitempty"`
+	// US4 rate-limit fields (contracts/status-report.md).
+	RateLimitedCount int64    `json:"rate_limited_count,omitempty"`
+	RateLimitedRepos int64    `json:"rate_limited_repos,omitempty"`
+	LastRetryAfterMS int64    `json:"last_retry_after_ms,omitempty"`
+	RatePauseUntil   string   `json:"rate_pause_until,omitempty"`
+	Phase            string   `json:"phase,omitempty"`
+	ExcludedSample   []string `json:"excluded_sample,omitempty"`
 }
 
 // workerStatusView is the worker_status_<id> KV payload (key "status").
@@ -550,7 +578,10 @@ func (t *tools) searchCode(ctx context.Context, _ *mcp.CallToolRequest, in searc
 			Snippet:   snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, resultsResponse[codeHit]{Results: hits}, nil
+	return nil, resultsResponse[codeHit]{
+		Results:        hits,
+		IndexFreshness: t.indexFreshness(ctx, t.scopedRepo(ctx, in.Repo)),
+	}, nil
 }
 
 // metadataFilter builds the shared issue/PR filter (T031): optional canonical
@@ -598,7 +629,10 @@ func (t *tools) searchPRs(ctx context.Context, _ *mcp.CallToolRequest, in metada
 			Snippet:      snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, resultsResponse[prHit]{Results: hits}, nil
+	return nil, resultsResponse[prHit]{
+		Results:        hits,
+		IndexFreshness: t.indexFreshness(ctx, t.scopedRepo(ctx, in.Repo)),
+	}, nil
 }
 
 // prFileHit — one MR/PR that changed the requested file, with its per-file
@@ -632,6 +666,9 @@ func (t *tools) searchPRsByFile(ctx context.Context, in metadataQueryInput, file
 	if len(repos) == 0 {
 		return nil, toolError{Code: codeInvalidInput, Message: "repo is required: mr_file points are namespaced by repository"}, nil
 	}
+	// The annotation scan runs first: the mr_file lookup stays the last scroll
+	// (existing tool tests pin it as the observed filter).
+	fresh := t.indexFreshness(ctx, t.scopedRepo(ctx, in.Repo))
 	f := &qdrant.Filter{Must: []*qdrant.Condition{
 		qdrant.NewMatch("kind", string(graph.KindMrFile)),
 		repoKeyword(repos),
@@ -680,7 +717,7 @@ func (t *tools) searchPRsByFile(ctx context.Context, in metadataQueryInput, file
 		}
 		return hits[i].PRID < hits[j].PRID
 	})
-	return nil, resultsResponse[prFileHit]{Results: hits}, nil
+	return nil, resultsResponse[prFileHit]{Results: hits, IndexFreshness: fresh}, nil
 }
 
 // searchIssues — issue search (T072).
@@ -709,7 +746,10 @@ func (t *tools) searchIssues(ctx context.Context, _ *mcp.CallToolRequest, in met
 			Snippet: snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, resultsResponse[issueHit]{Results: hits}, nil
+	return nil, resultsResponse[issueHit]{
+		Results:        hits,
+		IndexFreshness: t.indexFreshness(ctx, t.scopedRepo(ctx, in.Repo)),
+	}, nil
 }
 
 // searchCIFailures — search over failed CI job logs (T073).
@@ -740,7 +780,10 @@ func (t *tools) searchCIFailures(ctx context.Context, _ *mcp.CallToolRequest, in
 			Snippet:    snippet(payloadString(p.Payload, "text")),
 		})
 	}
-	return nil, resultsResponse[ciHit]{Results: hits}, nil
+	return nil, resultsResponse[ciHit]{
+		Results:        hits,
+		IndexFreshness: t.indexFreshness(ctx, t.scopedRepo(ctx, in.Repo)),
+	}, nil
 }
 
 // --- graph tools (T017–T019) ---
@@ -790,11 +833,11 @@ func (t *tools) searchDefinitions(ctx context.Context, _ *mcp.CallToolRequest, i
 // definitionsResult attaches the best-effort coverage notice (T057 markers);
 // a repo without a marker keeps indexed_commit empty (unknown).
 func (t *tools) definitionsResult(ctx context.Context, repos []string, hits []definitionHit) (*mcp.CallToolResult, any, error) {
-	cov, err := t.coverageNotice(ctx, repos, hits)
+	cov, fresh, err := t.coverageFreshness(ctx, repos, hits)
 	if err != nil {
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
-	return nil, definitionsResponse{Results: hits, Coverage: cov}, nil
+	return nil, definitionsResponse{Results: hits, Coverage: cov, IndexFreshness: fresh}, nil
 }
 
 // getImports — direct 1-hop imports of a file/package (T018): what the input
@@ -855,11 +898,11 @@ func (t *tools) graphEdges(ctx context.Context, in graphEdgesInput, defaultDir s
 			if len(pkgs) == 0 {
 				// No indexed definitions for the file → no package to look up:
 				// nothing can match to_package_name (honest empty result, R2).
-				cov, err := t.coverageNotice(ctx, repos, nil)
+				cov, fresh, err := t.coverageFreshness(ctx, repos, nil)
 				if err != nil {
 					return nil, errorResult(ctx, codeSearchFailed, err), nil
 				}
-				return nil, importsResponse{Results: []importEdge{}, Coverage: cov}, nil
+				return nil, importsResponse{Results: []importEdge{}, Coverage: cov, IndexFreshness: fresh}, nil
 			}
 			// filePackages returns the bare package names of the file's
 			// definition nodes — the to_package_name spelling of the edges.
@@ -870,11 +913,11 @@ func (t *tools) graphEdges(ctx context.Context, in graphEdgesInput, defaultDir s
 	if err != nil {
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
-	cov, err := t.coverageNotice(ctx, repos, nil)
+	cov, fresh, err := t.coverageFreshness(ctx, repos, nil)
 	if err != nil {
 		return nil, errorResult(ctx, codeSearchFailed, err), nil
 	}
-	return nil, importsResponse{Results: edges, Coverage: cov}, nil
+	return nil, importsResponse{Results: edges, Coverage: cov, IndexFreshness: fresh}, nil
 }
 
 // --- query_graph (T037/T016) ---
@@ -1596,6 +1639,13 @@ func (t *tools) fetchCoverage(ctx context.Context, repos []string) ([]schemaCove
 // and truncated come from the repo's marker (a missing marker → empty
 // indexed_commit; the marker carries no truncation flag yet → false).
 func (t *tools) coverageNotice(ctx context.Context, repos []string, hits []definitionHit) ([]coverage, error) {
+	cov, _, err := t.coverageFreshness(ctx, repos, hits)
+	return cov, err
+}
+
+// coverageFreshness builds the coverage notice AND the freshness annotation
+// from ONE coverage-marker scan (the graph responses pin the scan count).
+func (t *tools) coverageFreshness(ctx context.Context, repos []string, hits []definitionHit) ([]coverage, *indexFreshness, error) {
 	if len(repos) == 0 {
 		seen := map[string]bool{}
 		for _, h := range hits {
@@ -1607,11 +1657,11 @@ func (t *tools) coverageNotice(ctx context.Context, repos []string, hits []defin
 		sort.Strings(repos)
 	}
 	if len(repos) == 0 {
-		return []coverage{}, nil
+		return []coverage{}, nil, nil
 	}
 	marks, err := t.fetchCoverage(ctx, repos)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	byRepo := make(map[string]schemaCoverage, len(marks))
 	for _, m := range marks {
@@ -1626,7 +1676,104 @@ func (t *tools) coverageNotice(ctx context.Context, repos []string, hits []defin
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	return out, t.freshnessFromMarks(repos, byRepo), nil
+}
+
+// defaultFreshThreshold is the FR-010 fallback when the config is zero-valued.
+const defaultFreshThreshold = 24 * time.Hour
+
+// freshWindow returns the configured WORKER_FRESH_THRESHOLD (24h default).
+func (t *tools) freshWindow() time.Duration {
+	if t.freshThreshold > 0 {
+		return t.freshThreshold
+	}
+	return defaultFreshThreshold
+}
+
+// shortDuration renders the threshold in the contract form ("24h", "90m").
+func shortDuration(d time.Duration) string {
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int64(d/time.Hour))
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int64(d/time.Minute))
+	}
+	return d.String()
+}
+
+// scopedRepo returns the one full repo name when the input is repo-scoped;
+// "" for an unscoped (or ambiguous) search — no single freshness to report.
+func (t *tools) scopedRepo(ctx context.Context, raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	if repos := t.graphRepos(ctx, raw); len(repos) == 1 {
+		return repos[0]
+	}
+	return ""
+}
+
+// indexFreshness annotates a repo-scoped answer (FR-013): one coverage scan.
+func (t *tools) indexFreshness(ctx context.Context, repo string) *indexFreshness {
+	if repo == "" || t.graph == nil {
+		return nil
+	}
+	marks, err := t.fetchCoverage(ctx, []string{repo})
+	if err != nil {
+		return nil
+	}
+	byRepo := make(map[string]schemaCoverage, len(marks))
+	for _, m := range marks {
+		byRepo[m.Repo] = m
+	}
+	return t.freshnessFromMarks([]string{repo}, byRepo)
+}
+
+// remoteRefreshActive reports a live worker pass for the repo from the
+// refresh KV (the auto/worker-triggered refreshes do not use the local flight
+// group). Nil refresher — false.
+func (t *tools) remoteRefreshActive(repo string) bool {
+	sr, ok := t.refresher.(interface {
+		Status(string) (refreshStatus, bool)
+	})
+	if !ok {
+		return false
+	}
+	st, ok := sr.Status(repo)
+	return ok && st.State == "in_progress"
+}
+
+// freshnessFromMarks classifies a single-repo answer: refreshing while a
+// refresh is in flight, otherwise fresh/stale by indexed_at vs the threshold.
+// The annotation never hides results; nil when the marker/date is absent.
+func (t *tools) freshnessFromMarks(repos []string, byRepo map[string]schemaCoverage) *indexFreshness {
+	if len(repos) != 1 {
+		return nil
+	}
+	repo := repos[0]
+	m, ok := byRepo[repo]
+	if !ok || m.IndexedAt == "" {
+		return nil
+	}
+	f := &indexFreshness{IndexedAt: m.IndexedAt, Threshold: shortDuration(t.freshWindow())}
+	if t.inflight.active(refreshSlug(repo)) || t.remoteRefreshActive(repo) {
+		f.Freshness = "refreshing"
+		reason := "refresh_in_progress"
+		f.Reason = &reason
+		return f
+	}
+	at, err := time.Parse(time.RFC3339, m.IndexedAt)
+	if err != nil {
+		return nil
+	}
+	if time.Since(at) > t.freshWindow() {
+		f.Freshness = "stale"
+		reason := "stale_index"
+		f.Reason = &reason
+	} else {
+		f.Freshness = "fresh"
+	}
+	return f
 }
 
 // graphRepos resolves the raw repo input to the canonical full names used by

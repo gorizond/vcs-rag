@@ -52,6 +52,8 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	// ceiling of the new families — come from configuration too.
 	graph.SetQueryCaps(cfg.MCP.GraphPathMaxDepth, cfg.MCP.GraphMaxEdgesPerNode)
 	tl.graphSchemaVer = cfg.Worker.GraphSchemaVer
+	// FR-013: the freshness annotation threshold (T046).
+	tl.freshThreshold = cfg.Worker.FreshThreshold
 	// T132: the repository list index resolves short-form repo filters without
 	// extra API calls; the provider constructor makes no network calls, and a
 	// failure only degrades to the raw path (the search keeps working).

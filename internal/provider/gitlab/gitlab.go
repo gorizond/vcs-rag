@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 
@@ -65,6 +66,14 @@ func (c *Client) RateUsage() (float64, bool) { return c.upstream.usage() }
 
 // Pages returns the API page responses served since start (FR-003).
 func (c *Client) Pages() int64 { return c.upstream.pages.Load() }
+
+// RateLimitEvents returns the 429 responses observed since start (FR-008).
+func (c *Client) RateLimitEvents() int64 { return c.upstream.four29s.Load() }
+
+// LastRetryAfter returns the last Retry-After carried by a 429 (FR-008).
+func (c *Client) LastRetryAfter() time.Duration {
+	return time.Duration(c.upstream.retry.Load())
+}
 
 // SetPageCharger installs the per-page budget hook (FR-003); nil removes it.
 func (c *Client) SetPageCharger(fn func()) { c.upstream.setPageCharger(fn) }
