@@ -119,6 +119,8 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 	sum := newSummary("index")
 	// FR-003/FR-010: ONE unit budget per pass (commits + API pages); 0 = unlimited.
 	sum.configureUnitBudget(passConfig(cfg).UpstreamMaxUnits)
+	// T064: API pages served during this pass are charged to this budget.
+	ctx = passContext(ctx, sum)
 	deps.stats = sum
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup

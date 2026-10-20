@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -81,6 +82,13 @@ func newSummary(phase string) *summary {
 	s.metaDeleteBudget.Store(metaDeletePerPass)
 	s.commitBudget.Store(int64(indexMaxCommitsPerPass))
 	return s
+}
+
+// passContext attaches the per-pass page charger (T064): every API page served
+// under the returned context consumes one unit of this pass budget. A context
+// charger is per-pass, so concurrent lanes never charge one page twice.
+func passContext(ctx context.Context, sum *summary) context.Context {
+	return provider.WithPageCharger(ctx, func() { sum.reserveUnit() })
 }
 
 // configureUnitBudget applies WORKER_UPSTREAM_MAX_UNITS to this pass (FR-003):

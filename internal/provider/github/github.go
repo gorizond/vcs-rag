@@ -24,6 +24,7 @@ type Client struct {
 	repos    []string
 	ciWindow int
 	logsHTTP *http.Client
+	upstream *upstreamTransport
 }
 
 // New creates the GitHub client; it makes no network calls.
@@ -32,7 +33,9 @@ type Client struct {
 // is an error in go-github, and an anonymous client is exactly the tokenless
 // one; the option is added only for a non-empty token.
 func New(cfg *config.Config) (*Client, error) {
-	var opts []gh.ClientOptionsFunc
+	tr := &upstreamTransport{base: http.DefaultTransport}
+	tr.gate.Store(provider.NewUpstreamGate(cfg.Worker.UpstreamConcurrency))
+	opts := []gh.ClientOptionsFunc{gh.WithHTTPClient(&http.Client{Transport: tr})}
 	if cfg.Provider.GitHubToken != "" {
 		opts = append(opts, gh.WithAuthToken(cfg.Provider.GitHubToken))
 	}
@@ -54,7 +57,44 @@ func New(cfg *config.Config) (*Client, error) {
 		ciWindow: ciWindow,
 		// Actions log download goes via the signed redirect URL, without Authorization.
 		logsHTTP: &http.Client{Timeout: 60 * time.Second},
+		upstream: tr,
 	}, nil
+}
+
+// SetUpstreamGate shares the instance-wide upstream semaphore with the worker
+// (FR-002): git clone/fetch and API traffic draw from one gate.
+func (c *Client) SetUpstreamGate(g *provider.UpstreamGate) {
+	if g != nil {
+		c.upstream.gate.Store(g)
+	}
+}
+
+// SetUpstreamQueue shares the bounded FR-011 queue with the worker: an API
+// request over capacity fails with provider.ErrTooManyTasks instead of waiting
+// indefinitely (T063).
+func (c *Client) SetUpstreamQueue(q *provider.UpstreamQueue) {
+	if q != nil {
+		c.upstream.queue.Store(q)
+	}
+}
+
+// SetPageCharger installs the per-page budget hook (FR-003); nil removes it.
+func (c *Client) SetPageCharger(fn func()) { c.upstream.setPageCharger(fn) }
+
+// RateUsage exposes the authenticated budget consumption from the last
+// X-RateLimit-* headers (FR-015); ok=false — headers were absent.
+func (c *Client) RateUsage() (float64, bool) { return c.upstream.usage() }
+
+// Pages returns the API page responses served since start (FR-003).
+func (c *Client) Pages() int64 { return c.upstream.pages.Load() }
+
+// RateLimitEvents returns the rate-limit responses observed since start
+// (primary 403 + secondary 429; FR-008).
+func (c *Client) RateLimitEvents() int64 { return c.upstream.rateEvents.Load() }
+
+// LastRetryAfter returns the last Retry-After carried by a 429 (FR-008).
+func (c *Client) LastRetryAfter() time.Duration {
+	return time.Duration(c.upstream.retry.Load())
 }
 
 // Type returns "github".

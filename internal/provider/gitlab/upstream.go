@@ -67,6 +67,7 @@ func (b *tokenBucket) wait(ctx context.Context) error {
 type upstreamTransport struct {
 	base  http.RoundTripper
 	gate  atomic.Pointer[provider.UpstreamGate]
+	queue atomic.Pointer[provider.UpstreamQueue]
 	pages atomic.Int64
 	// US4/FR-008: 429 responses and the last Retry-After seen on one.
 	four29s atomic.Int64
@@ -86,7 +87,7 @@ func (t *upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if err := t.waitCooldown(req.Context()); err != nil {
 		return nil, err
 	}
-	release, err := t.gate.Load().Acquire(req.Context())
+	release, err := t.acquire(req.Context())
 	if err != nil {
 		return nil, err
 	}
@@ -103,8 +104,18 @@ func (t *upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 	}
 	t.observe(resp.Header)
-	t.charge()
+	t.charge(req.Context())
 	return resp, nil
+}
+
+// acquire takes one slot of the shared queue (gate + FR-011 bound) when the
+// worker wired it; without a queue it falls back to the plain gate. An
+// overflow returns provider.ErrTooManyTasks without waiting (T063).
+func (t *upstreamTransport) acquire(ctx context.Context) (func(), error) {
+	if q := t.queue.Load(); q != nil {
+		return q.Acquire(ctx)
+	}
+	return t.gate.Load().Acquire(ctx)
 }
 
 // waitCooldown blocks until the proactive rate-limit pause expires (R3).
@@ -154,7 +165,13 @@ func (t *upstreamTransport) usage() (float64, bool) {
 	return float64(t.limit-t.remaining) / float64(t.limit), true
 }
 
-func (t *upstreamTransport) charge() {
+// charge consumes exactly one page unit: the per-pass context charger wins
+// over the client-wide fallback, so concurrent lanes never double-charge a
+// page (T064).
+func (t *upstreamTransport) charge(ctx context.Context) {
+	if provider.ChargePage(ctx) {
+		return
+	}
 	t.chargerMu.Lock()
 	fn := t.charger
 	t.chargerMu.Unlock()

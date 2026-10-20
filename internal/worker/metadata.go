@@ -69,10 +69,9 @@ func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 	// served while the pass runs; concurrent lanes share the instance upstream
 	// budget, so this over-approximates rather than under-counts.
 	sum.configureUnitBudget(passConfig(cfg).UpstreamMaxUnits)
-	if charger, ok := deps.VCS.(provider.PageCharger); ok {
-		charger.SetPageCharger(func() { sum.reserveUnit() })
-		defer charger.SetPageCharger(nil)
-	}
+	// FR-003/T064: the per-pass charger travels in the context, so concurrent
+	// lanes charge their own budgets and one page never hits two passes.
+	ctx = passContext(ctx, sum)
 	deps.stats = sum
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
