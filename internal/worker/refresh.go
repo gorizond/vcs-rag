@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -196,21 +197,43 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 		runPhase("mirror", func(fctx context.Context) error {
 			fetchCtx, cancel := context.WithTimeout(fctx, refreshFetchTimeout)
 			defer cancel()
-			_, err := deps.Engine.EnsureMirror(fetchCtx, deps.VCSType, repo)
-			return err
+			return deps.runUpstream(fetchCtx, func() error {
+				_, err := deps.Engine.EnsureMirror(fetchCtx, deps.VCSType, repo)
+				return err
+			})
 		})
 		// phase 2: index new commits. A retry resumes from the per-commit
 		// checkpoints, so only the remaining units are processed (FR-004).
+		// FR-003: the pass also works on one unit budget (commits + API pages).
+		if deps.stats == nil {
+			stats := newSummary("index")
+			stats.configureUnitBudget(passConfig(deps.Cfg).UpstreamMaxUnits)
+			deps.stats = stats
+		}
 		runPhase("index", func(fctx context.Context) error {
 			return processRepoOnce(fctx, deps, repo, idx)
 		})
+		budgetStopped := deps.stats.budgetExhausted.Load()
+		if budgetStopped {
+			// The checkpoint is the resume point; coverage (IndexedAt) was not
+			// advanced. The pass is honestly incomplete (FR-003/FR-009).
+			if unit := repoName + ":index"; !slices.Contains(res.Unprocessed, unit) {
+				res.Unprocessed = append(res.Unprocessed, unit)
+			}
+			res.Incomplete = true
+			if deps.Logger != nil {
+				deps.Logger.Info("upstream unit budget exhausted: refresh left incomplete",
+					"repo", repoName, "sample", deps.stats.unprocessedSample())
+			}
+		}
 		if after, err := LoadState(statePath); err == nil {
 			res.CommitsIndexed = indexedDelta(before.Branches, after.Branches)
 		}
 		// phase 2b (T020): graph extraction for the refreshed repository — the
 		// same entry point as the graph lane, on the freshly fetched mirror.
 		// Best-effort like the other phases: a failure is collected, not fatal.
-		if gs := refreshGraphStore(deps); gs != nil {
+		// A budget-exhausted pass stops here: the remaining work is resumed.
+		if gs := refreshGraphStore(deps); gs != nil && !budgetStopped {
 			if _, err := processGraphRepo(ctx, deps.Cfg, deps, gs, repo, int(time.Now().Unix())); err != nil {
 				res.Errors = append(res.Errors, "graph: "+err.Error())
 			}
@@ -222,6 +245,8 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 		switch {
 		case err != nil:
 			res.Errors = append(res.Errors, "state: "+err.Error())
+		case budgetStopped:
+			// skip: the unit budget is spent; resume next pass
 		case origin == "auto" && !metaBefore.MetaSyncedAt.IsZero() &&
 			time.Since(metaBefore.MetaSyncedAt) < metaAutoFresh:
 			// skip: the metadata phase is fresh enough

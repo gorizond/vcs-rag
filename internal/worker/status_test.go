@@ -14,6 +14,7 @@ import (
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/gitengine"
 	"github.com/gorizond/vcs-rag/internal/provider"
+	"github.com/gorizond/vcs-rag/internal/provider/fake"
 )
 
 // fakeStatusStore records the published KV entries.
@@ -340,5 +341,53 @@ func TestNatsStatusStoreEmbedded(t *testing.T) {
 	// a second Put reuses the ensured bucket.
 	if err := store.Put(workerStatusKey, []byte(`{"repos_total":2}`)); err != nil {
 		t.Fatalf("second Put: %v", err)
+	}
+}
+
+// T029/T030 (FR-015): with VCS_DEDUP_ACCOUNT=1 the pass report warns when the
+// authenticated account budget is >80% consumed — headers first, the instance
+// page count as the header-less fallback, never a shared counter.
+func TestSharedAccountWarn(t *testing.T) {
+	newRep := func(usage float64, usageOK bool, pages int64) (*statusReporter, *summary) {
+		deps := RepoDeps{Cfg: &config.Config{}, Logger: testLogger()}
+		deps.Cfg.Worker.SharedAccountWarn = true
+		deps.VCS = &fake.Provider{AccountUsage: usage, AccountUsageOK: usageOK, PageCount: pages}
+		return newStatusReporter(newStatusPublisher(&fakeStatusStore{}, testLogger()), deps, &snapshot{}), newSummary("index")
+	}
+
+	rep, sum := newRep(0.9, true, 0)
+	rep.recordPass(sum)
+	if rep.lastPass == nil || !rep.lastPass.SharedAccountWarn {
+		t.Fatalf("last_pass = %+v, want shared_account_warn", rep.lastPass)
+	}
+	data, err := json.Marshal(rep.lastPass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"shared_account_warn":true`) {
+		t.Errorf("report does not carry the flag: %s", data)
+	}
+
+	// below the threshold — no warning.
+	rep, sum = newRep(0.5, true, 0)
+	rep.recordPass(sum)
+	if rep.lastPass.SharedAccountWarn {
+		t.Error("a 50% usage must not warn")
+	}
+
+	// no headers: the instance page count is compared with 5000/h.
+	rep, sum = newRep(0, false, 4100)
+	rep.recordPass(sum)
+	if !rep.lastPass.SharedAccountWarn {
+		t.Error("the header-less fallback did not warn above 80%")
+	}
+
+	// the feature is off by default (VCS_DEDUP_ACCOUNT unset).
+	deps := RepoDeps{Cfg: &config.Config{}, Logger: testLogger()}
+	deps.VCS = &fake.Provider{AccountUsage: 0.99, AccountUsageOK: true}
+	rep = newStatusReporter(newStatusPublisher(&fakeStatusStore{}, testLogger()), deps, &snapshot{})
+	rep.recordPass(newSummary("index"))
+	if rep.lastPass.SharedAccountWarn {
+		t.Error("the warning must be gated by Worker.SharedAccountWarn")
 	}
 }

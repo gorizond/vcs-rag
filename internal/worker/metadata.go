@@ -65,10 +65,26 @@ func metadataAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *s
 		return nil
 	}
 	sum := newSummary("metadata")
+	// FR-003: API pages are units too. The provider charges every page response
+	// served while the pass runs; concurrent lanes share the instance upstream
+	// budget, so this over-approximates rather than under-counts.
+	sum.configureUnitBudget(passConfig(cfg).UpstreamMaxUnits)
+	if charger, ok := deps.VCS.(provider.PageCharger); ok {
+		charger.SetPageCharger(func() { sum.reserveUnit() })
+		defer charger.SetPageCharger(nil)
+	}
 	deps.stats = sum
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
-	for _, repo := range repos {
+	for i, repo := range repos {
+		// Stop dispatching once the unit budget is spent; the rest is resumed
+		// by the next pass (incremental metadata).
+		if sum.budgetExhausted.Load() {
+			for _, left := range repos[i:] {
+				sum.markUnprocessed(left.Namespace + "/" + left.Path)
+			}
+			break
+		}
 		wg.Add(1)
 		go func(repo provider.Repo) {
 			defer wg.Done()

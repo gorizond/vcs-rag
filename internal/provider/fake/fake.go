@@ -23,7 +23,20 @@ type Provider struct {
 	ErrListChangeRequests error
 	ErrListPipelines      error
 	ErrPipelineLogTail    error
+
+	// Optional provider capabilities (FR-015/FR-003): the account usage read
+	// from RateLimit-* headers and the served page count. AccountUsageOK=false
+	// models a response without headers.
+	AccountUsage   float64
+	AccountUsageOK bool
+	PageCount      int64
 }
+
+// RateUsage implements provider.RateLimitObserver (FR-015).
+func (p *Provider) RateUsage() (float64, bool) { return p.AccountUsage, p.AccountUsageOK }
+
+// Pages implements provider.PageCounter (FR-003).
+func (p *Provider) Pages() int64 { return p.PageCount }
 
 // Type returns "fake".
 func (p *Provider) Type() string { return "fake" }

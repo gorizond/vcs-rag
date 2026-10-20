@@ -26,7 +26,11 @@ type RepoDeps struct {
 	Store   *store.Store
 	Cfg     *config.Config
 	Logger  *slog.Logger
-	stats   *summary // optional pass counters (T060)
+	// Upstream/Queue are the instance-wide FR-002/FR-011 gate shared by the
+	// git and API paths (nil — narrow unit tests run unthrottled).
+	Upstream *provider.UpstreamGate
+	Queue    *upstreamQueue
+	stats    *summary // optional pass counters (T060)
 }
 
 // indexMaxCommitsPerPass caps the commits indexed by one pass: the backfill of
@@ -109,13 +113,18 @@ func indexAll(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snap
 		return nil
 	}
 	sum := newSummary("index")
+	// FR-003/FR-010: ONE unit budget per pass (commits + API pages); 0 = unlimited.
+	sum.configureUnitBudget(passConfig(cfg).UpstreamMaxUnits)
 	deps.stats = sum
 	p := newPool(cfg.Worker.Concurrency)
 	var wg sync.WaitGroup
-	for _, repo := range repos {
+	for i, repo := range repos {
 		// T160: nothing new is dispatched once the pass budget is exhausted
 		// (running repositories stop at their next commit reservation).
 		if sum.budgetExhausted.Load() {
+			for _, left := range repos[i:] {
+				sum.markUnprocessed(left.Namespace + "/" + left.Path)
+			}
 			break
 		}
 		wg.Add(1)
@@ -155,7 +164,12 @@ func ProcessRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) err
 func processRepoOnce(ctx context.Context, deps RepoDeps, repo provider.Repo, st indexStore) error {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
 
-	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
+	var mirror string
+	err := deps.runUpstream(ctx, func() error {
+		var err error
+		mirror, err = deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("mirror: %w", err)
 	}
@@ -249,6 +263,7 @@ func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provi
 		// T160: the per-pass commit budget — a huge backfill must not occupy
 		// the embeddings backend for hours; the checkpoints keep the progress.
 		if deps.stats != nil && !deps.stats.reserveCommit() {
+			deps.stats.markUnprocessed(repo.Namespace + "/" + repo.Path)
 			return BranchState{}, errIndexBudget
 		}
 		if err := processCommit(ctx, deps, st, repo, mirror, branch, sha, reader, lg); err != nil {

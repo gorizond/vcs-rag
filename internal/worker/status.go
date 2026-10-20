@@ -14,6 +14,7 @@ import (
 
 	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/gitengine"
+	"github.com/gorizond/vcs-rag/internal/provider"
 )
 
 // Worker indexing status (T150). At most once per minute the worker publishes
@@ -42,6 +43,12 @@ type indexPassStats struct {
 	Skipped        int64 `json:"skipped"`
 	Pruned         int64 `json:"pruned"`
 	DurationMS     int64 `json:"duration_ms"`
+	// US2 budget report (FR-003/FR-010/FR-015). The remaining US4 counters
+	// (rate_limited_*, phase) are owned by that story.
+	Unlimited         bool     `json:"unlimited,omitempty"`
+	BudgetExhausted   bool     `json:"budget_exhausted,omitempty"`
+	UnprocessedSample []string `json:"unprocessed_sample,omitempty"`
+	SharedAccountWarn bool     `json:"shared_account_warn,omitempty"`
 }
 
 // workerStatus is the published payload (the MCP read model repeats it in
@@ -142,6 +149,15 @@ func (r *statusReporter) recordPass(sum *summary) {
 		return
 	}
 	st := passStats(sum)
+	if r.deps.Cfg != nil && r.deps.Cfg.Worker.SharedAccountWarn {
+		if used, ok := sharedAccountUsage(r.deps.VCS); ok && used > sharedAccountWarnThreshold {
+			st.SharedAccountWarn = true
+			if r.deps.Logger != nil {
+				r.deps.Logger.Warn("shared account budget above 80%: coordinate the instances",
+					"used", used, "reference", "Free sustained 5000/h")
+			}
+		}
+	}
 	r.mu.Lock()
 	r.lastPass = st
 	r.mu.Unlock()
@@ -187,15 +203,41 @@ func (r *statusReporter) tick(ctx context.Context) {
 // passStats snapshots the counters of one completed pass.
 func passStats(sum *summary) *indexPassStats {
 	return &indexPassStats{
-		Repos:          sum.repos.Load(),
-		OK:             sum.ok.Load(),
-		Errors:         sum.failed.Load(),
-		IndexedCommits: sum.indexed.Load(),
-		Resumed:        sum.resumed.Load(),
-		Skipped:        sum.skipped.Load(),
-		Pruned:         sum.pruned.Load(),
-		DurationMS:     time.Since(sum.start).Milliseconds(),
+		Repos:             sum.repos.Load(),
+		OK:                sum.ok.Load(),
+		Errors:            sum.failed.Load(),
+		IndexedCommits:    sum.indexed.Load(),
+		Resumed:           sum.resumed.Load(),
+		Skipped:           sum.skipped.Load(),
+		Pruned:            sum.pruned.Load(),
+		DurationMS:        time.Since(sum.start).Milliseconds(),
+		Unlimited:         sum.unlimited.Load(),
+		BudgetExhausted:   sum.budgetExhausted.Load(),
+		UnprocessedSample: sum.unprocessedSample(),
 	}
+}
+
+// sharedAccountWarnThreshold is the FR-015 soft warning level (80%).
+const sharedAccountWarnThreshold = 0.8
+
+// freeSustainedPerHour is the GitLab.com Free authenticated sustained budget;
+// the header-less fallback compares the instance page count against it.
+const freeSustainedPerHour = 5000
+
+// sharedAccountUsage reports the authenticated account budget consumption:
+// RateLimit-* headers when the provider exposes them, otherwise the instance
+// page count against the Free sustained reference (FR-015). Soft coordination
+// only — there is no shared counter between instances.
+func sharedAccountUsage(v provider.VCSProvider) (float64, bool) {
+	if obs, ok := v.(provider.RateLimitObserver); ok {
+		if used, ok := obs.RateUsage(); ok {
+			return used, true
+		}
+	}
+	if pc, ok := v.(provider.PageCounter); ok {
+		return float64(pc.Pages()) / freeSustainedPerHour, true
+	}
+	return 0, false
 }
 
 // collectWorkerStatus builds the status from the discovery snapshot and the

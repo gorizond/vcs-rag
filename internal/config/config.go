@@ -104,6 +104,9 @@ type Worker struct {
 	MaxRetries          int           // WORKER_UPSTREAM_MAX_RETRIES (default 5)
 	UpstreamQueueLimit  int           // WORKER_UPSTREAM_QUEUE_LIMIT (default 1000)
 	FreshThreshold      time.Duration // WORKER_FRESH_THRESHOLD (default 24h)
+	// SharedAccountWarn enables the soft FR-015 warning when the authenticated
+	// account budget is >80% consumed (VCS_DEDUP_ACCOUNT=1).
+	SharedAccountWarn bool // VCS_DEDUP_ACCOUNT (default 0)
 }
 
 // MCP is the MCP server transport (FR-013) and query-mode caps.
@@ -342,6 +345,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	sharedAccountWarn, err := envBool("VCS_DEDUP_ACCOUNT", false)
+	if err != nil {
+		return nil, err
+	}
 	cfg.Worker = Worker{
 		Interval:             interval,
 		MetaInterval:         metaInterval,
@@ -365,6 +372,7 @@ func Load() (*Config, error) {
 		MaxRetries:          maxRetries,
 		UpstreamQueueLimit:  upstreamQueueLimit,
 		FreshThreshold:      freshThreshold,
+		SharedAccountWarn:   sharedAccountWarn,
 	}
 
 	// --- NATS (T108/T117): empty URL — the refresh mode is off; the instance

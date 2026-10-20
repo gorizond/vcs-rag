@@ -2,6 +2,7 @@ package worker
 
 import (
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,9 +28,14 @@ type summary struct {
 	rateLimit  atomic.Bool
 	retryAfter atomic.Int64 // nanoseconds
 
-	// T160: the per-pass commit budget of the index lane.
+	// T160: the per-pass unit budget of the index lane (1 commit OR 1 API page,
+	// FR-003). unlimited — WORKER_UPSTREAM_MAX_UNITS=0 (FR-010).
 	commitBudget    atomic.Int64
 	budgetExhausted atomic.Bool
+	unlimited       atomic.Bool
+
+	unprocessedMu sync.Mutex
+	unprocessed   []string // ≤10 examples of units left by an exhausted budget
 
 	// repo-GC counters (T140).
 	gcKnown           atomic.Int64
@@ -58,6 +64,9 @@ type summary struct {
 // metaDeletePerPass caps the entity deletions of one metadata pass (T140).
 const metaDeletePerPass = 128
 
+// unprocessedSampleMax bounds the pass report sample (data-model: ≤10).
+const unprocessedSampleMax = 10
+
 // newSummary starts a lane pass.
 func newSummary(phase string) *summary {
 	s := &summary{phase: phase, start: time.Now()}
@@ -66,9 +75,25 @@ func newSummary(phase string) *summary {
 	return s
 }
 
-// reserveCommit consumes one slot of the index pass commit budget (T160) and
-// reports whether it is available; exhaustion is flagged once for the pass log.
-func (s *summary) reserveCommit() bool {
+// configureUnitBudget applies WORKER_UPSTREAM_MAX_UNITS to this pass (FR-003):
+// 0 means unlimited and is flagged in the report (FR-010); a positive value is
+// the ceiling, replacing the legacy indexMaxCommitsPerPass default (the var
+// stays functional for unit tests that build a config bypassing Load).
+func (s *summary) configureUnitBudget(units int) {
+	switch {
+	case units == 0:
+		s.unlimited.Store(true)
+	case units > 0:
+		s.commitBudget.Store(int64(units))
+	}
+}
+
+// reserveUnit consumes one slot of the pass budget: 1 commit or 1 API page
+// (FR-003); an unlimited pass always succeeds. Exhaustion is flagged once.
+func (s *summary) reserveUnit() bool {
+	if s.unlimited.Load() {
+		return true
+	}
 	for {
 		n := s.commitBudget.Load()
 		if n <= 0 {
@@ -79,6 +104,30 @@ func (s *summary) reserveCommit() bool {
 			return true
 		}
 	}
+}
+
+// reserveCommit consumes one slot of the index pass commit budget (T160) and
+// reports whether it is available; exhaustion is flagged once for the pass log.
+func (s *summary) reserveCommit() bool { return s.reserveUnit() }
+
+// markUnprocessed records up to 10 examples of units left by an exhausted
+// budget (FR-003); the full resume point is the per-commit checkpoint.
+func (s *summary) markUnprocessed(names ...string) {
+	s.unprocessedMu.Lock()
+	defer s.unprocessedMu.Unlock()
+	for _, name := range names {
+		if len(s.unprocessed) >= unprocessedSampleMax {
+			return
+		}
+		s.unprocessed = append(s.unprocessed, name)
+	}
+}
+
+// unprocessedSample copies the bounded sample for the pass report.
+func (s *summary) unprocessedSample() []string {
+	s.unprocessedMu.Lock()
+	defer s.unprocessedMu.Unlock()
+	return append([]string(nil), s.unprocessed...)
 }
 
 // reserveMetaDelete consumes one deletion slot of the pass budget (T140).

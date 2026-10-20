@@ -216,8 +216,12 @@ func processGraphRepo(ctx context.Context, cfg *config.Config, deps RepoDeps, gs
 // refresh composition hold the per-repo lock.
 func processGraphRepoPass(ctx context.Context, cfg *config.Config, deps RepoDeps, gs graphStore, repo provider.Repo, generation int, groups map[string]bool, vuln *vulnGate, runners *runnerGate) (int, error) {
 	lg := log.WithRepo(deps.Logger, repo.Namespace+"/"+repo.Path)
-	mirror, err := deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
-	if err != nil {
+	var mirror string
+	if err := deps.runUpstream(ctx, func() error {
+		var err error
+		mirror, err = deps.Engine.EnsureLocalMirror(ctx, deps.VCSType, repo)
+		return err
+	}); err != nil {
 		return 0, fmt.Errorf("mirror: %w", err)
 	}
 	refs, err := deps.Engine.Snapshot(ctx, mirror)
