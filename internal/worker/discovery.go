@@ -44,7 +44,7 @@ func (s *snapshot) at() time.Time {
 // (T143). A listing error does not break the loop (FR-014).
 func runDiscovery(ctx context.Context, p provider.VCSProvider, cfg *config.Config, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "discovery")
-	listOnceCached(ctx, p, cfg.Worker.DiscoveryMinInterval, logger, snap)
+	listOnceCached(ctx, p, cfg, logger, snap)
 
 	ticker := time.NewTicker(cfg.Worker.Interval)
 	defer ticker.Stop()
@@ -53,14 +53,16 @@ func runDiscovery(ctx context.Context, p provider.VCSProvider, cfg *config.Confi
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			listOnceCached(ctx, p, cfg.Worker.DiscoveryMinInterval, logger, snap)
+			listOnceCached(ctx, p, cfg, logger, snap)
 		}
 	}
 }
 
-// listOnceCached reuses a snapshot younger than minInterval without an API
-// call (T143); a zero interval always refreshes (the previous behavior).
-func listOnceCached(ctx context.Context, p provider.VCSProvider, minInterval time.Duration, logger *slog.Logger, snap *snapshot) {
+// listOnceCached reuses a snapshot younger than WORKER_DISCOVERY_MIN_INTERVAL
+// without an API call (T143); a zero interval always refreshes (the previous
+// behavior).
+func listOnceCached(ctx context.Context, p provider.VCSProvider, cfg *config.Config, logger *slog.Logger, snap *snapshot) {
+	minInterval := cfg.Worker.DiscoveryMinInterval
 	if minInterval > 0 {
 		if at := snap.at(); !at.IsZero() && time.Since(at) < minInterval {
 			logger.Debug("discovery: cached", "age", time.Since(at).Round(time.Second).String(),
@@ -68,19 +70,42 @@ func listOnceCached(ctx context.Context, p provider.VCSProvider, minInterval tim
 			return
 		}
 	}
-	listOnce(ctx, p, logger, snap)
+	listOnce(ctx, p, cfg, logger, snap)
 }
 
 // listOnce performs one pass: listing, a log line per repository,
-// snapshot update. Errors (except context cancellation) are logged.
-func listOnce(ctx context.Context, p provider.VCSProvider, logger *slog.Logger, snap *snapshot) {
-	repos, err := p.ListRepositories(ctx)
-	if err != nil {
+// snapshot update. A rate limit is transient and is waited out with the same
+// FR-007 policy as the per-unit work (RetryFloor…RetryCap, MaxRetries retries);
+// other errors and exhausted retries are logged once (FR-001).
+func listOnce(ctx context.Context, p provider.VCSProvider, cfg *config.Config, logger *slog.Logger, snap *snapshot) {
+	policy := retryPolicyOf(passConfig(cfg))
+	pace := newPacerWithLimits(cfg.Worker.Interval, policy.floor, policy.cap)
+	var repos []provider.Repo
+	for attempt := 0; ; attempt++ {
+		var err error
+		repos, err = p.ListRepositories(ctx)
+		if err == nil {
+			break
+		}
 		if ctx.Err() != nil {
 			return // normal shutdown — stay quiet
 		}
-		logger.Error("repository listing failed", "err", err)
-		return
+		retryAfter, limited := provider.IsRateLimit(err)
+		if !limited {
+			logger.Error("repository listing failed", "err", err)
+			return
+		}
+		if attempt >= policy.maxRetries {
+			logger.Error("repository listing failed: rate limit retries exhausted",
+				"err", err, "attempts", attempt+1)
+			return
+		}
+		wait := pace.next(false, true, retryAfter)
+		logger.Warn("repository listing rate limited: pausing before retry",
+			"err", err, "retry_after", retryAfter.String(), "wait", wait.String(), "attempt", attempt+1)
+		if sleepCtx(ctx, wait) != nil {
+			return // normal shutdown during the pause
+		}
 	}
 	snap.set(repos)
 	logger.Info("repositories fetched", "provider", p.Type(), "count", len(repos))
