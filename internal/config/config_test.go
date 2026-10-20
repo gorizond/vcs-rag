@@ -19,6 +19,10 @@ var allEnv = []string{
 	"WORKER_GC_INTERVAL", "WORKER_GC_DRY_RUN", "WORKER_DISCOVERY_MIN_INTERVAL",
 	"WORKER_CONCURRENCY", "MIRRORS_DIR",
 	"HISTORY_MAX_COMMITS", "MAX_FILE_BYTES", "CI_WINDOW",
+	"WORKER_UPSTREAM_CONCURRENCY", "WORKER_UPSTREAM_MAX_UNITS",
+	"WORKER_UPSTREAM_RETRY_FLOOR", "WORKER_UPSTREAM_RETRY_CAP",
+	"WORKER_UPSTREAM_MAX_RETRIES", "WORKER_UPSTREAM_QUEUE_LIMIT",
+	"WORKER_FRESH_THRESHOLD",
 	"MCP_TRANSPORT", "MCP_ADDR", "MCP_AUTHZ_ENABLED",
 	"NATS_URL", "NATS_INSTANCE_ID",
 }
@@ -73,6 +77,13 @@ func TestLoadValid(t *testing.T) {
 					cfg.Worker.MirrorsDir != "./mirrors" || cfg.Worker.HistoryMaxCommits != 2000 ||
 					cfg.Worker.MaxFileBytes != 1048576 || cfg.Worker.CIWindow != 50 {
 					t.Errorf("default worker: %+v", cfg.Worker)
+				}
+				// T004: the conservative upstream budget defaults (FR-010).
+				if cfg.Worker.UpstreamConcurrency != 2 || cfg.Worker.UpstreamMaxUnits != 500 ||
+					cfg.Worker.RetryFloor != 60*time.Second || cfg.Worker.RetryCap != 15*time.Minute ||
+					cfg.Worker.MaxRetries != 5 || cfg.Worker.UpstreamQueueLimit != 1000 ||
+					cfg.Worker.FreshThreshold != 24*time.Hour {
+					t.Errorf("default upstream budget: %+v", cfg.Worker)
 				}
 				// T080: the dedicated lanes default to WORKER_INTERVAL.
 				if cfg.Worker.MetaInterval != 60*time.Second || cfg.Worker.MirrorInterval != 60*time.Second {
@@ -172,6 +183,32 @@ func TestLoadValid(t *testing.T) {
 				if cfg.Worker.MetaInterval != 15*time.Minute || cfg.Worker.MirrorInterval != 2*time.Minute {
 					t.Errorf("lane intervals = %v/%v, want 15m/2m",
 						cfg.Worker.MetaInterval, cfg.Worker.MirrorInterval)
+				}
+			},
+		},
+		{
+			// T004/T005: the upstream budget parses; 0 units means unlimited
+			// (the only field where zero is valid).
+			name: "upstream budget: overrides and unlimited units",
+			env: map[string]string{
+				"GITLAB_GROUP_ID":             "1",
+				"GITLAB_TOKEN":                "t",
+				"EMBEDDINGS_PROVIDER":         "ollama",
+				"WORKER_UPSTREAM_CONCURRENCY": "1",
+				"WORKER_UPSTREAM_MAX_UNITS":   "0",
+				"WORKER_UPSTREAM_RETRY_FLOOR": "2s",
+				"WORKER_UPSTREAM_RETRY_CAP":   "30s",
+				"WORKER_UPSTREAM_MAX_RETRIES": "3",
+				"WORKER_UPSTREAM_QUEUE_LIMIT": "7",
+				"WORKER_FRESH_THRESHOLD":      "6h",
+			},
+			check: func(t *testing.T, cfg *Config) {
+				w := cfg.Worker
+				if w.UpstreamConcurrency != 1 || w.UpstreamMaxUnits != 0 ||
+					w.RetryFloor != 2*time.Second || w.RetryCap != 30*time.Second ||
+					w.MaxRetries != 3 || w.UpstreamQueueLimit != 7 ||
+					w.FreshThreshold != 6*time.Hour {
+					t.Errorf("upstream budget = %+v", w)
 				}
 			},
 		},
@@ -422,6 +459,57 @@ func TestLoadErrors(t *testing.T) {
 				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_META_INTERVAL": "abc",
 			},
 			wantProblem: "WORKER_META_INTERVAL",
+		},
+		{
+			// T005: negative values fail fast; 0 is not a special "default"
+			// here — only WORKER_UPSTREAM_MAX_UNITS accepts 0.
+			name: "upstream budget: negative concurrency",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_UPSTREAM_CONCURRENCY": "-1",
+			},
+			wantProblem: "WORKER_UPSTREAM_CONCURRENCY",
+		},
+		{
+			name: "upstream budget: negative max units",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_UPSTREAM_MAX_UNITS": "-5",
+			},
+			wantProblem: "WORKER_UPSTREAM_MAX_UNITS",
+		},
+		{
+			name: "upstream budget: retry floor above cap",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER":         "ollama",
+				"WORKER_UPSTREAM_RETRY_FLOOR": "20m", "WORKER_UPSTREAM_RETRY_CAP": "1m",
+			},
+			wantProblem: "WORKER_UPSTREAM_RETRY_FLOOR must not exceed WORKER_UPSTREAM_RETRY_CAP",
+		},
+		{
+			name: "upstream budget: zero max retries",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_UPSTREAM_MAX_RETRIES": "0",
+			},
+			wantProblem: "WORKER_UPSTREAM_MAX_RETRIES",
+		},
+		{
+			name: "upstream budget: zero queue limit",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_UPSTREAM_QUEUE_LIMIT": "0",
+			},
+			wantProblem: "WORKER_UPSTREAM_QUEUE_LIMIT",
+		},
+		{
+			name: "upstream budget: invalid fresh threshold",
+			env: map[string]string{
+				"GITLAB_GROUP_ID": "1", "GITLAB_TOKEN": "t",
+				"EMBEDDINGS_PROVIDER": "ollama", "WORKER_FRESH_THRESHOLD": "abc",
+			},
+			wantProblem: "WORKER_FRESH_THRESHOLD",
 		},
 		{
 			name: "gc: invalid dry-run boolean",

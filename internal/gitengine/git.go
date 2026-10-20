@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gorizond/vcs-rag/internal/provider"
 )
@@ -44,10 +45,29 @@ func (e *Engine) run(ctx context.Context, dir string, args ...string) ([]byte, e
 	return e.runWithEnv(ctx, dir, nil, args...)
 }
 
+// RateLimitError is a network git failure classified as a VCS rate limit
+// (FR-001/FR-007): RetryAfter is 0 when the provider gave no hint; the caller
+// picks the floor. It wraps the original git error so provider.IsRateLimit
+// still recognizes it through the text fallback.
+type RateLimitError struct {
+	RetryAfter time.Duration
+	Err        error
+}
+
+func (e *RateLimitError) Error() string { return "rate limit: " + e.Err.Error() }
+func (e *RateLimitError) Unwrap() error { return e.Err }
+
 // runNet executes a network git command (clone/fetch): AuthEnv is added to the
-// environment when set (private repositories, T074).
+// environment when set (private repositories, T074). A rate-limit failure is
+// returned as the typed *RateLimitError instead of a generic error (US1).
 func (e *Engine) runNet(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	return e.runWithEnv(ctx, dir, e.AuthEnv, args...)
+	out, err := e.runWithEnv(ctx, dir, e.AuthEnv, args...)
+	if err != nil {
+		if d, ok := provider.IsRateLimit(err); ok {
+			return nil, &RateLimitError{RetryAfter: d, Err: err}
+		}
+	}
+	return out, err
 }
 
 // runWithEnv runs git with the base and extra environment.

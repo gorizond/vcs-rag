@@ -33,6 +33,12 @@ type MirrorState struct {
 	// MetaSyncedAt is the end of the last successful metadata pass (T135):
 	// an "auto"-origin refresh skips the metadata phase when it is fresh.
 	MetaSyncedAt time.Time `json:"meta_synced_at"`
+	// Unprocessed is the list of pass units whose rate-limit retries were
+	// exhausted (FR-009): "<repo>:<phase>", e.g. "grp/repo:index". The resume
+	// point itself is the per-commit checkpoint (Branches[].IndexedCommits);
+	// this list makes the incomplete pass visible and is cleared by the next
+	// successful pass.
+	Unprocessed []string `json:"unprocessed,omitempty"`
 }
 
 // LoadState reads the state; a missing file yields an empty state.

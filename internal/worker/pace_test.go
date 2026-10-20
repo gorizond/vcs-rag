@@ -61,19 +61,21 @@ func TestPacerIdleBackoff(t *testing.T) {
 	}
 }
 
-// T129: a VCS rate limit dominates: max(min, retryAfter||30s), capped at 5m.
+// T129/T011: a VCS rate limit dominates: the base interval is
+// clamp(max(Retry-After, RetryFloor), RetryFloor, RetryCap). Each case uses a
+// fresh pacer — repeated 429s grow the interval (FR-007, TestPacerRateLimitGrowth).
 func TestPacerRateLimit(t *testing.T) {
-	p := seededPacer(time.Minute)
 	cases := []struct {
 		retryAfter time.Duration
 		want       time.Duration
 	}{
 		{45 * time.Second, 45 * time.Second},
 		{0, paceRateFloor},
-		{2 * time.Second, paceMin}, // below the floor → min
+		{2 * time.Second, paceRateFloor}, // below the floor → floor
 		{10 * time.Minute, paceRateCap},
 	}
 	for _, tc := range cases {
+		p := seededPacer(time.Minute)
 		d := p.next(false, true, tc.retryAfter)
 		if !within(d, tc.want) {
 			t.Errorf("rate limit retryAfter=%v: delay = %v, want ~%v", tc.retryAfter, d, tc.want)
@@ -81,6 +83,46 @@ func TestPacerRateLimit(t *testing.T) {
 		if p.reason != "rate-limit" {
 			t.Errorf("reason = %q, want rate-limit", p.reason)
 		}
+	}
+}
+
+// T012/T013: repeated consecutive rate limits double the base interval
+// (wait₀·2ⁿ), clamped by floor/cap; n resets after a non-rate-limit result.
+func TestPacerRateLimitGrowth(t *testing.T) {
+	p := newPacerWithLimits(time.Hour, 10*time.Second, 5*time.Minute)
+	p.rnd = rand.New(rand.NewSource(7))
+	want := []time.Duration{
+		10 * time.Second, 20 * time.Second, 40 * time.Second,
+		80 * time.Second, 160 * time.Second, 5 * time.Minute,
+	}
+	for i, target := range want {
+		d := p.next(false, true, 0)
+		if !within(d, target) {
+			t.Fatalf("rate limit #%d delay = %v, want ~%v", i, d, target)
+		}
+	}
+	// above the cap: the interval stays at the cap.
+	if d := p.next(false, true, 0); !within(d, 5*time.Minute) {
+		t.Errorf("delay above the cap = %v, want ~5m", d)
+	}
+}
+
+// T012/T013: a non-rate-limit result resets the exponent (n=0); the next 429
+// starts from the base interval again, not from the grown one.
+func TestPacerRateLimitGrowthResets(t *testing.T) {
+	p := newPacerWithLimits(time.Hour, 10*time.Second, 5*time.Minute)
+	p.rnd = rand.New(rand.NewSource(7))
+	if d := p.next(false, true, 0); !within(d, 10*time.Second) {
+		t.Fatalf("first 429 = %v, want ~10s", d)
+	}
+	if d := p.next(false, true, 0); !within(d, 20*time.Second) {
+		t.Fatalf("second 429 = %v, want ~20s", d)
+	}
+	if d := p.next(true, false, 0); !within(d, paceMin) {
+		t.Fatalf("busy = %v, want ~%v", d, paceMin)
+	}
+	if d := p.next(false, true, 0); !within(d, 10*time.Second) {
+		t.Errorf("429 after a success = %v, want the base ~10s (reset)", d)
 	}
 }
 

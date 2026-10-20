@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorizond/vcs-rag/internal/config"
 	"github.com/gorizond/vcs-rag/internal/gitengine"
 	"github.com/gorizond/vcs-rag/internal/provider"
 	"github.com/gorizond/vcs-rag/internal/store"
@@ -32,6 +33,15 @@ type RefreshResult struct {
 	MetaUpdated    int
 	Errors         []string // per-phase errors; the phases are best-effort
 	Duration       time.Duration
+	// Unprocessed lists the units whose rate-limit retries were exhausted
+	// (FR-007/FR-009): "<repo>:<phase>". The pass is honestly incomplete; the
+	// resume point is the per-commit checkpoint in the repository state.
+	Unprocessed []string
+	// Excluded lists the units excluded by an access error 403/404 (FR-012);
+	// they are not fatal and do not fail the pass.
+	Excluded []string
+	// Incomplete reports that at least one unit was left unprocessed (FR-009).
+	Incomplete bool
 }
 
 // errRefreshTransient marks retryable resolve failures (an empty discovery
@@ -47,6 +57,83 @@ const metaAutoFresh = time.Hour
 // A timeout is an ordinary phase error — the task is Nak-ed and retried with
 // the consumer backoff, so the retry semantics are unchanged.
 var refreshFetchTimeout = 15 * time.Minute
+
+// Retry policy defaults for a zero-value config (narrow unit tests build
+// config.Config{}); production always gets the values from config.Load (FR-010).
+const (
+	defaultRetryFloor = 60 * time.Second
+	defaultRetryCap   = 15 * time.Minute
+	defaultMaxRetries = 5
+)
+
+// passConfig snapshots the worker configuration at the pass boundary (FR-014):
+// a value copy is taken once, so a later env/config change applies only to the
+// next pass and never to the running one.
+func passConfig(cfg *config.Config) config.Worker {
+	if cfg == nil {
+		return config.Worker{}
+	}
+	return cfg.Worker
+}
+
+// retryPolicy is the immutable retry part of the pass snapshot.
+type retryPolicy struct {
+	floor      time.Duration
+	cap        time.Duration
+	maxRetries int
+}
+
+// retryPolicyOf applies the FR-010 defaults to a zero-value snapshot.
+func retryPolicyOf(w config.Worker) retryPolicy {
+	p := retryPolicy{floor: w.RetryFloor, cap: w.RetryCap, maxRetries: w.MaxRetries}
+	if p.floor <= 0 {
+		p.floor = defaultRetryFloor
+	}
+	if p.cap <= 0 {
+		p.cap = defaultRetryCap
+	}
+	if p.floor > p.cap {
+		p.floor = p.cap
+	}
+	if p.maxRetries <= 0 {
+		p.maxRetries = defaultMaxRetries
+	}
+	return p
+}
+
+// refreshRetrySleep waits between retries; replaceable in tests (no real waits).
+var refreshRetrySleep = sleepCtx
+
+// isRateLimit reports whether err is a VCS rate limit (FR-001).
+func isRateLimit(err error) bool {
+	_, ok := provider.IsRateLimit(err)
+	return ok
+}
+
+// retryUnit runs one unit under the FR-007 policy: only rate-limit failures
+// are retried, at most maxRetries times, with the pacer's growing interval
+// waitₙ = clamp(wait₀·2ⁿ + jitter, RetryFloor, RetryCap). A non-rate-limit
+// failure is returned immediately; an exhausted rate limit is returned as-is
+// so the caller can mark the unit unprocessed.
+func retryUnit(ctx context.Context, policy retryPolicy, fn func() error) error {
+	p := newPacerWithLimits(policy.cap, policy.floor, policy.cap)
+	for attempt := 0; ; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		retryAfter, limited := provider.IsRateLimit(err)
+		if !limited {
+			return err
+		}
+		if attempt >= policy.maxRetries {
+			return err
+		}
+		if waitErr := refreshRetrySleep(ctx, p.next(false, true, retryAfter)); waitErr != nil {
+			return waitErr
+		}
+	}
+}
 
 // RefreshOnce performs an on-demand refresh of one repository (T111): fetch
 // (mirror-lane semantics) → index new commits (per-commit checkpoints, T088) →
@@ -64,7 +151,10 @@ func RefreshOnce(ctx context.Context, deps RepoDeps, repo provider.Repo) Refresh
 func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaStore, repo provider.Repo, origin string) RefreshResult {
 	start := time.Now()
 	res := RefreshResult{}
-	_ = withRepoLock(repoSlug(repo.Namespace+"/"+repo.Path), func() error {
+	// FR-014: the pass works on one immutable config snapshot.
+	policy := retryPolicyOf(passConfig(deps.Cfg))
+	repoName := repo.Namespace + "/" + repo.Path
+	_ = withRepoLock(repoSlug(repoName), func() error {
 		statePath := gitengine.StatePath(deps.Engine.MirrorPath(deps.VCSType, repo))
 		before, err := LoadState(statePath)
 		if err != nil {
@@ -72,18 +162,48 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 			before = &MirrorState{}
 		}
 
+		// runPhase applies the retry policy to one unit (a phase pass over the
+		// repository) and classifies the outcome: an access error excludes the
+		// unit (FR-012); an exhausted rate limit leaves it unprocessed and marks
+		// the pass incomplete (FR-007/FR-009); anything else is a phase error.
+		runPhase := func(phase string, fn func(context.Context) error) {
+			err := retryUnit(ctx, policy, func() error { return fn(ctx) })
+			if err == nil || ctx.Err() != nil {
+				return
+			}
+			unit := repoName + ":" + phase
+			switch {
+			case provider.IsAccessError(err):
+				res.Excluded = append(res.Excluded, unit)
+				if deps.Logger != nil {
+					deps.Logger.Warn("access error: unit excluded from the pass",
+						"repo", repoName, "phase", phase, "err", err)
+				}
+			case isRateLimit(err):
+				res.Unprocessed = append(res.Unprocessed, unit)
+				res.Incomplete = true
+				if deps.Logger != nil {
+					deps.Logger.Warn("rate limit retries exhausted: unit left unprocessed",
+						"repo", repoName, "phase", phase, "err", err)
+				}
+			default:
+				res.Errors = append(res.Errors, phase+": "+err.Error())
+			}
+		}
+
 		// phase 1: fetch — the refresh owns network access (mirror lane semantics);
-		// the phase is bounded by refreshFetchTimeout (T142).
-		fetchCtx, cancel := context.WithTimeout(ctx, refreshFetchTimeout)
-		_, errFetch := deps.Engine.EnsureMirror(fetchCtx, deps.VCSType, repo)
-		cancel()
-		if errFetch != nil {
-			res.Errors = append(res.Errors, "mirror: "+errFetch.Error())
-		}
-		// phase 2: index new commits.
-		if err := processRepoOnce(ctx, deps, repo, idx); err != nil {
-			res.Errors = append(res.Errors, "index: "+err.Error())
-		}
+		// the phase is bounded by refreshFetchTimeout (T142), a fresh bound per retry.
+		runPhase("mirror", func(fctx context.Context) error {
+			fetchCtx, cancel := context.WithTimeout(fctx, refreshFetchTimeout)
+			defer cancel()
+			_, err := deps.Engine.EnsureMirror(fetchCtx, deps.VCSType, repo)
+			return err
+		})
+		// phase 2: index new commits. A retry resumes from the per-commit
+		// checkpoints, so only the remaining units are processed (FR-004).
+		runPhase("index", func(fctx context.Context) error {
+			return processRepoOnce(fctx, deps, repo, idx)
+		})
 		if after, err := LoadState(statePath); err == nil {
 			res.CommitsIndexed = indexedDelta(before.Branches, after.Branches)
 		}
@@ -106,12 +226,20 @@ func refreshOnce(ctx context.Context, deps RepoDeps, idx indexStore, meta metaSt
 			time.Since(metaBefore.MetaSyncedAt) < metaAutoFresh:
 			// skip: the metadata phase is fresh enough
 		default:
-			if err := processMetadataOnce(ctx, deps, repo, meta); err != nil {
-				res.Errors = append(res.Errors, "metadata: "+err.Error())
-			}
+			runPhase("metadata", func(fctx context.Context) error {
+				return processMetadataOnce(fctx, deps, repo, meta)
+			})
 			if metaAfter, err := LoadState(statePath); err == nil {
 				res.MetaUpdated = metaDelta(metaBefore.Meta, metaAfter.Meta)
 			}
+		}
+		// FR-009: persist the pass-level unprocessed list (cleared by a
+		// successful pass). The actual resume point stays the per-commit
+		// checkpoint, so no unit is duplicated or skipped by the next pass.
+		if err := updateState(statePath, func(st *MirrorState) {
+			st.Unprocessed = res.Unprocessed
+		}); err != nil {
+			res.Errors = append(res.Errors, "state: "+err.Error())
 		}
 		return nil
 	})

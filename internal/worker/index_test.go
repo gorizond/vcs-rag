@@ -74,7 +74,9 @@ func newIndexDeps(t *testing.T, repo provider.Repo) (RepoDeps, *countingEmbed) {
 type faultStore struct {
 	upserts         int
 	points          int
-	failAt          int // fail exactly the failAt-th upsert (0 — never)
+	failAt          int   // fail exactly the failAt-th upsert (0 — never)
+	failAlways      bool  // every upsert from failAt on fails (retry-exhaustion tests)
+	failErr         error // injected upsert error (default: a generic failure)
 	firstOp         func()
 	byBranch        map[string]int // payload branch → points (T160)
 	deletedBranches []string       // DeleteBranch calls (T160)
@@ -107,7 +109,10 @@ func (f *faultStore) DeleteCodeCommits(context.Context, string, string, []string
 func (f *faultStore) Upsert(_ context.Context, points []store.Point) error {
 	f.tick()
 	f.upserts++
-	if f.upserts == f.failAt { // one-shot: the K-th upsert fails, the retry succeeds
+	if f.upserts == f.failAt || (f.failAlways && f.failAt > 0 && f.upserts > f.failAt) { // one-shot by default: the K-th upsert fails, the retry succeeds
+		if f.failErr != nil {
+			return f.failErr
+		}
 		return errors.New("injected upsert failure")
 	}
 	if f.byBranch == nil {

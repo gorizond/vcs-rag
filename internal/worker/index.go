@@ -57,7 +57,7 @@ type indexStore interface {
 // own ticker (T150/T153).
 func runIndex(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot, status *statusReporter) error {
 	deps.Logger = log.WithPhase(deps.Logger, "index")
-	p := newPacer(cfg.Worker.Interval)
+	p := newPacerWithLimits(cfg.Worker.Interval, cfg.Worker.RetryFloor, cfg.Worker.RetryCap)
 	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
 	if err := p.sleep(ctx, p.startDelay()); err != nil {
 		return nil
@@ -256,7 +256,9 @@ func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provi
 		}
 		done = append(done, sha)
 		// T088: persist the branch progress — a crash/restart resumes from here.
-		if err := checkpointBranch(statePath, branch, tip, window, prev.IndexedCommits, done); err != nil {
+		// The coverage marker (IndexedAt) is preserved: FR-009 moves it only on
+		// a successful phase completion, not on a partial/aborted pass.
+		if err := checkpointBranch(statePath, branch, tip, window, prev.IndexedCommits, done, prev.IndexedAt); err != nil {
 			return BranchState{}, fmt.Errorf("state: %w", err)
 		}
 	}
@@ -296,12 +298,12 @@ func processBranch(ctx context.Context, deps RepoDeps, st indexStore, repo provi
 // checkpointBranch persists the intermediate branch progress after a commit
 // (T088): only st.Branches[branch] is touched inside the closure — the fresh
 // state's meta/last_fetch_at and the other branches are preserved (the index
-// lane is the only writer of Branches).
-func checkpointBranch(statePath, branch, tip string, window, prev, done []string) error {
+// lane is the only writer of Branches). IndexedAt (the coverage marker) is the
+// PREVIOUS value: FR-009 advances it only on a successful phase completion.
+func checkpointBranch(statePath, branch, tip string, window, prev, done []string, indexedAt time.Time) error {
 	idx := mergedIndexed(window, prev, done)
-	at := time.Now().UTC()
 	return updateState(statePath, func(st *MirrorState) {
-		st.Branches[branch] = BranchState{Tip: tip, IndexedCommits: idx, IndexedAt: at}
+		st.Branches[branch] = BranchState{Tip: tip, IndexedCommits: idx, IndexedAt: indexedAt}
 	})
 }
 

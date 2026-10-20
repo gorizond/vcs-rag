@@ -25,7 +25,7 @@ import (
 // Errors do not break the loop (FR-014).
 func runMetadata(ctx context.Context, cfg *config.Config, deps RepoDeps, snap *snapshot) error {
 	deps.Logger = log.WithPhase(deps.Logger, "metadata")
-	p := newPacer(cfg.Worker.MetaInterval)
+	p := newPacerWithLimits(cfg.Worker.MetaInterval, cfg.Worker.RetryFloor, cfg.Worker.RetryCap)
 	// T129: a random start U[0, 2s] avoids a boot herd across lanes.
 	if err := p.sleep(ctx, p.startDelay()); err != nil {
 		return nil

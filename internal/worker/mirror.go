@@ -19,7 +19,7 @@ import (
 // the loop (FR-014).
 func runMirror(ctx context.Context, cfg *config.Config, vcsType string, eng *gitengine.Engine, logger *slog.Logger, snap *snapshot) error {
 	logger = log.WithPhase(logger, "mirror")
-	p := newPacer(cfg.Worker.MirrorInterval)
+	p := newPacerWithLimits(cfg.Worker.MirrorInterval, cfg.Worker.RetryFloor, cfg.Worker.RetryCap)
 	lastRepos := -1
 	for {
 		sum := mirrorAll(ctx, cfg, vcsType, eng, logger, snap)

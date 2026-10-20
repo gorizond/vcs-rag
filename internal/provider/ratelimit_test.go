@@ -78,3 +78,60 @@ func TestIsRateLimitGitFetch429(t *testing.T) {
 		t.Error("nil is not a rate limit")
 	}
 }
+
+// T009 (US1): the three classification cases of the spec — GitLab 429 without
+// Retry-After (fallback floor), GitLab 429 with Retry-After: 7, git-fetch 429.
+func TestIsRateLimitUS1Cases(t *testing.T) {
+	glErr := func(h http.Header) error {
+		return &gitlab.ErrorResponse{
+			StatusCode: http.StatusTooManyRequests,
+			Response:   &http.Response{StatusCode: http.StatusTooManyRequests, Header: h},
+		}
+	}
+	cases := []struct {
+		name string
+		err  error
+		want time.Duration
+	}{
+		{"gitlab 429 without Retry-After", glErr(nil), 0},
+		{"gitlab 429 with Retry-After: 7", glErr(http.Header{"Retry-After": {"7"}}), 7 * time.Second},
+		{"git fetch 429 from stderr", errors.New("git remote update --prune: exit status 128: fatal: unable to access 'https://git.example/x.git/': The requested URL returned error: 429"), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, ok := IsRateLimit(tc.err)
+			if !ok || d != tc.want {
+				t.Errorf("IsRateLimit = %v/%v, want %v/true", d, ok, tc.want)
+			}
+		})
+	}
+}
+
+// T015 (US1): access errors (403/404) are classified separately from rate
+// limits, typed or as git transport text.
+func TestIsAccessError(t *testing.T) {
+	glErr := func(code int) error {
+		return &gitlab.ErrorResponse{StatusCode: code, Response: &http.Response{StatusCode: code}}
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"gitlab 403", glErr(http.StatusForbidden), true},
+		{"gitlab 404", glErr(http.StatusNotFound), true},
+		{"gitlab 401", glErr(http.StatusUnauthorized), false},
+		{"git fetch 403", errors.New("The requested URL returned error: 403"), true},
+		{"git fetch 404", errors.New("The requested URL returned error: 404"), true},
+		{"generic 429", errors.New("HTTP 429 Too Many Requests"), false},
+		{"plain failure", errors.New("connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsAccessError(tc.err); got != tc.want {
+				t.Errorf("IsAccessError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
